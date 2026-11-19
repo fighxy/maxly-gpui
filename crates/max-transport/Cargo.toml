@@ -1,0 +1,27 @@
+[package]
+name = "max-transport"
+version = "0.1.0"
+description = "TLS connection to the MAX API: request/response matching by seq, server pushes, ping"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1.12.2"
+max-proto = { path = "../max-proto" }
+rmpv = "1.3.1"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = "1.0.229"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-util = "0.7.20"
+tracing = "0.1.44"
+webpki-roots = "1.0.12"
+
+[dev-dependencies]
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring", "pem"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "test-util"] }

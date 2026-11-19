@@ -68,3 +68,16 @@ group and channel management, mini-apps, stories viewing, polls); v3 calls, stor
 livestreams, media editor, multiaccount, ESIA. Recommendations (C10, F12) are not built.
 Consequences: Units are ported in waves that serve v1 first; v2 and v3 rows stay `open` until
 v1 is done. Calls stay a separate track that starts only after RE of the OK calls SDK.
+
+## ADR-007: UI on gpui with longbridge/gpui-kit
+Status: accepted (2026-11-19)
+Context: The user chose gpui-kit (github.com/longbridge/gpui-kit, formerly gpui-component;
+version 0.10 on 2026-11-19) for the UI. It provides the parts a messenger needs: `message`,
+`bubble`, `message_scroller`, `virtual_list`, `avatar`, `sidebar`, `input`, `attachment`,
+`notification`, `dialog`, `menu`, `title_bar`, `tab`, `setting`, and the `gpui-webview` crate.
+Decision: The `app` crate is a gpui application built with gpui-kit components; the official
+QML screens (`re/out/qml_files.txt`) are the reference for layout and behavior, not for code.
+Consequences: The UI depends on gpui and its platform backends (Windows first). Gaps to fill
+outside gpui-kit: Lottie/thorvg stickers and animoji, video and audio playback, the QR code
+view, tray icon and system notifications. Mini-apps (I3) use `gpui-webview`. The pinned
+gpui-kit and gpui revisions and the minimum Rust version are set when the `app` crate starts.

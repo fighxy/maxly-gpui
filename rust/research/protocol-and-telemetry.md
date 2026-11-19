@@ -98,6 +98,15 @@ shows the same payloads with partial masking.
 | QR login | `288` `{}` → `{trackId, qrLink, expiresAt, pollingInterval: 5000, ttl}`; then `289 {trackId}` every `pollingInterval` → `{status: {expiresAt, ttl}}` |
 | Other TLS via libssl in 40 s | only `localhost` (gRPC to `max-service.exe` for calls). No Tracer or other external host through OpenSSL; Tracer may use another stack (open). |
 
+### Known detection risk: TLS fingerprint
+
+The desktop client speaks TLS through OpenSSL 3 (`libssl-3-x64.dll`, Qt `openssl` backend).
+`max-transport` uses rustls, whose ClientHello (cipher suites, extensions, their order) differs
+from OpenSSL's, so a server that fingerprints TLS (JA3/JA4) can tell the two apart even when
+every frame matches. Not addressed yet; options: record the official ClientHello (it is on the
+wire before encryption, so any packet capture shows it) and compare, then decide whether to
+shape rustls' offer or use OpenSSL through the `openssl` crate.
+
 ### msgpack encoding of the desktop client (capture `cap2`, raw `SESSION_INIT`)
 
 Type markers of the 314-byte payload (`re/capture/msgpack_markers.py`; raw bytes deleted after

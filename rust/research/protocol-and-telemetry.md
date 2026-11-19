@@ -134,6 +134,27 @@ Example header bytes: `0b 00 0001 0006 0000013a` (SESSION_INIT, 314 bytes),
 `SessionInit` also carries `deviceId` (base64, 28 bytes decoded; persistent per install,
 stored in the profile; to locate) and `clientSessionId` (`1` on first launch; a counter).
 
+### How the official client makes `deviceId` (decompiled, `desktop_utils.dll`)
+
+`Utilities::getDeviceId` (export, `0x180002fbd`) returns
+`base64(QCryptographicHash::hash(input, 11))`; algorithm 11 in Qt 6 is `RealSha3_224`, so 28
+bytes and 40 base64 characters. `input` is built once per process (`FUN_18003cd40`) as
+`"{}|{}|{}|{}|{}|{}"` of:
+
+1. registry value `UninstallId` (`FUN_18003fa40`, `RegGetValueW`), or a new GUID from
+   `CoCreateGuid` when it is missing (`FUN_18003d8e0`);
+2. volume serial from `GetVolumeInformationW`, folded to 16 bits (high + low half);
+3. physical disk serial: `\\.\PhysicalDrive{n}` with `IOCTL_STORAGE_GET_DEVICE_NUMBER`
+   (`0x2d1080`) and `IOCTL_STORAGE_QUERY_PROPERTY` (`0x2d1400`);
+4. MAC addresses of every adapter except software loopback (`GetAdaptersAddresses`,
+   `{:02x}` per byte);
+5. CPUID: `vendor={};sig={:08x};feat={:08x}{:08x}`;
+6. `GetComputerNameW`.
+
+The value changed between the first launch (by the installer) and the second, then stayed the
+same (client logs). `clientSessionId` went 1, 2, 3 over three launches. Our client does not
+reproduce any of this (ADR-008).
+
 ### Pre-login side effects seen in the profile (`%LOCALAPPDATA%\ONEME`)
 
 - `.crash_dumps\...\crashfree_running_uploaded` and `calls\calls-settings\tracer\...\crashfree_running_uploaded`:

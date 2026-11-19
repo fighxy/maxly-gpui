@@ -18,6 +18,7 @@ Read first: `DECISIONS.md`, `GLOSSARY.md`, `research/protocol-and-telemetry.md`,
 | 005 | No telemetry by default; minimal fixed stream behind `telemetry-minimal`, off |
 | 006 | Release split v1 / v2 / v3 as in the feature table; no recommendations |
 | 007 | UI: gpui + longbridge/gpui-kit; official QML screens as reference |
+| 008 | Random deviceId and device name instead of a hardware fingerprint |
 
 ## Feature parity table
 
@@ -34,7 +35,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
 | A1 | TCP/TLS to `api2.oneme.ru:443`, frame codec (ver 11, lz4 from server) | O 6; capture | v1 | done (`max-proto`, `max-transport`); not yet tried against the real server |
-| A2 | `SESSION_INIT` with desktop user agent, `deviceId`, `clientSessionId` | O 6; capture | v1 | packet done (`max-proto::packets::session`, byte-exact size and markers); identity values open (`max-identity`) |
+| A2 | `SESSION_INIT` with desktop user agent, `deviceId`, `clientSessionId` | O 6; capture | v1 | done: packet (`max-proto`), values (`max-identity`: version table, random deviceId and name, OS version, language, time zone, launch counter); storage of `Identity` open (`max-store`) |
 | A3 | PING every 30 s `{interactive}`, reconnect, request timeouts | O 1; config `ping_interval` | v1 | ping, timeouts, close detection, backoff done (`max-transport`); reconnect loop with session re-init open (`max-core`) |
 | A4 | Failover hosts from server config | K `failover-hosts` | v1 | open |
 | A5 | Login sync (chats, contacts, config on `LOGIN`) | O 19, 22 | v1 | open |
@@ -225,7 +226,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 |---|---|---|---|
 | `max-proto` | frame codec, lz4, msgpack, opcode enum, packet types | 1 | done 2026-11-19: 30 tests (unit + capture headers), clippy -D warnings, fmt, no unsafe |
 | `max-transport` | TLS socket, seq/response matching, ping, reconnect, failover | 1 | done 2026-11-19: 15 tests (fake server over duplex, local TLS with rcgen), 5 stable runs, clippy -D warnings, fmt, no unsafe; reconnect loop and failover hosts left to `max-core` |
-| `max-identity` | user agent, device id, version table | 1 | open |
+| `max-identity` | user agent, device id, version table | 1 | done 2026-11-19: 12 tests, clippy -D warnings, fmt, no unsafe, no hardware probing (ADR-008) |
 | `max-store` | encrypted local DB, token in OS keystore | 2 | open |
 | `max-core` | session, auth flows, sync, event dispatch, server config | 2 | open |
 | `max-media` | uploads/downloads, image/video/audio decode, Lottie | 3 | open |

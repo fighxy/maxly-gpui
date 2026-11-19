@@ -81,3 +81,21 @@ Consequences: The UI depends on gpui and its platform backends (Windows first). 
 outside gpui-kit: Lottie/thorvg stickers and animoji, video and audio playback, the QR code
 view, tray icon and system notifications. Mini-apps (I3) use `gpui-webview`. The pinned
 gpui-kit and gpui revisions and the minimum Rust version are set when the `app` crate starts.
+
+## ADR-008: Device identity without hardware fingerprinting
+Status: accepted (2026-11-19)
+Context: The official client derives `deviceId` from a hardware fingerprint
+(`desktop_utils.dll` `Utilities::getDeviceId`): `base64(SHA3-224("{}|{}|{}|{}|{}|{}"))` over the
+registry `UninstallId` (or a new GUID), the volume serial folded to 16 bits, the physical disk
+serial (`IOCTL_STORAGE_QUERY_PROPERTY`), all non-loopback MAC addresses, CPUID vendor, signature
+and feature bits, and the computer name. The server cannot check how the hash was made, and the
+official `deviceId` itself changed between the first and second launch on this machine.
+`deviceName` is the real computer name, which often contains the owner's name.
+Decision: `deviceId` is 28 random bytes from the OS RNG, base64 with padding (40 characters,
+the same shape), generated once per profile and kept. `deviceName` defaults to a random
+Windows-style name (`DESKTOP-` + 7 characters of `A-Z0-9`), kept per profile; the user may
+choose the real computer name or any text. `timezone` and `locale` come from the system by
+default (the server uses them for content) and can be overridden. `clientSessionId` is a
+per-profile counter, +1 per launch, starting at 1 (client log: 1, 2, 3 over three launches).
+Consequences: No hardware data leaves the machine. Two installs on one machine look like two
+devices. `max-identity` has no code that reads disks, adapters or CPUID.

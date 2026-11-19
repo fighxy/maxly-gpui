@@ -1,0 +1,22 @@
+[package]
+name = "max-identity"
+version = "0.1.0"
+description = "Client identity for MAX SESSION_INIT: version table, device id, user agent, session counter"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+getrandom = "0.4.3"
+iana-time-zone = "0.1.65"
+max-proto = { path = "../max-proto" }
+serde = { version = "1.0.229", features = ["derive"] }
+sys-locale = "0.3.2"
+thiserror = "2.0.21"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.56.0"

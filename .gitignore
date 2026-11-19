@@ -1,0 +1,12 @@
+/target/
+**/target/
+/ref/
+/re/snapshots/
+/re/out/
+*.pcap
+*.pcapng
+*.har
+/re/.venv-frida/
+/re/ghidra/
+/re/q/
+**/__pycache__/

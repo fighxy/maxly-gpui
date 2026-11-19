@@ -37,11 +37,11 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 |---|---|---|---|---|
 | A1 | TCP/TLS to `api2.oneme.ru:443`, frame codec (ver 11, lz4 from server) | O 6; capture | v1 | done (`max-proto`, `max-transport`); not yet tried against the real server |
 | A2 | `SESSION_INIT` with desktop user agent, `deviceId`, `clientSessionId` | O 6; capture | v1 | done: packet (`max-proto`), values (`max-identity`: version table, random deviceId and name, OS version, language, time zone, launch counter); stored per profile (`max-store`) |
-| A3 | PING every 30 s `{interactive}`, reconnect, request timeouts | O 1; config `ping_interval` | v1 | ping, timeouts, close detection, backoff done (`max-transport`); reconnect loop with session re-init open (`max-core`) |
+| A3 | PING every 30 s `{interactive}`, reconnect, request timeouts | O 1; config `ping_interval` | v1 | ping, timeouts, close detection, backoff done (`max-transport`); reconnect with SESSION_INIT and LOGIN again done (`max-core::Supervisor`) |
 | A4 | Failover hosts from server config | K `failover-hosts` | v1 | open |
-| A5 | Login sync (chats, contacts, config on `LOGIN`) | O 19, 22 | v1 | open |
+| A5 | Login sync (chats, contacts, config on `LOGIN`) | O 19, 22 | v1 | LOGIN with saved token and initial sync done (`max-core`); sync markers stay 0 until their update rule is decoded |
 | A6 | Server config flags, local feature gates | K (184 keys); O 134 `ConfigChangeData` | v1 | open |
-| A7 | Server push events dispatch | O 128-165, 216, 243, 277, 293 (CommonEvent) | v1 | open |
+| A7 | Server push events dispatch | O 128-165, 216, 243, 277, 293 (CommonEvent) | v1 | pushes delivered raw (`CoreEvent::Push`); typed dispatch open |
 | A8 | Network change handling | S `network_change_notifier` | v1 | open |
 | A9 | Upload/download HTTP endpoints, URL refresh | O 80, 82, 87, 88, 203; K `desktop-upload-url-failover`, `photo-url-refresh` | v1 | open |
 
@@ -49,10 +49,10 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
-| B1 | QR login (create, poll, login by track) | O 288, 289, 291; Q `QrCodePage` | v1 | open |
-| B2 | Phone + SMS code login | O 17, 18, 23; Q `PhoneNumberPage`, `CodeEnterPage` | v1 | open |
-| B3 | Two-factor password: login check, restore, hint | O 101, 104, 113, 115; Q `PasswordEnterPage`, `AuthForgotPasswordPage` | v1 | open |
-| B4 | Registration: name, avatar presets | O 25; Q `NameEnterPage`, `AvatarPreset*` | v1 | open |
+| B1 | QR login (create, poll, login by track) | O 288, 289, 291; Q `QrCodePage` | v1 | done in core (`Session::start_qr`, `poll_qr`, `finish_qr`); UI open; not tried on the real server |
+| B2 | Phone + SMS code login | O 17, 18, 23; Q `PhoneNumberPage`, `CodeEnterPage` | v1 | done in core (`request_code` START_AUTH/RESEND, `confirm_code` CHECK_CODE); UI open; not tried on the real server |
+| B3 | Two-factor password: login check, restore, hint | O 101, 104, 113, 115; Q `PasswordEnterPage`, `AuthForgotPasswordPage` | v1 | login check done (`check_password`); restore and hint open |
+| B4 | Registration: name, avatar presets | O 25; Q `NameEnterPage`, `AvatarPreset*` | v1 | detected (`AuthStep::RegistrationRequired`); flow open |
 | B5 | 2FA setup and management (email, hint, password) | O 109-112; Q `SFACreate*`, `SFAConfig*` | v2 | open |
 | B6 | Active sessions list and close | O 96, 97; Q `DevicesSettings*` | v1 | open |
 | B7 | Logout | O 20 | v1 | open |
@@ -229,7 +229,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | `max-transport` | TLS socket, seq/response matching, ping, reconnect, failover | 1 | done 2026-11-19: 15 tests (fake server over duplex, local TLS with rcgen), 5 stable runs, clippy -D warnings, fmt, no unsafe; reconnect loop and failover hosts left to `max-core` |
 | `max-identity` | user agent, device id, version table | 1 | done 2026-11-19: 12 tests, clippy -D warnings, fmt, no unsafe, no hardware probing (ADR-008) |
 | `max-store` | encrypted local DB, token in OS keystore | 2 | done 2026-11-19: SQLCipher 4.20 (vendored OpenSSL), key and token in Credential Manager (DPAPI), profile with Identity and launch counter; 9 tests + 1 OS store test (run once, cleaned up); chat and message tables come with `max-core` |
-| `max-core` | session, auth flows, sync, event dispatch, server config | 2 | open |
+| `max-core` | session, auth flows, sync, event dispatch, server config | 2 | done 2026-11-19: Session (SESSION_INIT, QR, SMS, 2FA password, LOGIN), Supervisor (reconnect, re-login), 6 flow tests on a scripted server; typed push dispatch, sync markers, logout open |
 | `max-media` | uploads/downloads, image/video/audio decode, Lottie | 3 | open |
 | `app` | gpui-kit UI, desktop integration | 3 | open |
 

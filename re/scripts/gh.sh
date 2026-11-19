@@ -13,4 +13,4 @@ log="$root/re/out/gh_${script%.java}.log"
 cmd //c "$GHIDRA_INSTALL_DIR\\support\\analyzeHeadless.bat" \
   "$root/re/ghidra" max -process "$program" -noanalysis -readOnly \
   -scriptPath "$root/re/ghidra_scripts" -postScript "$script" "$@" > "$log" 2>&1
-grep -E 'matches=|Decompile wrote|MaxRs |ERROR|Exception' "$log" | grep -v 'INFO  Using' | tail -15 || true
+grep -E 'matches=|Decompile wrote|MaxRs |ExtractSchemas|ERROR|Exception' "$log" | grep -v 'INFO  Using' | tail -15 || true

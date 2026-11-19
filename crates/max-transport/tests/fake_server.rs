@@ -76,11 +76,16 @@ fn no_ping() -> TransportConfig {
     }
 }
 
+/// The captured response shape: schema keys (`lang`, `reg-country-code`) and extra ones
+/// (`location`, `qr-auth-enabled`) that the client ignores.
 #[derive(Serialize)]
 struct InitReply {
     location: &'static str,
     #[serde(rename = "qr-auth-enabled")]
     qr: bool,
+    lang: bool,
+    #[serde(rename = "reg-country-code")]
+    reg: Vec<&'static str>,
 }
 
 #[tokio::test]
@@ -99,6 +104,8 @@ async fn session_init_roundtrip_with_lz4_response() {
             &InitReply {
                 location: "RU",
                 qr: true,
+                lang: true,
+                reg: vec!["AZ", "AM"],
             },
         )
         .await;
@@ -125,8 +132,8 @@ async fn session_init_roundtrip_with_lz4_response() {
         .call(Opcode::SessionInit, &Init { user_agent: &ua })
         .await
         .unwrap();
-    assert_eq!(resp.location.as_deref(), Some("RU"));
-    assert_eq!(resp.qr_auth_enabled, Some(true));
+    assert_eq!(resp.lang, Some(true));
+    assert_eq!(resp.reg_country_code.unwrap(), ["AZ", "AM"]);
     server.await.unwrap();
     assert_eq!(t.pending(), 0);
 }

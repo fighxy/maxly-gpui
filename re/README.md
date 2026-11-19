@@ -34,6 +34,18 @@ eats `| ^ & < >` on the command line.
 | `ListFunctions.java` | `@regex-file out.tsv` | entry, size, callers, full name |
 | `Decompile.java` | `out-dir @selectors` (`0xaddr`, `name:regex`, `callers:0xaddr`) | one `.c` per function + `index.tsv` |
 | `SymbolAt.java` | `0xaddr...` | nearest symbol and references to it |
+| `ExtractSchemas.java` | `out.tsv` | every `SerializableMember` struct: key, type, flag (core.dll: ~80 s) |
+| `ListVtables.java` | `@regex-file out.tsv` | vftable counts by template name |
+
+Packet schemas end to end:
+
+```sh
+bash re/scripts/gh.sh core.dll ExtractSchemas.java 'C:\dev\maxrs\re\out\schemas.tsv'
+cp re/out/schemas.tsv rust/research/packet-schemas.tsv
+node re/scripts/schemas_md.mjs rust/research/packet-schemas.tsv rust/research/packet-schemas.md
+node re/scripts/gen_schema_rs.mjs rust/research/packet-schemas.tsv crates/max-proto/src/schema.rs
+cargo fmt --all
+```
 
 Import another binary:
 

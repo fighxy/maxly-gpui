@@ -13,6 +13,9 @@ pub mod msgpack;
 mod opcode;
 pub mod packets;
 pub mod payload;
+/// Every packet and type layout of the desktop client, generated from `core.dll`
+/// (`re/scripts/gen_schema_rs.mjs`; reference: `rust/research/packet-schemas.md`).
+pub mod schema;
 
 pub use cmd::Cmd;
 pub use compress::{MAX_PLAIN_LEN, compress_server_payload, compression_hint, decompress};

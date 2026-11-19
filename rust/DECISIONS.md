@@ -99,3 +99,15 @@ default (the server uses them for content) and can be overridden. `clientSession
 per-profile counter, +1 per launch, starting at 1 (client log: 1, 2, 3 over three launches).
 Consequences: No hardware data leaves the machine. Two installs on one machine look like two
 devices. `max-identity` has no code that reads disks, adapters or CPUID.
+
+## ADR-009: Local storage encrypted with SQLCipher, keys protected by DPAPI
+Status: accepted (2026-11-19)
+Context: The client keeps chats, messages, the identity (ADR-008) and a login token on disk.
+The official client stores its data with SQLCipher (`storage/backends/sqlcipher`).
+Decision: One SQLCipher database per profile. Its 256-bit key is random, generated on first
+run, and kept in the Windows user's protected store (DPAPI), never in a file next to the
+database. The login token is kept in the same protected store, not in the database.
+Consequences: Data is unreadable without the Windows user's logon secrets; copying the profile
+folder to another account or machine does not reveal it. Losing the protected entry loses the
+local cache (the account itself is unaffected: log in again). Other platforms use their own
+keystore behind the same interface later.

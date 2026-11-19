@@ -1,0 +1,37 @@
+# Building maxrs
+
+## Windows
+
+- Rust (MSVC toolchain), with the Visual Studio Build Tools C++ workload (`cl`, `nmake`, `link`).
+- A full Perl for the OpenSSL build behind SQLCipher (`max-store`). Perl from Git for Windows
+  does not work (it lacks modules OpenSSL's `Configure` needs). Use portable Strawberry Perl,
+  unpacked without installing, and point the build at it:
+
+  ```powershell
+  [Environment]::SetEnvironmentVariable('OPENSSL_SRC_PERL', "$env:USERPROFILE\.local\strawberry-perl\perl\bin\perl.exe", 'User')
+  ```
+
+  New shells see the variable; an already open shell needs it exported by hand.
+- A short path to the target directory. OpenSSL's build tree is deep, and MSVC fails with
+  `C1083: Invalid argument` when paths get too long; `C:\dev\maxrs\target` is fine.
+- NASM is not needed: OpenSSL is built with `no-asm`.
+
+The first build of `max-store` compiles OpenSSL and SQLCipher and takes about 4 minutes;
+later builds reuse it.
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+`max-store` has one test that writes to the Windows Credential Manager and deletes what it
+writes; it is ignored by default:
+
+```sh
+cargo test -p max-store --test os_secrets -- --ignored
+```
+
+## Reverse engineering tools
+
+See `re/README.md` (Ghidra, rea, Frida).

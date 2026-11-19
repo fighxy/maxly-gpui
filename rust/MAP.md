@@ -19,6 +19,7 @@ Read first: `DECISIONS.md`, `GLOSSARY.md`, `research/protocol-and-telemetry.md`,
 | 006 | Release split v1 / v2 / v3 as in the feature table; no recommendations |
 | 007 | UI: gpui + longbridge/gpui-kit; official QML screens as reference |
 | 008 | Random deviceId and device name instead of a hardware fingerprint |
+| 009 | SQLCipher database per profile; DB key and login token in the DPAPI-protected store |
 
 ## Feature parity table
 
@@ -35,7 +36,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
 | A1 | TCP/TLS to `api2.oneme.ru:443`, frame codec (ver 11, lz4 from server) | O 6; capture | v1 | done (`max-proto`, `max-transport`); not yet tried against the real server |
-| A2 | `SESSION_INIT` with desktop user agent, `deviceId`, `clientSessionId` | O 6; capture | v1 | done: packet (`max-proto`), values (`max-identity`: version table, random deviceId and name, OS version, language, time zone, launch counter); storage of `Identity` open (`max-store`) |
+| A2 | `SESSION_INIT` with desktop user agent, `deviceId`, `clientSessionId` | O 6; capture | v1 | done: packet (`max-proto`), values (`max-identity`: version table, random deviceId and name, OS version, language, time zone, launch counter); stored per profile (`max-store`) |
 | A3 | PING every 30 s `{interactive}`, reconnect, request timeouts | O 1; config `ping_interval` | v1 | ping, timeouts, close detection, backoff done (`max-transport`); reconnect loop with session re-init open (`max-core`) |
 | A4 | Failover hosts from server config | K `failover-hosts` | v1 | open |
 | A5 | Login sync (chats, contacts, config on `LOGIN`) | O 19, 22 | v1 | open |
@@ -227,7 +228,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | `max-proto` | frame codec, lz4, msgpack, opcode enum, packet types | 1 | done 2026-11-19: 30 tests (unit + capture headers), clippy -D warnings, fmt, no unsafe |
 | `max-transport` | TLS socket, seq/response matching, ping, reconnect, failover | 1 | done 2026-11-19: 15 tests (fake server over duplex, local TLS with rcgen), 5 stable runs, clippy -D warnings, fmt, no unsafe; reconnect loop and failover hosts left to `max-core` |
 | `max-identity` | user agent, device id, version table | 1 | done 2026-11-19: 12 tests, clippy -D warnings, fmt, no unsafe, no hardware probing (ADR-008) |
-| `max-store` | encrypted local DB, token in OS keystore | 2 | open |
+| `max-store` | encrypted local DB, token in OS keystore | 2 | done 2026-11-19: SQLCipher 4.20 (vendored OpenSSL), key and token in Credential Manager (DPAPI), profile with Identity and launch counter; 9 tests + 1 OS store test (run once, cleaned up); chat and message tables come with `max-core` |
 | `max-core` | session, auth flows, sync, event dispatch, server config | 2 | open |
 | `max-media` | uploads/downloads, image/video/audio decode, Lottie | 3 | open |
 | `app` | gpui-kit UI, desktop integration | 3 | open |
@@ -237,7 +238,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 1. ~~Release split~~ accepted: ADR-006.
 2. Channel view counts (D10) and stories marks: report or not (they are visible to authors)?
 3. Map provider for location bubbles (E10): Yandex static maps as the official client, or none.
-4. Platforms after Windows; local storage encryption (SQLCipher + DPAPI) — from the first planning round.
+4. Platforms after Windows (open); ~~storage encryption~~ accepted: ADR-009.
 5. Where Tracer sends from (not through OpenSSL in the pre-login capture).
 
 ## Out of scope

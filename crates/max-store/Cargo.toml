@@ -1,0 +1,24 @@
+[package]
+name = "max-store"
+version = "0.1.0"
+description = "Encrypted local storage (SQLCipher) with keys in the OS protected store (ADR-009)"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dirs = "7.0.0"
+getrandom = "0.4.3"
+keyring = { version = "3.6.3", features = ["windows-native"] }
+max-identity = { path = "../max-identity" }
+rusqlite = { version = "0.40.2", features = ["bundled-sqlcipher-vendored-openssl"] }
+serde = "1.0.229"
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+zeroize = { version = "1.9.2", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -32,6 +32,16 @@ writes; it is ignored by default:
 cargo test -p max-store --test os_secrets -- --ignored
 ```
 
+## Running the client
+
+```sh
+cargo run -p maxrs -- --demo        # made-up data, no network
+cargo run -p maxrs -- --demo-walk   # steps through every screen on a timer
+cargo run -p maxrs                  # connects to api2.oneme.ru
+```
+
+`tools/window-shot.ps1 -ProcessName maxrs -Out shot.png` captures only the client window.
+
 ## Reverse engineering tools
 
 See `re/README.md` (Ghidra, rea, Frida).

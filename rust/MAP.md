@@ -20,6 +20,7 @@ Read first: `DECISIONS.md`, `GLOSSARY.md`, `research/protocol-and-telemetry.md`,
 | 007 | UI: gpui + longbridge/gpui-kit; official QML screens as reference |
 | 008 | Random deviceId and device name instead of a hardware fingerprint |
 | 009 | SQLCipher database per profile; DB key and login token in the DPAPI-protected store |
+| 010 | UI stack pinned: gpui-kit =0.10.0 (gpui-pre 0.3.12); core on its own tokio runtime |
 
 ## Feature parity table
 
@@ -49,8 +50,8 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
-| B1 | QR login (create, poll, login by track) | O 288, 289, 291; Q `QrCodePage` | v1 | done in core (`Session::start_qr`, `poll_qr`, `finish_qr`); UI open; not tried on the real server |
-| B2 | Phone + SMS code login | O 17, 18, 23; Q `PhoneNumberPage`, `CodeEnterPage` | v1 | done in core (`request_code` START_AUTH/RESEND, `confirm_code` CHECK_CODE); UI open; not tried on the real server |
+| B1 | QR login (create, poll, login by track) | O 288, 289, 291; Q `QrCodePage` | v1 | done in core and UI (QR drawn from the link, refreshed on expiry); not tried on the real server |
+| B2 | Phone + SMS code login | O 17, 18, 23; Q `PhoneNumberPage`, `CodeEnterPage` | v1 | done in core and UI (phone, code, resend, other number, server error text); not tried on the real server; see open question 6 |
 | B3 | Two-factor password: login check, restore, hint | O 101, 104, 113, 115; Q `PasswordEnterPage`, `AuthForgotPasswordPage` | v1 | login check done (`check_password`); restore and hint open |
 | B4 | Registration: name, avatar presets | O 25; Q `NameEnterPage`, `AvatarPreset*` | v1 | detected (`AuthStep::RegistrationRequired`); flow open |
 | B5 | 2FA setup and management (email, hint, password) | O 109-112; Q `SFACreate*`, `SFAConfig*` | v2 | open |
@@ -231,7 +232,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | `max-store` | encrypted local DB, token in OS keystore | 2 | done 2026-11-19: SQLCipher 4.20 (vendored OpenSSL), key and token in Credential Manager (DPAPI), profile with Identity and launch counter; 9 tests + 1 OS store test (run once, cleaned up); chat and message tables come with `max-core` |
 | `max-core` | session, auth flows, sync, event dispatch, server config | 2 | done 2026-11-19: Session (SESSION_INIT, QR, SMS, 2FA password, LOGIN), Supervisor (reconnect, re-login), 6 flow tests on a scripted server; typed push dispatch, sync markers, logout open |
 | `max-media` | uploads/downloads, image/video/audio decode, Lottie | 3 | open |
-| `app` | gpui-kit UI, desktop integration | 3 | open |
+| `app` | gpui-kit UI, desktop integration | 3 | started 2026-11-19: window, QR, phone and code, 2FA password, chat list from LOGIN (local times), `--demo` and `--demo-walk` without network; message history, sending, settings open |
 
 ## Open questions
 
@@ -240,6 +241,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 3. Map provider for location bubbles (E10): Yandex static maps as the official client, or none.
 4. Platforms after Windows (open); ~~storage encryption~~ accepted: ADR-009.
 5. Where Tracer sends from (not through OpenSSL in the pre-login capture).
+6. Phone login with the desktop identity: the official desktop client offers it (`PhoneNumberPage`, `CodeEnterPage`, `CalloutPage`), so the server should accept it, possibly sending the code to the MAX app instead of SMS. If a test account shows the server refusing it for desktops, consider presenting as the Android client for login only; that needs RE of the Android APK (user agent, protocol version 10, opcodes) and a new ADR, since it contradicts ADR-003.
 
 ## Out of scope
 

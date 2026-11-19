@@ -111,3 +111,15 @@ Consequences: Data is unreadable without the Windows user's logon secrets; copyi
 folder to another account or machine does not reveal it. Losing the protected entry loses the
 local cache (the account itself is unaffected: log in again). Other platforms use their own
 keystore behind the same interface later.
+
+## ADR-010: Pinned UI stack
+Status: accepted (2026-11-19)
+Context: ADR-007 left the gpui-kit and gpui revisions to be fixed when the `app` crate starts.
+gpui-kit pins GPUI to one `gpui-pre` snapshot, and any snapshot may change GPUI's API.
+Decision: `gpui-kit = "=0.10.0"` from crates.io, which brings `gpui-pre =0.3.12`. The core runs
+on its own tokio runtime; events reach the UI through `tokio::sync::mpsc`, which works on
+GPUI's executor. Upgrades bump gpui-kit and its GPUI snapshot together, in a commit of their
+own, after `--demo-walk` screenshots look the same.
+Consequences: Rust 1.97 builds it on Windows (MSVC) with no extra tools. GPUI's `test`
+attribute macro shadows `#[test]` under `use gpui_kit::*`: test modules import only what they
+need.

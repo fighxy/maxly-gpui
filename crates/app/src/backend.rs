@@ -70,6 +70,8 @@ pub enum UiEvent {
     ImageFailed { url: String },
     /// A short note for the status line ("saved to ...").
     Notice(String),
+    /// Dialog titles learned after the chat list was shown: (chat id, title).
+    ChatTitles(Vec<(i64, String)>),
     /// Something failed; shown with a way to start over.
     Error(String),
 }
@@ -154,7 +156,7 @@ impl MessageRow {
     /// One line for the chat list: the text, or what is attached.
     pub fn preview(&self) -> String {
         if !self.text.is_empty() {
-            return self.text.clone();
+            return one_line(&self.text);
         }
         self.attachments
             .first()
@@ -617,6 +619,17 @@ async fn real_flow(
                     CoreEvent::LoggedIn(login) => {
                         *names.write().unwrap_or_else(PoisonError::into_inner) = Names::from_login(&login);
                         let (me, chats) = rows_from_login(&login);
+                        let peers = dialog_peers(&login);
+                        let (handle, names, ui) = (handle.clone(), names.clone(), ui.clone());
+                        tokio::spawn(async move {
+                            if let Ok(t) = handle.transport() {
+                                resolve_names(&t, &names, peers.iter().map(|p| p.1)).await;
+                                let titles = names.read().unwrap_or_else(PoisonError::into_inner).titles(&peers);
+                                if !titles.is_empty() {
+                                    let _ = ui.send(UiEvent::ChatTitles(titles));
+                                }
+                            }
+                        });
                         UiEvent::LoggedIn { me, chats }
                     }
                     CoreEvent::AuthRequired => UiEvent::Error("Нужно войти заново.".into()),
@@ -699,10 +712,13 @@ async fn real_flow(
                     }
                     UiCommand::OpenChat(chat_id) => {
                         tokio::spawn(async move {
-                            let result = match handle.transport() {
-                                Ok(t) => messages::history(&t, chat_id, now_ms(), messages::HISTORY_PAGE).await,
-                                Err(e) => Err(e),
-                            };
+                            let result = async {
+                                let t = handle.transport()?;
+                                let list = messages::history(&t, chat_id, now_ms(), messages::HISTORY_PAGE).await?;
+                                resolve_names(&t, &names, list.iter().filter_map(|m| m.sender)).await;
+                                Ok::<_, CoreError>(list)
+                            }
+                            .await;
                             let _ = ui.send(match result {
                                 Ok(list) => {
                                     let names = names.read().unwrap_or_else(PoisonError::into_inner);
@@ -715,10 +731,13 @@ async fn real_flow(
                     }
                     UiCommand::LoadOlder { chat_id, before } => {
                         tokio::spawn(async move {
-                            let result = match handle.transport() {
-                                Ok(t) => messages::history(&t, chat_id, before, messages::HISTORY_PAGE).await,
-                                Err(e) => Err(e),
-                            };
+                            let result = async {
+                                let t = handle.transport()?;
+                                let list = messages::history(&t, chat_id, before, messages::HISTORY_PAGE).await?;
+                                resolve_names(&t, &names, list.iter().filter_map(|m| m.sender)).await;
+                                Ok::<_, CoreError>(list)
+                            }
+                            .await;
                             let _ = ui.send(match result {
                                 Ok(list) => {
                                     let names = names.read().unwrap_or_else(PoisonError::into_inner);
@@ -882,18 +901,44 @@ impl Names {
         }
     }
 
-    /// A history row for a message.
+    /// Ids among `ids` with no known name, each once.
+    pub fn missing(&self, ids: impl IntoIterator<Item = i64>) -> Vec<i64> {
+        let mut out: Vec<i64> = ids
+            .into_iter()
+            .filter(|id| *id != 0 && !self.contacts.contains_key(id))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Learn names from `CONTACT_INFO`.
+    pub fn add(&mut self, contacts: &[Contact]) {
+        for c in contacts {
+            self.contacts.insert(c.id, contact_name(c));
+        }
+    }
+
+    /// Known titles for dialogs given as (chat id, peer id).
+    pub fn titles(&self, peers: &[(i64, i64)]) -> Vec<(i64, String)> {
+        peers
+            .iter()
+            .filter_map(|(chat, peer)| self.contacts.get(peer).map(|n| (*chat, n.clone())))
+            .collect()
+    }
+
+    /// A history row for a message. Channel posts have no sender: not ours, no name.
     pub fn row(&self, m: &messages::Message) -> MessageRow {
-        let sender_id = m.sender.unwrap_or(self.me);
         MessageRow {
             id: m.id,
             cid: m.cid,
-            out: sender_id == self.me,
-            sender: self
-                .contacts
-                .get(&sender_id)
-                .cloned()
-                .unwrap_or_else(|| format!("id {sender_id}")),
+            out: m.sender == Some(self.me),
+            sender: m.sender.map_or_else(String::new, |id| {
+                self.contacts
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("id {id}"))
+            }),
             text: bubble_text(m),
             time: m.time,
             delivery: Delivery::Sent,
@@ -1173,6 +1218,49 @@ fn contact_name(c: &Contact) -> String {
         .unwrap_or_else(|| format!("id {}", c.id))
 }
 
+/// Fetch names for ids we do not know yet; a failure leaves them as ids.
+async fn resolve_names(
+    t: &max_transport::Transport,
+    names: &RwLock<Names>,
+    ids: impl IntoIterator<Item = i64>,
+) {
+    let missing = names
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .missing(ids);
+    if missing.is_empty() {
+        return;
+    }
+    match max_core::contacts::contact_info(t, &missing).await {
+        Ok(found) => names
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .add(&found),
+        Err(e) => crate::trace::note(&format!("contact info failed: {e}")),
+    }
+}
+
+/// Dialogs without a title, as (chat id, the other participant).
+pub fn dialog_peers(login: &LoginResponse) -> Vec<(i64, i64)> {
+    let me = login.profile.contact.id;
+    login
+        .chats
+        .iter()
+        .filter(|c| c.title.as_deref().is_none_or(str::is_empty))
+        .filter_map(|c| {
+            c.participants
+                .keys()
+                .find(|id| **id != me)
+                .map(|p| (c.id, *p))
+        })
+        .collect()
+}
+
+/// Text on one line, for chat list previews.
+pub fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Chat list rows from the initial sync, newest first.
 pub fn rows_from_login(login: &LoginResponse) -> (String, Vec<ChatRow>) {
     let me_id = login.profile.contact.id;
@@ -1209,7 +1297,7 @@ fn row(chat: &Chat, me_id: i64, contacts: &BTreeMap<i64, &Contact>) -> ChatRow {
     let preview = chat
         .last_message
         .as_ref()
-        .map(message_text)
+        .map(|m| one_line(&message_text(m)))
         .unwrap_or_default();
     ChatRow {
         id: chat.id,
@@ -1286,5 +1374,69 @@ mod tests {
             payload,
         });
         assert_eq!(message(&e), "Неверный код");
+    }
+
+    fn login_with(chats: Vec<Chat>) -> LoginResponse {
+        LoginResponse {
+            profile: ProfileT {
+                contact: contact(1, "Я"),
+                ..ProfileT::default()
+            },
+            chats,
+            ..LoginResponse::default()
+        }
+    }
+
+    #[test]
+    fn channel_posts_are_not_ours_and_have_no_sender() {
+        let names = Names::from_login(&login_with(vec![]));
+        let post = Message {
+            text: Some("новость".into()),
+            ..Message::default()
+        };
+        let row = names.row(&post);
+        assert!(!row.out);
+        assert_eq!(row.sender, "");
+        let mine = Message {
+            sender: Some(1),
+            ..Message::default()
+        };
+        assert!(names.row(&mine).out);
+    }
+
+    #[test]
+    fn unknown_dialog_peers_get_names_later() {
+        let dialog = Chat {
+            id: 10,
+            participants: [(1, 0), (7, 0)].into_iter().collect(),
+            ..Chat::default()
+        };
+        let channel = Chat {
+            id: -5,
+            title: Some("Канал".into()),
+            participants: [(1, 0)].into_iter().collect(),
+            ..Chat::default()
+        };
+        let login = login_with(vec![dialog, channel]);
+        let peers = dialog_peers(&login);
+        assert_eq!(peers, [(10, 7)]);
+        let mut names = Names::from_login(&login);
+        assert_eq!(names.missing([7, 1, 7, 0]), [7]);
+        assert!(names.titles(&peers).is_empty());
+        names.add(&[contact(7, "Борис")]);
+        assert_eq!(names.titles(&peers), [(10, "Борис".to_string())]);
+        assert!(names.missing([7]).is_empty());
+    }
+
+    #[test]
+    fn previews_are_one_line() {
+        assert_eq!(
+            one_line(
+                "OZON.ru
+
+Для  проверки	"
+            ),
+            "OZON.ru Для проверки"
+        );
     }
 }

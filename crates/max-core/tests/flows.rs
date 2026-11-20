@@ -765,3 +765,47 @@ async fn older_page_and_mark_read() {
     assert_eq!(r.unread, Some(0));
     let _keep = srv.await.unwrap();
 }
+
+#[tokio::test]
+async fn contact_info_sends_ids_only() {
+    use max_core::contacts::contact_info;
+
+    let root = tempfile::tempdir().unwrap();
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::new());
+    let mut p = profile(&root, &secrets);
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(async move {
+        let mut s = Server::new(server);
+        s.session_init().await;
+        let (seq, body) = s.expect(Opcode::ContactInfo).await;
+        let ids: Vec<i64> = get(&body, "contactIds")
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, [7, 9]);
+        assert_eq!(body.as_map().unwrap().len(), 1, "only contactIds");
+        let anna = map(&[
+            ("id", 7i64.into()),
+            (
+                "names",
+                Value::Array(vec![map(&[("firstName", "Анна".into())])]),
+            ),
+        ]);
+        s.reply(
+            Opcode::ContactInfo,
+            seq,
+            &map(&[("contacts", Value::Array(vec![anna]))]),
+        )
+        .await;
+        s
+    });
+    let session = Session::start(client, &config(), &mut p, &env())
+        .await
+        .unwrap();
+    let found = contact_info(session.transport(), &[7, 9]).await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, 7);
+    let _keep = srv.await.unwrap();
+}

@@ -42,3 +42,21 @@ close it in the phone app's list of active sessions and delete the profile folde
 
 For each step note: worked / server error (the `error` and `localizedMessage` in the trace) /
 nothing happened. Any server `cmd=Error` (3) line answers which guess was wrong.
+
+## Results
+
+Run 1 (phone login): `AUTH_REQUEST` accepted with the desktop identity; `requestMaxDuration` and
+`altActionDuration` are in ms. `AUTH` CHECK_CODE refused with
+`error.profile.active.session.no2fa` (MAP question 6).
+
+Run 2 (QR login):
+
+| # | Result |
+|---|--------|
+| 1 | works: `CREATE_QR` → `AUTH_CHECK` ×3 → `AUTH_BY_TRACK` → `LOGIN` |
+| 2 | works; `LOGIN` with zero sync markers has no `contacts`, so dialog peers were bare ids (now fetched with `CONTACT_INFO`) |
+| 3 | works: `CHAT_HISTORY` with `from` = now, `backward` 40, the rest 0 is accepted |
+| 5 | accepted: `CHAT_MARK` answers `{mark, unread: 0}`; `mark` in the answer is the server's own |
+| 8 | fails: every `i.oneme.ru` image request failed before an HTTP status ("error sending request"); the cause chain is now logged |
+
+Channel posts have no `sender`; they were shown as ours (fixed). Steps 4, 6, 7, 9–13 not done yet.

@@ -110,6 +110,18 @@ pub fn attachments(m: &Message) -> Vec<Attachment> {
         .collect()
 }
 
+/// An HTTP failure with its whole cause chain (reqwest's own text hides TLS and connect causes).
+fn http_error(e: reqwest::Error) -> CoreError {
+    let mut text = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    CoreError::Http(text)
+}
+
 /// HTTPS for media and uploads, with the certificate rules of ADR-011 and the desktop user agent.
 #[derive(Clone)]
 pub struct Http {
@@ -123,7 +135,7 @@ impl Http {
             .tls_backend_preconfigured(http_tls_config()?)
             .user_agent(user_agent)
             .build()
-            .map_err(|e| CoreError::Http(e.to_string()))?;
+            .map_err(http_error)?;
         Ok(Http { client })
     }
 
@@ -135,14 +147,11 @@ impl Http {
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| CoreError::Http(e.to_string()))?;
+            .map_err(http_error)?;
         if resp.content_length().is_some_and(|n| n > max as u64) {
             return Err(CoreError::Http(format!("{url}: larger than {max} bytes")));
         }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| CoreError::Http(e.to_string()))?;
+        let body = resp.bytes().await.map_err(http_error)?;
         if body.len() > max {
             return Err(CoreError::Http(format!("{url}: larger than {max} bytes")));
         }
@@ -187,7 +196,7 @@ pub async fn upload_photo(
     let part = reqwest::multipart::Part::stream(data)
         .file_name(file_name.to_string())
         .mime_str(mime)
-        .map_err(|e| CoreError::Http(e.to_string()))?;
+        .map_err(http_error)?;
     let form = reqwest::multipart::Form::new().part("file", part);
     let body: serde_json::Value = http
         .client
@@ -196,10 +205,10 @@ pub async fn upload_photo(
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| CoreError::Http(e.to_string()))?
+        .map_err(http_error)?
         .json()
         .await
-        .map_err(|e| CoreError::Http(e.to_string()))?;
+        .map_err(http_error)?;
     photo_token(&body)
 }
 
@@ -244,7 +253,7 @@ pub async fn upload_file(
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| CoreError::Http(e.to_string()))?;
+        .map_err(http_error)?;
     Ok(info.file_id)
 }
 

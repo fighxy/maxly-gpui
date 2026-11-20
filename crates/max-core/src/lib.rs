@@ -13,6 +13,7 @@
 
 mod auth;
 mod config;
+pub mod contacts;
 mod error;
 pub mod media;
 pub mod messages;

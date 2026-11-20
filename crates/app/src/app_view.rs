@@ -270,6 +270,15 @@ impl AppView {
             UiEvent::ImageFailed { url } => {
                 self.images.insert(url, ImageState::Failed);
             }
+            UiEvent::ChatTitles(titles) => {
+                if let Screen::Main { chats, .. } = &mut self.screen {
+                    for (id, title) in titles {
+                        if let Some(row) = chats.iter_mut().find(|c| c.id == id) {
+                            row.title = title;
+                        }
+                    }
+                }
+            }
             UiEvent::Notice(text) => {
                 if let Screen::Main { status, .. } = &mut self.screen {
                     *status = Some(text);

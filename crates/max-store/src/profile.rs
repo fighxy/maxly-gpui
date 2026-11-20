@@ -102,9 +102,50 @@ impl Profile {
         Ok(id)
     }
 
+    /// A handle to this profile's login token that can live apart from the profile (the
+    /// supervisor owns the profile while logout and session closing need the token).
+    pub fn token_store(&self) -> TokenStore {
+        TokenStore {
+            secrets: self.secrets.clone(),
+            key: secret_name(&self.name, "auth-token"),
+        }
+    }
+
     /// The login token, if logged in.
     pub fn auth_token(&self) -> Result<Option<Zeroizing<String>>> {
-        match self.secrets.get(&secret_name(&self.name, "auth-token"))? {
+        self.token_store().get()
+    }
+
+    /// Keep the login token in the protected store.
+    pub fn set_auth_token(&self, token: &str) -> Result<()> {
+        self.token_store().set(token)
+    }
+
+    /// Forget the login token (log out).
+    pub fn clear_auth_token(&self) -> Result<()> {
+        self.token_store().clear()
+    }
+}
+
+/// The login token of one profile, in the protected store.
+#[derive(Clone)]
+pub struct TokenStore {
+    secrets: Arc<dyn SecretStore>,
+    key: String,
+}
+
+impl std::fmt::Debug for TokenStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenStore")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TokenStore {
+    /// The login token, if logged in.
+    pub fn get(&self) -> Result<Option<Zeroizing<String>>> {
+        match self.secrets.get(&self.key)? {
             None => Ok(None),
             Some(bytes) => {
                 let bytes = Zeroizing::new(bytes);
@@ -115,15 +156,14 @@ impl Profile {
         }
     }
 
-    /// Keep the login token in the protected store.
-    pub fn set_auth_token(&self, token: &str) -> Result<()> {
-        self.secrets
-            .set(&secret_name(&self.name, "auth-token"), token.as_bytes())
+    /// Keep a new login token.
+    pub fn set(&self, token: &str) -> Result<()> {
+        self.secrets.set(&self.key, token.as_bytes())
     }
 
-    /// Forget the login token (log out).
-    pub fn clear_auth_token(&self) -> Result<()> {
-        self.secrets.delete(&secret_name(&self.name, "auth-token"))
+    /// Forget the login token.
+    pub fn clear(&self) -> Result<()> {
+        self.secrets.delete(&self.key)
     }
 }
 

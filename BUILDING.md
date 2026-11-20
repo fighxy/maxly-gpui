@@ -41,7 +41,8 @@ cargo run -p maxrs                  # connects to api2.oneme.ru
 cargo run -p maxrs -- --trace       # same, with a local protocol trace (rust/research/live-check.md)
 ```
 
-`tools/window-shot.ps1 -ProcessName maxrs -Out shot.png` captures only the client window.
+`tools/window-shot.ps1 -ProcessName maxrs -Out shot.png` captures only the client window;
+`tools/window-click.ps1 -ProcessName maxrs -X 289 -Y 25` posts a click to it without moving the cursor.
 
 ## Reverse engineering tools
 

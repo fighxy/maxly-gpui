@@ -17,7 +17,7 @@ mod secrets;
 
 pub use database::{Database, DbKey};
 pub use error::StoreError;
-pub use profile::{Profile, default_profiles_dir};
+pub use profile::{Profile, TokenStore, default_profiles_dir};
 pub use secrets::{MemorySecrets, OsSecrets, SecretStore};
 
 /// Result type of this crate.

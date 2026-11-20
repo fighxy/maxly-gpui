@@ -4,13 +4,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use max_identity::Environment;
-use max_store::Profile;
+use max_proto::Opcode;
+use max_proto::schema::packets::sessions_close;
+use max_store::{Profile, TokenStore};
 use max_transport::{Incoming, Response, Transport, connect, tls_config_for};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
+use crate::account::NoParams;
 use crate::{CoreConfig, CoreError, LoginResponse, Result, Session, SyncState};
 
 /// A byte stream the core can run a session over.
@@ -72,6 +75,7 @@ pub enum CoreEvent {
 pub struct SupervisorHandle {
     current: Arc<Mutex<Option<Transport>>>,
     stop: CancellationToken,
+    token: TokenStore,
 }
 
 impl SupervisorHandle {
@@ -88,6 +92,39 @@ impl SupervisorHandle {
     /// Send a request on the current connection.
     pub async fn request(&self, opcode: u16, payload: impl Into<Bytes>) -> Result<Response> {
         Ok(self.transport()?.request(opcode, payload).await?)
+    }
+
+    /// End this session on the server (`LOGOUT`), forget the token and stop. The token is
+    /// forgotten even when the server cannot be reached, so the next start asks to log in.
+    pub async fn logout(&self) -> Result<()> {
+        let sent = match self.transport() {
+            Ok(t) => t
+                .call::<_, rmpv::Value>(Opcode::Logout, &NoParams {})
+                .await
+                .map(drop)
+                .map_err(CoreError::from),
+            Err(e) => Err(e),
+        };
+        let cleared = self.token.clear();
+        self.stop();
+        cleared?;
+        if let Err(e) = sent {
+            debug!(error = %e, "logout request failed; token forgotten anyway");
+        }
+        Ok(())
+    }
+
+    /// End every other session of the account (`SESSIONS_CLOSE`) and keep the new token the
+    /// server issues for this one.
+    pub async fn close_other_sessions(&self) -> Result<()> {
+        let r: sessions_close::Response = self
+            .transport()?
+            .call(Opcode::SessionsClose, &NoParams {})
+            .await?;
+        if !r.token.is_empty() {
+            self.token.set(&r.token)?;
+        }
+        Ok(())
     }
 
     /// Stop the supervisor and close the connection.
@@ -120,6 +157,7 @@ impl Supervisor {
         let handle = SupervisorHandle {
             current: Arc::new(Mutex::new(None)),
             stop: CancellationToken::new(),
+            token: profile.token_store(),
         };
         tokio::spawn(run(config, connector, profile, env, handle.clone(), events));
         (handle, rx)

@@ -72,6 +72,12 @@ pub enum UiEvent {
     Notice(String),
     /// Dialog titles learned after the chat list was shown: (chat id, title).
     ChatTitles(Vec<(i64, String)>),
+    /// The account's active sessions.
+    Sessions(Vec<SessionRow>),
+    /// The sessions could not be loaded or closed.
+    SessionsFailed(String),
+    /// Logged out: the token is gone and the login screens follow.
+    LoggedOut,
     /// Something failed; shown with a way to start over.
     Error(String),
 }
@@ -118,6 +124,46 @@ pub enum UiCommand {
     LoadOlder { chat_id: i64, before: i64 },
     /// Tell the server the chat is read up to `message_id`.
     MarkRead { chat_id: i64, message_id: i64 },
+    /// Load the account's active sessions.
+    LoadSessions,
+    /// End every session but this one.
+    CloseOtherSessions,
+    /// End this session and forget the token.
+    Logout,
+}
+
+/// One active session of the account, for the account panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionRow {
+    /// Client name and version.
+    pub client: String,
+    /// Device or OS.
+    pub info: String,
+    /// Where the server places it.
+    pub location: String,
+    /// Last activity, Unix ms.
+    pub time: i64,
+    /// This client.
+    pub current: bool,
+}
+
+impl SessionRow {
+    fn from_info(s: &max_core::account::SessionInfo) -> SessionRow {
+        SessionRow {
+            client: s.client.clone(),
+            info: s.info.clone(),
+            location: s.location.clone(),
+            time: s.time,
+            current: s.current.unwrap_or(false),
+        }
+    }
+}
+
+/// Sessions with this one first, then the most recently active.
+fn session_rows(list: &[max_core::account::SessionInfo]) -> Vec<SessionRow> {
+    let mut rows: Vec<SessionRow> = list.iter().map(SessionRow::from_info).collect();
+    rows.sort_by_key(|r| (std::cmp::Reverse(r.current), std::cmp::Reverse(r.time)));
+    rows
 }
 
 /// Delivery state of a message in the history view.
@@ -332,6 +378,7 @@ async fn demo_flow(
             UiCommand::Code(_) | UiCommand::Password(_) => break,
             UiCommand::OpenChat(_) | UiCommand::SendText { .. } => {}
             UiCommand::LoadOlder { .. } | UiCommand::MarkRead { .. } => {}
+            UiCommand::LoadSessions | UiCommand::CloseOtherSessions | UiCommand::Logout => {}
             UiCommand::FetchImage(_)
             | UiCommand::DownloadFile { .. }
             | UiCommand::SendFile { .. } => {}
@@ -472,9 +519,53 @@ async fn demo_flow(
                     message: row,
                 });
             }
+            UiCommand::LoadSessions => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ = ui.send(UiEvent::Sessions(demo_sessions(now_ms(), false)));
+            }
+            UiCommand::CloseOtherSessions => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = ui.send(UiEvent::Sessions(demo_sessions(now_ms(), true)));
+                let _ = ui.send(UiEvent::Notice("Другие сеансы завершены".into()));
+            }
+            UiCommand::Logout => {
+                let _ = ui.send(UiEvent::LoggedOut);
+                let _ = ui.send(UiEvent::Qr(
+                    "https://max.ru/:auth/demo-only-not-a-real-login".into(),
+                ));
+            }
             _ => {}
         }
     }
+}
+
+/// Made-up sessions: this one, and two others unless they were closed.
+fn demo_sessions(now: i64, only_current: bool) -> Vec<SessionRow> {
+    let row = |client: &str, info: &str, location: &str, ago: i64, current: bool| SessionRow {
+        client: client.into(),
+        info: info.into(),
+        location: location.into(),
+        time: now - ago,
+        current,
+    };
+    let mut rows = vec![row("MAX Desktop 26.41", "Windows", "Россия", 0, true)];
+    if !only_current {
+        rows.push(row(
+            "MAX Android 25.20",
+            "Pixel 7",
+            "Россия",
+            3_600_000,
+            false,
+        ));
+        rows.push(row(
+            "MAX Web",
+            "Firefox",
+            "Казахстан",
+            5 * 86_400_000,
+            false,
+        ));
+    }
+    rows
 }
 
 fn demo_row(id: i64, out: bool, text: &str, time: i64, delivery: Delivery) -> MessageRow {
@@ -585,17 +676,34 @@ async fn real_flow(
 ) -> Result<(), String> {
     let root = default_profiles_dir().ok_or("no local data folder")?;
     let secrets: Arc<dyn SecretStore> = Arc::new(OsSecrets::new("maxrs"));
-    let mut profile = Profile::open(&root, "default", secrets).map_err(|e| e.to_string())?;
-    let env = Environment::detect();
     let mut config = CoreConfig::default();
     config.transport.trace = crate::trace::transport_trace();
+    // Each pass is one logged-in run; logout starts the next pass at the login screens.
+    loop {
+        let profile =
+            Profile::open(&root, "default", secrets.clone()).map_err(|e| e.to_string())?;
+        if !run_logged_in(profile, &config, &ui, &mut commands).await? {
+            return Ok(());
+        }
+    }
+}
+
+/// Log in if needed, then serve the UI until it closes (`false`) or the user logs out (`true`).
+async fn run_logged_in(
+    mut profile: Profile,
+    config: &CoreConfig,
+    ui: &UnboundedSender<UiEvent>,
+    commands: &mut UnboundedReceiver<UiCommand>,
+) -> Result<bool, String> {
+    let env = Environment::detect();
+    let config = config.clone();
 
     if profile.auth_token().map_err(|e| e.to_string())?.is_none() {
         let _ = ui.send(UiEvent::Status("Подключение…".into()));
         let session = Session::connect(&config, &mut profile, &env)
             .await
             .map_err(|e| e.to_string())?;
-        let token = login(&session, &ui, &mut commands, &env.system_language).await?;
+        let token = login(&session, ui, commands, &env.system_language).await?;
         profile.set_auth_token(&token).map_err(|e| e.to_string())?;
         session.transport().close();
     }
@@ -775,12 +883,51 @@ async fn real_flow(
                             });
                         });
                     }
+                    UiCommand::LoadSessions => {
+                        tokio::spawn(async move {
+                            let result = match handle.transport() {
+                                Ok(t) => max_core::account::sessions(&t).await,
+                                Err(e) => Err(e),
+                            };
+                            let _ = ui.send(match result {
+                                Ok(list) => UiEvent::Sessions(session_rows(&list)),
+                                Err(e) => UiEvent::SessionsFailed(message(&e)),
+                            });
+                        });
+                    }
+                    UiCommand::CloseOtherSessions => {
+                        tokio::spawn(async move {
+                            let result = async {
+                                handle.close_other_sessions().await?;
+                                max_core::account::sessions(&handle.transport()?).await
+                            }
+                            .await;
+                            match result {
+                                Ok(list) => {
+                                    let _ = ui.send(UiEvent::Sessions(session_rows(&list)));
+                                    let _ = ui.send(UiEvent::Notice("Другие сеансы завершены".into()));
+                                }
+                                Err(e) => {
+                                    let _ = ui.send(UiEvent::SessionsFailed(message(&e)));
+                                }
+                            }
+                        });
+                    }
+                    UiCommand::Logout => {
+                        if let Err(e) = handle.logout().await {
+                            let _ = ui.send(UiEvent::SessionsFailed(format!("Не удалось выйти: {}", message(&e))));
+                            continue;
+                        }
+                        let _ = ui.send(UiEvent::LoggedOut);
+                        return Ok(true);
+                    }
                     _ => {}
                 }
             }
         }
     }
-    Ok(())
+    handle.stop();
+    Ok(false)
 }
 
 type FileWaiters = std::collections::HashMap<i64, tokio::sync::oneshot::Sender<Option<String>>>;
@@ -1426,6 +1573,20 @@ mod tests {
         names.add(&[contact(7, "Борис")]);
         assert_eq!(names.titles(&peers), [(10, "Борис".to_string())]);
         assert!(names.missing([7]).is_empty());
+    }
+
+    #[test]
+    fn this_session_first_then_newest() {
+        use max_core::account::SessionInfo;
+        let s = |client: &str, time: i64, current: bool| SessionInfo {
+            client: client.into(),
+            time,
+            current: Some(current),
+            ..SessionInfo::default()
+        };
+        let rows = session_rows(&[s("old", 1, false), s("me", 5, true), s("new", 9, false)]);
+        let order: Vec<&str> = rows.iter().map(|r| r.client.as_str()).collect();
+        assert_eq!(order, ["me", "new", "old"]);
     }
 
     #[test]

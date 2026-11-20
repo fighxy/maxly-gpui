@@ -11,6 +11,7 @@
 //! the string values (`START_AUTH`, `CHECK_CODE`, token kinds `LOGIN` / `REGISTER`) come from
 //! `core.dll` (`rust/research/protocol-and-telemetry.md`). No telemetry is sent (ADR-005).
 
+pub mod account;
 mod auth;
 mod config;
 pub mod contacts;

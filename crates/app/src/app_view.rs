@@ -13,7 +13,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use max_core::media::Attachment;
 
-use crate::backend::{ChatRow, Delivery, MessageRow, UiCommand, UiEvent};
+use crate::backend::{ChatRow, Delivery, MessageRow, SessionRow, UiCommand, UiEvent};
 use crate::qr;
 
 enum Screen {
@@ -42,6 +42,24 @@ enum Screen {
         status: Option<String>,
     },
     Error(String),
+}
+
+/// The account panel: active sessions and logout.
+#[derive(Default)]
+struct AccountPanel {
+    /// `None` while loading.
+    sessions: Option<Vec<SessionRow>>,
+    error: Option<String>,
+    /// An action waiting for a second click.
+    confirm: Option<AccountAction>,
+    /// A request is on its way.
+    busy: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccountAction {
+    CloseOthers,
+    Logout,
 }
 
 /// The messages of one chat as far as they are loaded.
@@ -152,6 +170,8 @@ pub struct AppView {
     composer: Entity<InputState>,
     scroll: ScrollHandle,
     commands: UnboundedSender<UiCommand>,
+    /// Shown instead of a chat while open.
+    account: Option<AccountPanel>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -197,6 +217,7 @@ impl AppView {
             scroll: ScrollHandle::new(),
             images: HashMap::new(),
             commands,
+            account: None,
             _subscriptions: subscriptions,
         }
     }
@@ -270,6 +291,25 @@ impl AppView {
             }
             UiEvent::ImageFailed { url } => {
                 self.images.insert(url, ImageState::Failed);
+            }
+            UiEvent::Sessions(rows) => {
+                if let Some(panel) = &mut self.account {
+                    panel.sessions = Some(rows);
+                    panel.error = None;
+                    panel.busy = false;
+                }
+            }
+            UiEvent::SessionsFailed(error) => {
+                if let Some(panel) = &mut self.account {
+                    panel.error = Some(error);
+                    panel.busy = false;
+                }
+            }
+            UiEvent::LoggedOut => {
+                self.account = None;
+                self.histories.clear();
+                self.images.clear();
+                self.screen = Screen::Status("Вы вышли из аккаунта".into());
             }
             UiEvent::ChatTitles(titles) => {
                 if let Screen::Main { chats, .. } = &mut self.screen {
@@ -471,6 +511,7 @@ impl AppView {
             return;
         };
         *selected = Some(chat_id);
+        self.account = None;
         if let Some(row) = chats.iter_mut().find(|c| c.id == chat_id) {
             row.unread = 0;
         }
@@ -483,6 +524,182 @@ impl AppView {
         self.scroll.scroll_to_bottom();
         self.mark_read(chat_id);
         cx.notify();
+    }
+
+    /// Open the account panel and ask for the sessions.
+    fn open_account(&mut self, cx: &mut Context<Self>) {
+        if self.commands.send(UiCommand::LoadSessions).is_ok() {
+            self.account = Some(AccountPanel::default());
+            cx.notify();
+        }
+    }
+
+    /// First click asks for confirmation, the second one acts.
+    fn account_action(&mut self, action: AccountAction, cx: &mut Context<Self>) {
+        let Some(panel) = &mut self.account else {
+            return;
+        };
+        if panel.confirm != Some(action) {
+            panel.confirm = Some(action);
+        } else {
+            let command = match action {
+                AccountAction::CloseOthers => UiCommand::CloseOtherSessions,
+                AccountAction::Logout => UiCommand::Logout,
+            };
+            if self.commands.send(command).is_ok() {
+                panel.confirm = None;
+                panel.busy = true;
+                panel.error = None;
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_account(&self, me: &str, panel: &AccountPanel, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let others = panel
+            .sessions
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|s| !s.current));
+        let list: Vec<AnyElement> = match &panel.sessions {
+            None => vec![
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("Загрузка…")
+                    .into_any_element(),
+            ],
+            Some(list) => list
+                .iter()
+                .map(|s| {
+                    let details = [s.info.as_str(), s.location.as_str()]
+                        .into_iter()
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    v_flex()
+                        .py_2()
+                        .gap_0p5()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(div().font_semibold().child(s.client.clone()))
+                                .when(s.current, |this| {
+                                    this.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().success)
+                                            .child("этот клиент"),
+                                    )
+                                }),
+                        )
+                        .child(div().text_sm().text_color(muted).child(details))
+                        .when(!s.current && s.time > 0, |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!("Активность: {}", short_time(s.time))),
+                            )
+                        })
+                        .into_any_element()
+                })
+                .collect(),
+        };
+        let confirm_text = match panel.confirm {
+            Some(AccountAction::CloseOthers) => {
+                Some("Завершить все другие сеансы? На тех устройствах придётся войти заново.")
+            }
+            Some(AccountAction::Logout) => Some(
+                "Выйти из аккаунта на этом компьютере? Для входа понадобится QR-код или код из SMS.",
+            ),
+            None => None,
+        };
+        let busy = panel.busy;
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .font_semibold()
+                    .child("Аккаунт"),
+            )
+            .child(
+                v_flex()
+                    .id("account")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_6()
+                    .py_4()
+                    .gap_3()
+                    .max_w(px(640.))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(format!("Вы вошли как {me}")),
+                    )
+                    .child(div().font_semibold().child("Активные сеансы"))
+                    .child(v_flex().children(list))
+                    .when_some(panel.error.clone(), |this, e| {
+                        this.child(div().text_sm().text_color(cx.theme().danger).child(e))
+                    })
+                    .when_some(confirm_text, |this, text| {
+                        this.child(div().text_sm().text_color(cx.theme().warning).child(text))
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .pt_2()
+                            .child(
+                                Button::new("close-others")
+                                    .label(if panel.confirm == Some(AccountAction::CloseOthers) {
+                                        "Да, завершить"
+                                    } else {
+                                        "Завершить другие сеансы"
+                                    })
+                                    .warning()
+                                    .disabled(busy || !others)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.account_action(AccountAction::CloseOthers, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("logout")
+                                    .label(if panel.confirm == Some(AccountAction::Logout) {
+                                        "Да, выйти"
+                                    } else {
+                                        "Выйти"
+                                    })
+                                    .danger()
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.account_action(AccountAction::Logout, cx)
+                                    })),
+                            )
+                            .when(panel.confirm.is_some(), |this| {
+                                this.child(
+                                    Button::new("account-cancel")
+                                        .ghost()
+                                        .label("Отмена")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(panel) = &mut this.account {
+                                                panel.confirm = None;
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
+                    ),
+            )
     }
 
     /// Tell the server the open chat is read up to its newest message.
@@ -1142,7 +1359,18 @@ impl AppView {
                     .gap_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(div().font_semibold().child("Чаты"))
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(div().font_semibold().child("Чаты"))
+                            .child(
+                                Button::new("account-open")
+                                    .ghost()
+                                    .small()
+                                    .label("Аккаунт")
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_account(cx))),
+                            ),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -1154,9 +1382,11 @@ impl AppView {
                     }),
             )
             .child(list);
-        let content = match selected.and_then(|id| chats.iter().find(|c| c.id == id)) {
-            Some(chat) => self.render_chat(chat, cx),
-            None => v_flex()
+        let open = selected.and_then(|id| chats.iter().find(|c| c.id == id));
+        let content = match (&self.account, open) {
+            (Some(panel), _) => self.render_account(me, panel, cx),
+            (None, Some(chat)) => self.render_chat(chat, cx),
+            (None, None) => v_flex()
                 .flex_1()
                 .items_center()
                 .justify_center()

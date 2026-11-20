@@ -809,3 +809,80 @@ async fn contact_info_sends_ids_only() {
     assert_eq!(found[0].id, 7);
     let _keep = srv.await.unwrap();
 }
+
+#[tokio::test]
+async fn sessions_close_others_and_logout() {
+    use max_core::account::sessions;
+
+    let root = tempfile::tempdir().unwrap();
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::new());
+    let p = profile(&root, &secrets);
+    p.set_auth_token("saved-token").unwrap();
+    let tokens = p.token_store();
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    let connector = Arc::new(QueueConnector {
+        streams: Mutex::new(rx),
+    });
+    let (client, server) = tokio::io::duplex(1 << 16);
+    tx.send(client).unwrap();
+    let srv = tokio::spawn(async move {
+        let mut s = Server::new(server);
+        s.session_init().await;
+        s.login(1).await;
+        let (seq, body) = s.expect(Opcode::SessionsInfo).await;
+        assert_eq!(body.as_map().unwrap().len(), 0, "no parameters");
+        let session = |client: &str, current: bool| {
+            map(&[
+                ("time", 1_000i64.into()),
+                ("client", client.into()),
+                ("info", "Windows".into()),
+                ("location", "RU".into()),
+                ("current", current.into()),
+            ])
+        };
+        s.reply(
+            Opcode::SessionsInfo,
+            seq,
+            &map(&[(
+                "sessions",
+                Value::Array(vec![
+                    session("MAX Desktop", true),
+                    session("MAX Android", false),
+                ]),
+            )]),
+        )
+        .await;
+        let (seq, body) = s.expect(Opcode::SessionsClose).await;
+        assert_eq!(body.as_map().unwrap().len(), 0, "no parameters");
+        s.reply(
+            Opcode::SessionsClose,
+            seq,
+            &map(&[("token", "new-token".into())]),
+        )
+        .await;
+        let (seq, _) = s.expect(Opcode::Logout).await;
+        s.reply(Opcode::Logout, seq, &map(&[])).await;
+        s
+    });
+
+    let (handle, mut events) = Supervisor::spawn(config(), connector, p, env());
+    loop {
+        let e = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(e, CoreEvent::LoggedIn(_)) {
+            break;
+        }
+    }
+    let list = sessions(&handle.transport().unwrap()).await.unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].current, Some(true));
+    handle.close_other_sessions().await.unwrap();
+    assert_eq!(tokens.get().unwrap().unwrap().as_str(), "new-token");
+    handle.logout().await.unwrap();
+    assert!(tokens.get().unwrap().is_none(), "token forgotten");
+    assert!(handle.transport().is_err(), "stopped");
+    let _keep = srv.await.unwrap();
+}

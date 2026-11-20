@@ -1,4 +1,4 @@
-# maxrs: port map
+done: LOGOUT, token forgotten even offline, back to the login screens (account panel, with confirmation); not tried on the real server |
 
 **Goal.** A telemetry-free MAX desktop client in Rust with a gpui-kit UI, at feature parity
 with the official Windows client 26.41.0.83760 (`C:\MAX`). The official client is the source of
@@ -56,8 +56,8 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | B3 | Two-factor password: login check, restore, hint | O 101, 104, 113, 115; Q `PasswordEnterPage`, `AuthForgotPasswordPage` | v1 | login check done (`check_password`); restore and hint open |
 | B4 | Registration: name, avatar presets | O 25; Q `NameEnterPage`, `AvatarPreset*` | v1 | detected (`AuthStep::RegistrationRequired`); flow open |
 | B5 | 2FA setup and management (email, hint, password) | O 109-112; Q `SFACreate*`, `SFAConfig*` | v2 | open |
-| B6 | Active sessions list and close | O 96, 97; Q `DevicesSettings*` | v1 | open |
-| B7 | Logout | O 20 | v1 | open |
+| B6 | Active sessions list and close | O 96, 97; Q `DevicesSettings*` | v1 | list (SESSIONS_INFO) and close all others (SESSIONS_CLOSE, new token kept) done in core and the account panel, with confirmation; not tried on the real server |
+| B7 | Logout | O 20 | v1 | done: LOGOUT, token forgotten even offline, back to the login screens (account panel, with confirmation); not tried on the real server |
 | B8 | Profile delete and cancel | O 116, 199, 200; Q `RemoveProfileDialog`, `CancelProfileDeletePopup` | v2 | open |
 | B9 | Multiaccount | K `multiaccount`; Q `AccountsStackView`, `MultiaccountSectionButton` | v3 | open |
 | B10 | Callout login (call-based code) | O 294; Q `CalloutPage` | v2 | open |

@@ -442,3 +442,106 @@ async fn supervisor_without_token_asks_for_login() {
         .unwrap();
     assert!(matches!(e, CoreEvent::AuthRequired), "{e:?}");
 }
+
+#[tokio::test]
+async fn history_send_and_new_message_push() {
+    use max_core::messages::{history, new_message, send_text};
+    use max_transport::Incoming;
+
+    let root = tempfile::tempdir().unwrap();
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::new());
+    let mut p = profile(&root, &secrets);
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(async move {
+        let mut s = Server::new(server);
+        s.session_init().await;
+        let (seq, body) = s.expect(Opcode::ChatHistory).await;
+        assert_eq!(get(&body, "chatId").as_i64(), Some(42));
+        assert_eq!(get(&body, "from").as_i64(), Some(1_000));
+        assert_eq!(get(&body, "backward").as_i64(), Some(40));
+        assert_eq!(get(&body, "forward").as_i64(), Some(0));
+        let msg = |id: i64, time: i64, text: &str| {
+            map(&[
+                ("id", id.into()),
+                ("time", time.into()),
+                ("type", "USER".into()),
+                ("sender", 2i64.into()),
+                ("text", text.into()),
+            ])
+        };
+        // Newest first on the wire; the client sorts.
+        s.reply(
+            Opcode::ChatHistory,
+            seq,
+            &map(&[(
+                "messages",
+                Value::Array(vec![msg(2, 900, "b"), msg(1, 800, "a")]),
+            )]),
+        )
+        .await;
+        let (seq, body) = s.expect(Opcode::MessagingSend).await;
+        assert_eq!(get(&body, "chatId").as_i64(), Some(42));
+        assert_eq!(get(&body, "notify").as_bool(), Some(true));
+        let m = get(&body, "message");
+        assert_eq!(get(m, "text").as_str(), Some("привет"));
+        assert_eq!(get(m, "cid").as_i64(), Some(77));
+        let stored = map(&[
+            ("id", 3i64.into()),
+            ("time", 1_100i64.into()),
+            ("type", "USER".into()),
+            ("cid", 77i64.into()),
+            ("text", "привет".into()),
+        ]);
+        s.reply(
+            Opcode::MessagingSend,
+            seq,
+            &map(&[("chatId", 42i64.into()), ("message", stored)]),
+        )
+        .await;
+        // A push about a new incoming message (cmd 0, as PyMax reports for events).
+        let push = map(&[
+            ("chatId", 42i64.into()),
+            ("message", msg(4, 1_200, "ответ")),
+        ]);
+        let (flags, packed) = compress_server_payload(&to_msgpack(&push).unwrap()).unwrap();
+        let f = Frame::new(
+            PROTOCOL_VERSION,
+            Cmd::Request,
+            0,
+            Opcode::NotificationMessage.as_u16(),
+            flags,
+            packed,
+        )
+        .unwrap();
+        s.io.write_all(&f.encode()).await.unwrap();
+        s
+    });
+
+    let mut session = Session::start(client, &config(), &mut p, &env())
+        .await
+        .unwrap();
+    let messages = history(session.transport(), 42, 1_000, 40).await.unwrap();
+    let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
+    assert_eq!(ids, [1, 2], "oldest first");
+    let sent = send_text(session.transport(), 42, "привет", 77)
+        .await
+        .unwrap();
+    assert_eq!(
+        (sent.chat_id, sent.message.id, sent.message.cid),
+        (42, 3, Some(77))
+    );
+    let push = match tokio::time::timeout(Duration::from_secs(5), session.pushes().recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        Incoming::Push(p) => p,
+        other => panic!("expected a push, got {other:?}"),
+    };
+    let new = new_message(&push).expect("a NOTIF_MESSAGE");
+    assert_eq!(
+        (new.chat_id, new.message.id, new.message.text.as_deref()),
+        (42, 4, Some("ответ"))
+    );
+    let _keep = srv.await.unwrap();
+}

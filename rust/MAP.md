@@ -43,7 +43,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | A4 | Failover hosts from server config | K `failover-hosts` | v1 | open |
 | A5 | Login sync (chats, contacts, config on `LOGIN`) | O 19, 22 | v1 | LOGIN with saved token and initial sync done (`max-core`); sync markers stay 0 until their update rule is decoded |
 | A6 | Server config flags, local feature gates | K (184 keys); O 134 `ConfigChangeData` | v1 | open |
-| A7 | Server push events dispatch | O 128-165, 216, 243, 277, 293 (CommonEvent) | v1 | pushes delivered raw (`CoreEvent::Push`); typed dispatch open |
+| A7 | Server push events dispatch | O 128-165, 216, 243, 277, 293 (CommonEvent) | v1 | NOTIF_MESSAGE (128) decoded and shown live (`max_core::messages::new_message`); other pushes delivered raw |
 | A8 | Network change handling | S `network_change_notifier` | v1 | open |
 | A9 | Upload/download HTTP endpoints, URL refresh | O 80, 82, 87, 88, 203; K `desktop-upload-url-failover`, `photo-url-refresh` | v1 | open |
 
@@ -66,7 +66,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
-| C1 | Chat list with previews, counters, presence | O 53, 35, 132; Q `ChatListView`, `ChatDelegate`, `PresenceMarker` | v1 | open |
+| C1 | Chat list with previews, counters, presence | O 53, 35, 132; Q `ChatListView`, `ChatDelegate`, `PresenceMarker` | v1 | list, last message, unread counter, live reordering on new messages done; presence open |
 | C2 | Mark read / unread | O 50, 130; K `readmark-validation-disabled` | v1 | open |
 | C3 | Typing indicators (send and show) | O 65, 129; K `typing-send-enabled`; Q `TypingControl` | v1 | open |
 | C4 | Search: chats, messages, public, by phone | O 60, 68, 73, 46; Q `SearchPanel`, `SearchByPhoneDialog` | v1 | open |
@@ -81,8 +81,8 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
-| D1 | History load and scroll, day dividers, new-messages marker | O 49, 71; Q `HistoryListView`, `NewMessagesPanel` | v1 | open |
-| D2 | Send text, formatting, links, mentions | O 64; Q `MessageTextInput`, `AddFormatLinkDialog`, `MentionContactList` | v1 | open |
+| D1 | History load and scroll, day dividers, new-messages marker | O 49, 71; Q `HistoryListView`, `NewMessagesPanel` | v1 | first page (40, from now) with day dividers and scroll to the newest done; request values from PyMax, unverified on the real server; paging back and the new-messages marker open |
+| D2 | Send text, formatting, links, mentions | O 64; Q `MessageTextInput`, `AddFormatLinkDialog`, `MentionContactList` | v1 | plain text with pending, sent and failed states done (cid = send time); formatting, links, mentions open |
 | D3 | Edit, delete (for me / for all), delete range | O 66, 67, 140, 142; K `delete-msg-fys-large-chat-disabled` | v1 | open |
 | D4 | Reply, forward, quote navigation | Q `Reply*`, `MessageForwardDialog`; K `reply-navigation-highlight` | v1 | open |
 | D5 | Reactions: set, cancel, list, detailed | O 178-181, 155, 156; Q `ReactionPlate`; K `reactions-rank-config` | v1 | open |
@@ -233,7 +233,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | `max-store` | encrypted local DB, token in OS keystore | 2 | done 2026-11-19: SQLCipher 4.20 (vendored OpenSSL), key and token in Credential Manager (DPAPI), profile with Identity and launch counter; 9 tests + 1 OS store test (run once, cleaned up); chat and message tables come with `max-core` |
 | `max-core` | session, auth flows, sync, event dispatch, server config | 2 | done 2026-11-19: Session (SESSION_INIT, QR, SMS, 2FA password, LOGIN), Supervisor (reconnect, re-login), 6 flow tests on a scripted server; typed push dispatch, sync markers, logout open |
 | `max-media` | uploads/downloads, image/video/audio decode, Lottie | 3 | open |
-| `app` | gpui-kit UI, desktop integration | 3 | started 2026-11-19: window, QR, phone and code, 2FA password, chat list from LOGIN (local times), `--demo` and `--demo-walk` without network; message history, sending, settings open |
+| `app` | gpui-kit UI, desktop integration | 3 | started 2026-11-19: window, QR, phone and code, 2FA password, chat list from LOGIN (local times), `--demo` and `--demo-walk` without network; message history (first page) and sending text done 2026-11-20; attachments, paging, settings open |
 
 ## Open questions
 

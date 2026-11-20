@@ -75,15 +75,19 @@ pub struct SupervisorHandle {
 }
 
 impl SupervisorHandle {
-    /// Send a request on the current connection.
-    pub async fn request(&self, opcode: u16, payload: impl Into<Bytes>) -> Result<Response> {
-        let transport = self
-            .current
+    /// The current logged-in connection; [`max_transport::TransportError::Closed`] while
+    /// reconnecting.
+    pub fn transport(&self) -> Result<Transport> {
+        self.current
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .ok_or(CoreError::Transport(max_transport::TransportError::Closed))?;
-        Ok(transport.request(opcode, payload).await?)
+            .ok_or(CoreError::Transport(max_transport::TransportError::Closed))
+    }
+
+    /// Send a request on the current connection.
+    pub async fn request(&self, opcode: u16, payload: impl Into<Bytes>) -> Result<Response> {
+        Ok(self.transport()?.request(opcode, payload).await?)
     }
 
     /// Stop the supervisor and close the connection.

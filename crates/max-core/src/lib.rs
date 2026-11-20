@@ -3,6 +3,7 @@
 //! * [`Session`]: one connection after `SESSION_INIT`, with the login flows the desktop
 //!   client offers: QR ([`Session::start_qr`]), SMS code ([`Session::request_code`]), the 2FA
 //!   password ([`Session::check_password`]), and `LOGIN` with a saved token.
+//! * [`messages`]: chat history, sending text, new-message pushes.
 //! * [`Supervisor`]: keeps a logged-in session alive: reconnects with backoff, sends
 //!   `SESSION_INIT` and `LOGIN` again, and reports [`CoreEvent`]s.
 //!
@@ -13,6 +14,7 @@
 mod auth;
 mod config;
 mod error;
+pub mod messages;
 mod session;
 mod supervisor;
 

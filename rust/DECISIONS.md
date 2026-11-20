@@ -124,7 +124,7 @@ Consequences: Rust 1.97 builds it on Windows (MSVC) with no extra tools. GPUI's 
 attribute macro shadows `#[test]` under `use gpui_kit::*`: test modules import only what they
 need.
 
-## ADR-011: Trust only the Russian Trusted Root CA for MAX hosts
+## ADR-011: Trust the Russian Trusted Root CA for MAX hosts only
 Status: accepted (2026-11-19)
 Context: `api2.oneme.ru` presents `*.oneme.ru` (MAX LLC) issued by "Russian Trusted Sub CA",
 issued by "Russian Trusted Root CA" of the Ministry of Digital Development. That root is not in
@@ -140,3 +140,8 @@ Mozilla roots. The root is never added to the Windows store.
 Consequences: A certificate for a MAX host from any other CA is refused, which is stricter than
 the official client. The root expires in 2032; when the server moves to the 2024 root or another
 one, the embedded set is updated from the then current official client.
+Amendment (2026-11-20): a live run showed `i.oneme.ru` (photos) failing with `UnknownIssuer`
+under the Russian root alone: media hosts use certificates from other CAs. MAX hosts now accept
+a chain to the Russian root or to a Mozilla root (`webpki-roots`), which the official client
+evidently allows too (it shows the same photos). Hosts outside `*.oneme.ru` still get the
+Mozilla roots only, so the Russian root is never trusted for them.

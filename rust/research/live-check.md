@@ -60,3 +60,8 @@ Run 2 (QR login):
 | 8 | fails: every `i.oneme.ru` image request failed before an HTTP status ("error sending request"); the cause chain is now logged |
 
 Channel posts have no `sender`; they were shown as ours (fixed). Steps 4, 6, 7, 9–13 not done yet.
+
+Run 3 (stored token): login without QR (13 works); `CONTACT_INFO` with `contactIds` only is
+accepted and dialog names show; channel posts show as incoming. Images failed with
+`invalid peer certificate: UnknownIssuer`: `i.oneme.ru` is not under the Russian root. ADR-011
+amended: MAX hosts accept the Russian root or a Mozilla root.

@@ -49,12 +49,14 @@ pub fn is_max_host(host: &str) -> bool {
     host == "oneme.ru" || host.ends_with(".oneme.ru")
 }
 
-/// The roots MAX hosts are checked against: only the Russian Trusted Root CA (ADR-011).
+/// The roots MAX hosts are checked against (ADR-011, amended): the Russian Trusted Root CA, which
+/// `api2.oneme.ru` chains to, and the Mozilla roots, which media hosts such as `i.oneme.ru`
+/// need. Other hosts get the Mozilla roots only.
 pub fn max_roots() -> Result<RootCertStore> {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject as _;
 
-    let mut roots = RootCertStore::empty();
+    let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     for cert in CertificateDer::pem_slice_iter(RUSSIAN_TRUSTED_ROOT_CA) {
         let cert = cert.map_err(|e| {
             TransportError::Tls(rustls::Error::General(format!("bundled root: {e}")))
@@ -133,15 +135,19 @@ mod tests {
     }
 
     #[test]
-    fn bundled_root_parses_to_one_anchor() {
-        assert_eq!(max_roots().unwrap().len(), 1);
+    fn max_roots_are_the_russian_root_plus_mozilla() {
+        assert_eq!(
+            max_roots().unwrap().len(),
+            webpki_roots::TLS_SERVER_ROOTS.len() + 1
+        );
         assert!(tls_config_for("api2.oneme.ru").is_ok());
         assert!(tls_config_for("example.com").is_ok());
     }
 }
 
-/// Checks server certificates against [`max_roots`] for MAX hosts and the Mozilla roots for
-/// every other host, so one HTTP client follows ADR-011 for any URL the server hands out.
+/// Checks server certificates against [`max_roots`] for MAX hosts and the Mozilla roots only for
+/// every other host, so one HTTP client follows ADR-011 for any URL the server hands out: the
+/// Russian root is never trusted outside `*.oneme.ru`.
 #[derive(Debug)]
 pub struct ScopedVerifier {
     max: Arc<rustls::client::WebPkiServerVerifier>,
@@ -235,5 +241,13 @@ mod scoped_tests {
     #[test]
     fn http_config_builds() {
         assert!(http_tls_config().is_ok());
+    }
+
+    #[test]
+    fn russian_root_only_for_max_hosts() {
+        let v = ScopedVerifier::new().unwrap();
+        let name = |h: &str| ServerName::try_from(h.to_string()).unwrap();
+        assert!(std::ptr::eq(v.pick(&name("i.oneme.ru")), &*v.max));
+        assert!(std::ptr::eq(v.pick(&name("iv.okcdn.ru")), &*v.other));
     }
 }

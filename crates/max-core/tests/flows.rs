@@ -545,3 +545,174 @@ async fn history_send_and_new_message_push() {
     );
     let _keep = srv.await.unwrap();
 }
+
+/// A one-request HTTP/1.1 server on loopback: returns the raw request and answers `body`.
+async fn http_once(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/upload", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut req = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            req.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&req).to_string();
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let len: usize = text[..head_end]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                if req.len() >= head_end + 4 + len {
+                    break;
+                }
+            }
+            if n == 0 {
+                break;
+            }
+        }
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(reply.as_bytes()).await.unwrap();
+        String::from_utf8_lossy(&req).to_string()
+    });
+    (url, task)
+}
+
+#[tokio::test]
+async fn photo_and_file_upload_then_send() {
+    use max_core::media::{
+        Http, OutgoingAttachment, attach_ready, send_attachment, upload_file, upload_photo,
+    };
+    use max_transport::Incoming;
+
+    let root = tempfile::tempdir().unwrap();
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::new());
+    let mut p = profile(&root, &secrets);
+    let (photo_url, photo_http) = http_once(r#"{"photos":{"55":{"token":"ptok"}}}"#).await;
+    let (file_url, file_http) = http_once("{}").await;
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(async move {
+        let mut s = Server::new(server);
+        s.session_init().await;
+        let (seq, body) = s.expect(Opcode::PhotoUpload).await;
+        assert_eq!(get(&body, "count").as_i64(), Some(1));
+        s.reply(
+            Opcode::PhotoUpload,
+            seq,
+            &map(&[("url", photo_url.as_str().into())]),
+        )
+        .await;
+        let (seq, body) = s.expect(Opcode::MessagingSend).await;
+        let attach = &get(get(&body, "message"), "attaches").as_array().unwrap()[0];
+        assert_eq!(get(attach, "_type").as_str(), Some("PHOTO"));
+        assert_eq!(get(attach, "photoToken").as_str(), Some("ptok"));
+        s.reply(
+            Opcode::MessagingSend,
+            seq,
+            &map(&[
+                ("chatId", 42i64.into()),
+                ("message", map(&[("id", 8i64.into())])),
+            ]),
+        )
+        .await;
+        let (seq, _) = s.expect(Opcode::FileUpload).await;
+        let info = map(&[
+            ("fileId", 900i64.into()),
+            ("url", file_url.as_str().into()),
+            ("token", "ftok".into()),
+        ]);
+        s.reply(
+            Opcode::FileUpload,
+            seq,
+            &map(&[("info", Value::Array(vec![info]))]),
+        )
+        .await;
+        // The server confirms the processed file with NOTIF_ATTACH.
+        let push = map(&[("fileId", 900i64.into())]);
+        let f = Frame::new(
+            PROTOCOL_VERSION,
+            Cmd::Request,
+            0,
+            Opcode::NotificationAttach.as_u16(),
+            0,
+            to_msgpack(&push).unwrap(),
+        )
+        .unwrap();
+        s.io.write_all(&f.encode()).await.unwrap();
+        s
+    });
+
+    let mut session = Session::start(client, &config(), &mut p, &env())
+        .await
+        .unwrap();
+    let http = Http::new("OneMe Desktop/26.41.0.83760").unwrap();
+    let token = upload_photo(
+        session.transport(),
+        &http,
+        bytes::Bytes::from_static(b"\x89PNGfake"),
+        "a.png",
+        "image/png",
+    )
+    .await
+    .unwrap();
+    assert_eq!(token, "ptok");
+    let photo_req = photo_http.await.unwrap();
+    assert!(photo_req.starts_with("POST /upload "), "{photo_req}");
+    assert!(
+        photo_req.contains("name=\"file\"") && photo_req.contains("filename=\"a.png\""),
+        "{photo_req}"
+    );
+    assert!(
+        photo_req
+            .to_ascii_lowercase()
+            .contains("user-agent: oneme desktop/26.41.0.83760")
+    );
+    let sent = send_attachment(
+        session.transport(),
+        42,
+        &OutgoingAttachment::Photo { token },
+        None,
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent.message.id, 8);
+
+    let file_id = upload_file(
+        session.transport(),
+        &http,
+        bytes::Bytes::from_static(b"hello"),
+        "отчёт.txt",
+    )
+    .await
+    .unwrap();
+    assert_eq!(file_id, 900);
+    let file_req = file_http.await.unwrap();
+    assert!(
+        file_req.contains("content-range: 0-4/5") || file_req.contains("Content-Range: 0-4/5"),
+        "{file_req}"
+    );
+    assert!(
+        file_req.contains("filename=%D0%BE%D1%82%D1%87%D1%91%D1%82.txt"),
+        "{file_req}"
+    );
+    assert!(file_req.ends_with("hello"));
+    let push = match tokio::time::timeout(Duration::from_secs(5), session.pushes().recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        Incoming::Push(p) => p,
+        other => panic!("expected a push, got {other:?}"),
+    };
+    assert_eq!(attach_ready(&push), Some((900, None)));
+    let _keep = srv.await.unwrap();
+}

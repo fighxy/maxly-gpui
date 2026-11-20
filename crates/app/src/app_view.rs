@@ -1,6 +1,7 @@
 //! The window content: login screens and the main view, driven by backend events.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -9,6 +10,8 @@ use gpui_kit::component::{ActiveTheme, *};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+use max_core::media::Attachment;
 
 use crate::backend::{ChatRow, Delivery, MessageRow, UiCommand, UiEvent};
 use crate::qr;
@@ -68,8 +71,51 @@ impl History {
     }
 }
 
+/// A photo or sticker image for display.
+enum ImageState {
+    Loading,
+    Ready(Arc<Image>),
+    Failed,
+}
+
+/// The image format of downloaded bytes, by their signature.
+fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
+    let head = &bytes[..bytes.len().min(256)];
+    let text = String::from_utf8_lossy(head);
+    if bytes.starts_with(b"\x89PNG") {
+        Some(ImageFormat::Png)
+    } else if bytes.starts_with(&[0xFF, 0xD8]) {
+        Some(ImageFormat::Jpeg)
+    } else if bytes.starts_with(b"GIF8") {
+        Some(ImageFormat::Gif)
+    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(ImageFormat::Webp)
+    } else if bytes.starts_with(b"BM") {
+        Some(ImageFormat::Bmp)
+    } else if text.trim_start().starts_with("<svg") || text.trim_start().starts_with("<?xml") {
+        Some(ImageFormat::Svg)
+    } else {
+        None
+    }
+}
+
+/// "245 КБ" style size.
+fn human_size(bytes: i64) -> String {
+    let b = bytes.max(0) as f64;
+    if b >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} ГБ", b / (1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024.0 * 1024.0 {
+        format!("{:.1} МБ", b / (1024.0 * 1024.0))
+    } else if b >= 1024.0 {
+        format!("{:.0} КБ", b / 1024.0)
+    } else {
+        format!("{} Б", bytes.max(0))
+    }
+}
+
 /// Root view of the main window.
 pub struct AppView {
+    images: HashMap<String, ImageState>,
     screen: Screen,
     histories: HashMap<i64, History>,
     phone: Entity<InputState>,
@@ -121,6 +167,7 @@ impl AppView {
             password,
             composer,
             scroll: ScrollHandle::new(),
+            images: HashMap::new(),
             commands,
             _subscriptions: subscriptions,
         }
@@ -141,6 +188,8 @@ impl AppView {
                 for m in pending {
                     h.add(m);
                 }
+                let urls: Vec<String> = h.messages.iter().flat_map(image_urls).collect();
+                self.request_images(urls);
                 // `--demo-walk` sends a history without a click: open that chat.
                 if let Screen::Main {
                     selected, chats, ..
@@ -159,7 +208,27 @@ impl AppView {
                 h.loading = false;
                 h.error = Some(error);
             }
-            UiEvent::MessageAdded { chat_id, message } => self.message_added(chat_id, message),
+            UiEvent::MessageAdded { chat_id, message } => {
+                self.request_images(image_urls(&message));
+                self.message_added(chat_id, message);
+            }
+            UiEvent::Image { url, bytes } => {
+                let state = match image_format(&bytes) {
+                    Some(format) => {
+                        ImageState::Ready(Arc::new(Image::from_bytes(format, bytes.to_vec())))
+                    }
+                    None => ImageState::Failed,
+                };
+                self.images.insert(url, state);
+            }
+            UiEvent::ImageFailed { url } => {
+                self.images.insert(url, ImageState::Failed);
+            }
+            UiEvent::Notice(text) => {
+                if let Screen::Main { status, .. } = &mut self.screen {
+                    *status = Some(text);
+                }
+            }
             UiEvent::SendFailed {
                 chat_id,
                 cid,
@@ -189,7 +258,7 @@ impl AppView {
         let open = *selected == Some(chat_id);
         if let Some(pos) = chats.iter().position(|c| c.id == chat_id) {
             let mut row = chats.remove(pos);
-            row.preview = message.text.clone();
+            row.preview = message.preview();
             row.time = row.time.max(message.time);
             if !open && !message.out && message.delivery == Delivery::Sent {
                 row.unread += 1;
@@ -201,6 +270,65 @@ impl AppView {
             if open {
                 self.scroll.scroll_to_bottom();
             }
+        }
+    }
+
+    fn request_images(&mut self, urls: Vec<String>) {
+        for url in urls {
+            if !self.images.contains_key(&url) {
+                self.images.insert(url.clone(), ImageState::Loading);
+                let _ = self.commands.send(UiCommand::FetchImage(url));
+            }
+        }
+    }
+
+    fn pick_file(&mut self, cx: &mut Context<Self>) {
+        let Screen::Main {
+            selected: Some(chat_id),
+            ..
+        } = self.screen
+        else {
+            return;
+        };
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Отправить".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = this.update(cx, |view, cx| view.send_file(chat_id, path, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn send_file(&mut self, chat_id: i64, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let cid = jiff::Timestamp::now().as_millisecond();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let pending = MessageRow {
+            id: 0,
+            cid: Some(cid),
+            out: true,
+            sender: String::new(),
+            text: format!("Отправка: {name}"),
+            time: cid,
+            delivery: Delivery::Pending,
+            attachments: Vec::new(),
+        };
+        if self
+            .commands
+            .send(UiCommand::SendFile { chat_id, path, cid })
+            .is_ok()
+        {
+            self.message_added(chat_id, pending);
+            cx.notify();
         }
     }
 
@@ -317,6 +445,7 @@ impl AppView {
             text: text.clone(),
             time: cid,
             delivery: Delivery::Pending,
+            attachments: Vec::new(),
         };
         if self
             .commands
@@ -605,7 +734,105 @@ impl AppView {
             )
     }
 
-    fn bubble(m: &MessageRow, chat_title: &str, cx: &App) -> Div {
+    fn attachment_view(
+        &self,
+        chat_id: i64,
+        m: &MessageRow,
+        a: &Attachment,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match a {
+            Attachment::Photo { url, .. } | Attachment::Sticker { url } => {
+                let sticker = matches!(a, Attachment::Sticker { .. });
+                let (w, h) = match a {
+                    Attachment::Photo { width, height, .. } if *width > 0 && *height > 0 => {
+                        let w = (*width as f32).min(320.0);
+                        (w, w * (*height as f32) / (*width as f32))
+                    }
+                    _ if sticker => (160.0, 160.0),
+                    _ => (320.0, 210.0),
+                };
+                match self.images.get(url) {
+                    Some(ImageState::Ready(image)) => img(image.clone())
+                        .w(px(w))
+                        .h(px(h))
+                        .rounded(px(8.))
+                        .object_fit(ObjectFit::Contain)
+                        .into_any_element(),
+                    state => div()
+                        .w(px(w))
+                        .h(px(h))
+                        .rounded(px(8.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(cx.theme().muted)
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(match state {
+                            Some(ImageState::Failed) => "Фото не загрузилось",
+                            _ => "Загрузка фото…",
+                        })
+                        .into_any_element(),
+                }
+            }
+            Attachment::File {
+                file_id,
+                name,
+                size,
+            } => {
+                let (message_id, file_id, name_c) = (m.id, *file_id, name.clone());
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(div().text_2xl().child("📄"))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(div().font_medium().truncate().child(name.clone()))
+                            .child(div().text_xs().opacity(0.7).child(human_size(*size))),
+                    )
+                    .when(message_id != 0, |this| {
+                        this.child(
+                            Button::new((
+                                "download",
+                                u64::from_ne_bytes(m.id.to_ne_bytes()).wrapping_add(index as u64),
+                            ))
+                            .small()
+                            .label("Скачать")
+                            .on_click(cx.listener(
+                                move |this, _, _, _| {
+                                    let _ = this.commands.send(UiCommand::DownloadFile {
+                                        chat_id,
+                                        message_id,
+                                        file_id,
+                                        name: name_c.clone(),
+                                    });
+                                },
+                            )),
+                        )
+                    })
+                    .into_any_element()
+            }
+            _ => div().into_any_element(),
+        }
+    }
+
+    fn bubble(
+        &self,
+        chat_id: i64,
+        m: &MessageRow,
+        chat_title: &str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let attachments: Vec<AnyElement> = m
+            .attachments
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| !matches!(a, Attachment::Other { .. }))
+            .map(|(i, a)| self.attachment_view(chat_id, m, a, i, cx))
+            .collect();
         let state = match m.delivery {
             Delivery::Sent => String::new(),
             Delivery::Pending => " · отправка…".into(),
@@ -649,7 +876,10 @@ impl AppView {
                                 .child(m.sender.clone()),
                         )
                     })
-                    .child(div().child(m.text.clone()))
+                    .children(attachments)
+                    .when(!m.text.is_empty(), |this| {
+                        this.child(div().child(m.text.clone()))
+                    })
                     .child(
                         div()
                             .text_xs()
@@ -681,7 +911,7 @@ impl AppView {
                 );
                 last_day = day;
             }
-            items.push(Self::bubble(m, &chat.title, cx).into_any_element());
+            items.push(self.bubble(chat.id, m, &chat.title, cx).into_any_element());
         }
         let notice = match history {
             Some(h) if h.loading => Some("Загрузка…".to_string()),
@@ -733,6 +963,12 @@ impl AppView {
                     .py_3()
                     .border_t_1()
                     .border_color(cx.theme().border)
+                    .child(
+                        Button::new("attach")
+                            .ghost()
+                            .label("📎")
+                            .on_click(cx.listener(|this, _, _, cx| this.pick_file(cx))),
+                    )
                     .child(div().flex_1().child(Input::new(&self.composer)))
                     .child(Button::new("send").primary().label("Отправить").on_click(
                         cx.listener(|this, _, window, cx| this.send_message(window, cx)),
@@ -801,6 +1037,17 @@ impl AppView {
             .child(sidebar)
             .child(content)
     }
+}
+
+/// Image addresses a message needs.
+fn image_urls(m: &MessageRow) -> Vec<String> {
+    m.attachments
+        .iter()
+        .filter_map(|a| match a {
+            Attachment::Photo { url, .. } | Attachment::Sticker { url } => Some(url.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `+79000000000` from what the user typed: digits with a leading `+`; a Russian `8...` or
@@ -998,6 +1245,7 @@ mod tests {
             text: format!("m{id}"),
             time: id,
             delivery,
+            attachments: Vec::new(),
         }
     }
 
@@ -1010,5 +1258,39 @@ mod tests {
         h.add(row(1, None, false, Delivery::Sent));
         let ids: Vec<(i64, Delivery)> = h.messages.iter().map(|m| (m.id, m.delivery)).collect();
         assert_eq!(ids, [(1, Delivery::Sent), (5, Delivery::Sent)]);
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::{human_size, image_format};
+    use gpui_kit::ImageFormat;
+
+    #[test]
+    fn image_signatures() {
+        assert!(matches!(
+            image_format(b"\x89PNG\r\n\x1a\n...."),
+            Some(ImageFormat::Png)
+        ));
+        assert!(matches!(
+            image_format(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some(ImageFormat::Jpeg)
+        ));
+        assert!(matches!(
+            image_format(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some(ImageFormat::Webp)
+        ));
+        assert!(matches!(
+            image_format(b"<svg xmlns=..."),
+            Some(ImageFormat::Svg)
+        ));
+        assert!(image_format(b"not an image").is_none());
+    }
+
+    #[test]
+    fn sizes() {
+        assert_eq!(human_size(512), "512 Б");
+        assert_eq!(human_size(245_760), "240 КБ");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 МБ");
     }
 }

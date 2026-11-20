@@ -14,6 +14,8 @@ name = "maxrs"
 path = "src/main.rs"
 
 [dependencies]
+bytes = "1.12.2"
+dirs = "7.0.0"
 gpui-kit = "=0.10.0"
 jiff = "1.0.1"
 max-core = { path = "../max-core" }

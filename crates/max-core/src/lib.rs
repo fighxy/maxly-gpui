@@ -14,6 +14,7 @@
 mod auth;
 mod config;
 mod error;
+pub mod media;
 pub mod messages;
 mod session;
 mod supervisor;

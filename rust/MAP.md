@@ -45,7 +45,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | A6 | Server config flags, local feature gates | K (184 keys); O 134 `ConfigChangeData` | v1 | open |
 | A7 | Server push events dispatch | O 128-165, 216, 243, 277, 293 (CommonEvent) | v1 | NOTIF_MESSAGE (128) decoded and shown live (`max_core::messages::new_message`); other pushes delivered raw |
 | A8 | Network change handling | S `network_change_notifier` | v1 | open |
-| A9 | Upload/download HTTP endpoints, URL refresh | O 80, 82, 87, 88, 203; K `desktop-upload-url-failover`, `photo-url-refresh` | v1 | open |
+| A9 | Upload/download HTTP endpoints, URL refresh | O 80, 82, 87, 88, 203; K `desktop-upload-url-failover`, `photo-url-refresh` | v1 | HTTP client with host-scoped roots (ADR-011) and the desktop User-Agent; photo and file upload and download done (`max_core::media`); URL refresh and failover open |
 
 ### B. Account and authorization
 
@@ -102,14 +102,14 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
-| E1 | Photo send/view, image quality, WebP | O 80; K `image-quality`, `image-width`, `webp-config`, `desktop-webp-conversion` | v1 | open |
-| E2 | Files send/download, retries, download path | O 87, 88; K `desktop-attachmnets-upload-retries`; Q `FileAttachmentItem` | v1 | open |
+| E1 | Photo send/view, image quality, WebP | O 80; K `image-quality`, `image-width`, `webp-config`, `desktop-webp-conversion` | v1 | view (baseUrl, aspect kept) and send (PHOTO_UPLOAD, multipart, photoToken) done; quality settings, WebP conversion open; upload unverified on the real server |
+| E2 | Files send/download, retries, download path | O 87, 88; K `desktop-attachmnets-upload-retries`; Q `FileAttachmentItem` | v1 | send (FILE_UPLOAD, raw body, NOTIF_ATTACH wait) and download to Downloads (FILE_DOWNLOAD) done; retries open; unverified on the real server |
 | E3 | Video send and playback (embedded, speed) | O 82, 83; K `desktop-embed-video`, `video-speed`, `oneme-media-player` | v1 | open |
 | E4 | Voice messages play and record, waveform | O 301; K `audio-msg-send-enabled`; Q `AudioAttachmentDelegate`, `InputAudioRecorderPanel` | v1 (play), v2 (record) | open |
 | E5 | Video messages (circles) play and record | Q `VideoMessage*`, `InputVideoRecorderPanel`; K `ov-media-send-enabled` | v2 | open |
 | E6 | Fullscreen gallery | Q `FullscreenGalleryWindow`; S `fsg_gallery` | v1 | open |
 | E7 | Media editor (photo, video) | Q `FullscreenMediaEditorWindow`, `MeMediaEditor*`; K `edit-media-*` | v3 | open |
-| E8 | Stickers, sticker sets, favorites, suggest | O 26-29, 259, 261; Q `StickersView`, `EmojiStickerPicker` | v1 (view, send), v2 (manage) | open |
+| E8 | Stickers, sticker sets, favorites, suggest | O 26-29, 259, 261; Q `StickersView`, `EmojiStickerPicker` | v1 (view, send), v2 (manage) | stickers shown as images; sending and sets open |
 | E9 | Emoji, animoji (Lottie/thorvg) | Q `MeAnimojis*`, `EmojiView`; K `desktop-thorvg-enable`; S `lottie_player` | v1 (emoji), v2 (animoji) | open |
 | E10 | Location bubble (static map) | Q `GeoPositionBubbleContent`; `static-maps.yandex.ru` | v2 | open (map provider: decide) |
 | E11 | Contact share | Q `ContactBubbleContent`; K `contact-share-enabled` | v2 | open |

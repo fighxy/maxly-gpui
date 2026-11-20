@@ -139,3 +139,101 @@ mod tests {
         assert!(tls_config_for("example.com").is_ok());
     }
 }
+
+/// Checks server certificates against [`max_roots`] for MAX hosts and the Mozilla roots for
+/// every other host, so one HTTP client follows ADR-011 for any URL the server hands out.
+#[derive(Debug)]
+pub struct ScopedVerifier {
+    max: Arc<rustls::client::WebPkiServerVerifier>,
+    other: Arc<rustls::client::WebPkiServerVerifier>,
+}
+
+impl ScopedVerifier {
+    /// Both verifiers with the ring provider.
+    pub fn new() -> Result<ScopedVerifier> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let build = |roots: RootCertStore| {
+            rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider.clone(),
+            )
+            .build()
+            .map_err(|e| TransportError::Tls(rustls::Error::General(e.to_string())))
+        };
+        Ok(ScopedVerifier {
+            max: build(max_roots()?)?,
+            other: build(RootCertStore::from_iter(
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+            ))?,
+        })
+    }
+
+    fn pick(&self, name: &ServerName<'_>) -> &rustls::client::WebPkiServerVerifier {
+        match name {
+            ServerName::DnsName(dns) if is_max_host(dns.as_ref()) => &self.max,
+            _ => &self.other,
+        }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for ScopedVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.pick(server_name).verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.other.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.other.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.other.supported_verify_schemes()
+    }
+}
+
+/// TLS config for an HTTP client that may reach MAX and non-MAX hosts (media, uploads): the
+/// certificate check follows [`ScopedVerifier`].
+pub fn http_tls_config() -> Result<ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    Ok(ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ScopedVerifier::new()?))
+        .with_no_client_auth())
+}
+
+#[cfg(test)]
+mod scoped_tests {
+    use super::*;
+
+    #[test]
+    fn http_config_builds() {
+        assert!(http_tls_config().is_ok());
+    }
+}

@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use max_core::media::{self, Attachment, Http, OutgoingAttachment};
 use max_core::messages;
 use max_core::{
     AuthStep, CodeRequest, CoreConfig, CoreError, CoreEvent, LoginResponse, QrLogin, QrPoll,
@@ -56,6 +57,12 @@ pub enum UiEvent {
         cid: i64,
         error: String,
     },
+    /// Image bytes for a photo or sticker address.
+    Image { url: String, bytes: bytes::Bytes },
+    /// An image could not be loaded.
+    ImageFailed { url: String },
+    /// A short note for the status line ("saved to ...").
+    Notice(String),
     /// Something failed; shown with a way to start over.
     Error(String),
 }
@@ -81,6 +88,21 @@ pub enum UiCommand {
     SendText {
         chat_id: i64,
         text: String,
+        cid: i64,
+    },
+    /// Load an image for display.
+    FetchImage(String),
+    /// Save a file attachment to the Downloads folder.
+    DownloadFile {
+        chat_id: i64,
+        message_id: i64,
+        file_id: i64,
+        name: String,
+    },
+    /// Send a file from disk: images as photos, anything else as a file.
+    SendFile {
+        chat_id: i64,
+        path: std::path::PathBuf,
         cid: i64,
     },
 }
@@ -113,6 +135,26 @@ pub struct MessageRow {
     pub time: i64,
     /// Delivery state.
     pub delivery: Delivery,
+    /// Photos, files and other attachments.
+    pub attachments: Vec<Attachment>,
+}
+
+impl MessageRow {
+    /// One line for the chat list: the text, or what is attached.
+    pub fn preview(&self) -> String {
+        if !self.text.is_empty() {
+            return self.text.clone();
+        }
+        self.attachments
+            .first()
+            .map(|a| match a {
+                Attachment::Photo { .. } => "Фото".to_string(),
+                Attachment::File { name, .. } => format!("Файл: {name}"),
+                Attachment::Sticker { .. } => "Стикер".to_string(),
+                Attachment::Other { kind } => attachment_label(kind).to_string(),
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// One row of the chat list.
@@ -264,6 +306,9 @@ async fn demo_flow(
             }
             UiCommand::Code(_) | UiCommand::Password(_) => break,
             UiCommand::OpenChat(_) | UiCommand::SendText { .. } => {}
+            UiCommand::FetchImage(_)
+            | UiCommand::DownloadFile { .. }
+            | UiCommand::SendFile { .. } => {}
         }
     }
     let t = now_ms();
@@ -312,8 +357,8 @@ async fn demo_flow(
                 Delivery::Pending,
             ),
         });
-        return;
     }
+    // Serve the chat screen: history, sending, images and files.
     while let Some(cmd) = commands.recv().await {
         match cmd {
             UiCommand::OpenChat(chat_id) => {
@@ -342,6 +387,54 @@ async fn demo_flow(
                     });
                 });
             }
+            UiCommand::FetchImage(url) => {
+                let bytes = if url == "demo://photo" {
+                    Some(demo_photo_svg())
+                } else {
+                    // A photo the user picked in the demo: read it locally, nothing leaves.
+                    tokio::fs::read(url.trim_start_matches("demo-file://"))
+                        .await
+                        .ok()
+                        .map(bytes::Bytes::from)
+                };
+                let _ = ui.send(match bytes {
+                    Some(bytes) => UiEvent::Image { url, bytes },
+                    None => UiEvent::ImageFailed { url },
+                });
+            }
+            UiCommand::DownloadFile { name, .. } => {
+                let _ = ui.send(UiEvent::Notice(format!("Демо: {name} не скачивается")));
+            }
+            UiCommand::SendFile { chat_id, path, cid } => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let size = tokio::fs::metadata(&path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let mut row = demo_row(cid, true, "", now_ms(), Delivery::Sent);
+                row.attachments = vec![if media::is_photo_name(&name) {
+                    Attachment::Photo {
+                        photo_id: None,
+                        url: format!("demo-file://{}", path.display()),
+                        width: 0,
+                        height: 0,
+                    }
+                } else {
+                    Attachment::File {
+                        file_id: cid,
+                        name,
+                        size: i64::try_from(size).unwrap_or(0),
+                    }
+                }];
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let _ = ui.send(UiEvent::MessageAdded {
+                    chat_id,
+                    message: row,
+                });
+            }
             _ => {}
         }
     }
@@ -360,7 +453,21 @@ fn demo_row(id: i64, out: bool, text: &str, time: i64, delivery: Delivery) -> Me
         text: text.into(),
         time,
         delivery,
+        attachments: Vec::new(),
     }
+}
+
+/// A made-up photo for the demo: an SVG drawn in memory, no network.
+fn demo_photo_svg() -> bytes::Bytes {
+    bytes::Bytes::from_static(
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="420" viewBox="0 0 640 420">
+<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7cb7ff"/><stop offset="1" stop-color="#d9ecff"/></linearGradient></defs>
+<rect width="640" height="420" fill="url(#g)"/>
+<circle cx="520" cy="90" r="46" fill="#ffd54f"/>
+<path d="M0 330 L150 210 L260 300 L380 170 L640 340 L640 420 L0 420 Z" fill="#4e8a5a"/>
+<path d="M0 360 L200 280 L330 350 L470 260 L640 370 L640 420 L0 420 Z" fill="#2f6b3d"/>
+</svg>"##,
+    )
 }
 
 /// A short made-up conversation ending a few minutes before `now`.
@@ -370,7 +477,7 @@ fn demo_history(chat_id: i64, now: i64) -> Vec<MessageRow> {
         (true, "Привет, да. Во сколько удобно?", 90),
         (false, "Давай с утра, часов в 10", 60),
         (true, "Договорились", 58),
-        (false, "[Фото] Вот место, где встретимся", 20),
+        (false, "Вот место, где встретимся", 20),
         (false, "До завтра! 👋", 5),
     ];
     lines
@@ -385,6 +492,21 @@ fn demo_history(chat_id: i64, now: i64) -> Vec<MessageRow> {
                 Delivery::Sent,
             );
             row.cid = None;
+            if i == 4 {
+                row.attachments = vec![Attachment::Photo {
+                    photo_id: None,
+                    url: "demo://photo".into(),
+                    width: 640,
+                    height: 420,
+                }];
+            }
+            if i == 3 {
+                row.attachments = vec![Attachment::File {
+                    file_id: 1,
+                    name: "Маршрут.pdf".into(),
+                    size: 245_760,
+                }];
+            }
             row
         })
         .collect()
@@ -419,6 +541,9 @@ async fn real_flow(
         env,
     );
     let names = Arc::new(RwLock::new(Names::default()));
+    let http =
+        Http::new(&CoreConfig::default().version.http_user_agent()).map_err(|e| e.to_string())?;
+    let waiters: Arc<std::sync::Mutex<FileWaiters>> = Arc::default();
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -431,6 +556,14 @@ async fn real_flow(
                         UiEvent::LoggedIn { me, chats }
                     }
                     CoreEvent::AuthRequired => UiEvent::Error("Нужно войти заново.".into()),
+                    CoreEvent::Push(push) if media::attach_ready(&push).is_some() => {
+                        if let Some((file_id, error)) = media::attach_ready(&push)
+                            && let Some(tx) = waiters.lock().unwrap_or_else(PoisonError::into_inner).remove(&file_id)
+                        {
+                            let _ = tx.send(error);
+                        }
+                        continue;
+                    }
                     CoreEvent::Push(push) => match messages::new_message(&push) {
                         Some(new) => {
                             let names = names.read().unwrap_or_else(PoisonError::into_inner);
@@ -447,7 +580,47 @@ async fn real_flow(
             cmd = commands.recv() => {
                 let Some(cmd) = cmd else { break };
                 let (handle, ui, names) = (handle.clone(), ui.clone(), names.clone());
+                let (http, waiters) = (http.clone(), waiters.clone());
                 match cmd {
+                    UiCommand::FetchImage(url) => {
+                        tokio::spawn(async move {
+                            let _ = ui.send(match http.download(&url, media::MAX_DOWNLOAD).await {
+                                Ok(bytes) => UiEvent::Image { url, bytes },
+                                Err(_) => UiEvent::ImageFailed { url },
+                            });
+                        });
+                    }
+                    UiCommand::DownloadFile { chat_id, message_id, file_id, name } => {
+                        tokio::spawn(async move {
+                            let result = async {
+                                let t = handle.transport()?;
+                                let url = media::file_download_url(&t, chat_id, message_id, file_id).await?;
+                                http.download(&url, media::MAX_DOWNLOAD).await
+                            }
+                            .await;
+                            let _ = ui.send(match result {
+                                Ok(bytes) => match save_download(&name, &bytes) {
+                                    Ok(path) => UiEvent::Notice(format!("Сохранено: {}", path.display())),
+                                    Err(e) => UiEvent::Notice(format!("Не удалось сохранить {name}: {e}")),
+                                },
+                                Err(e) => UiEvent::Notice(format!("Не удалось скачать {name}: {}", message(&e))),
+                            });
+                        });
+                    }
+                    UiCommand::SendFile { chat_id, path, cid } => {
+                        tokio::spawn(async move {
+                            let result = send_file(&handle, &http, &waiters, chat_id, &path, cid).await;
+                            let _ = ui.send(match result {
+                                Ok(sent) => {
+                                    let names = names.read().unwrap_or_else(PoisonError::into_inner);
+                                    let mut row = names.row(&sent.message);
+                                    row.cid = Some(cid);
+                                    UiEvent::MessageAdded { chat_id, message: row }
+                                }
+                                Err(e) => UiEvent::SendFailed { chat_id, cid, error: e },
+                            });
+                        });
+                    }
                     UiCommand::OpenChat(chat_id) => {
                         tokio::spawn(async move {
                             let result = match handle.transport() {
@@ -488,6 +661,99 @@ async fn real_flow(
     Ok(())
 }
 
+type FileWaiters = std::collections::HashMap<i64, tokio::sync::oneshot::Sender<Option<String>>>;
+
+/// Largest file the client sends.
+const MAX_UPLOAD: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Upload a file from disk and send it: images as photos, anything else as a file after the
+/// server's NOTIF_ATTACH.
+async fn send_file(
+    handle: &max_core::SupervisorHandle,
+    http: &Http,
+    waiters: &std::sync::Mutex<FileWaiters>,
+    chat_id: i64,
+    path: &std::path::Path,
+    cid: i64,
+) -> Result<messages::SendResponse, String> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".into());
+    let size = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| e.to_string())?
+        .len();
+    if size > MAX_UPLOAD {
+        return Err(format!("{name}: файл больше 2 ГБ"));
+    }
+    let data = bytes::Bytes::from(tokio::fs::read(path).await.map_err(|e| e.to_string())?);
+    let t = handle.transport().map_err(|e| message(&e))?;
+    let attachment = if media::is_photo_name(&name) {
+        let token = media::upload_photo(&t, http, data, &name, media::photo_mime(&name))
+            .await
+            .map_err(|e| message(&e))?;
+        OutgoingAttachment::Photo { token }
+    } else {
+        // Register before the upload so a fast NOTIF_ATTACH is not missed.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let file_id = media::upload_file(&t, http, data, &name)
+            .await
+            .map_err(|e| message(&e))?;
+        waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(file_id, tx);
+        match tokio::time::timeout(Duration::from_secs(120), rx).await {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(error))) => return Err(format!("сервер не принял файл: {error}")),
+            Ok(Err(_)) | Err(_) => {
+                waiters
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&file_id);
+                return Err("сервер не подтвердил файл".into());
+            }
+        }
+        OutgoingAttachment::File { file_id }
+    };
+    media::send_attachment(&t, chat_id, &attachment, None, cid)
+        .await
+        .map_err(|e| message(&e))
+}
+
+/// Save bytes into the Downloads folder under a name that does not overwrite anything.
+fn save_download(name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    let dir = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || r#"<>:"/\|?*"#.contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let clean = if clean.trim().is_empty() {
+        "file".to_string()
+    } else {
+        clean
+    };
+    let (stem, ext) = match clean.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (clean.clone(), String::new()),
+    };
+    let mut path = dir.join(&clean);
+    let mut n = 1;
+    while path.exists() {
+        path = dir.join(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
 /// Who is who, for message rows: our id and contact names from the last LOGIN.
 #[derive(Debug, Default)]
 pub struct Names {
@@ -525,10 +791,45 @@ impl Names {
                 .get(&sender_id)
                 .cloned()
                 .unwrap_or_else(|| format!("id {sender_id}")),
-            text: message_text(m),
+            text: bubble_text(m),
             time: m.time,
             delivery: Delivery::Sent,
+            attachments: media::attachments(m),
         }
+    }
+}
+
+/// What an attachment kind is called in the chat list and history.
+pub fn attachment_label(kind: &str) -> &'static str {
+    match kind {
+        "PHOTO" => "Фото",
+        "VIDEO" => "Видео",
+        "FILE" => "Файл",
+        "STICKER" => "Стикер",
+        "AUDIO" => "Голосовое сообщение",
+        "CONTACT" => "Контакт",
+        "LOCATION" => "Геопозиция",
+        "POLL" => "Опрос",
+        "CONTROL" => "Служебное сообщение",
+        _ => "Вложение",
+    }
+}
+
+/// The text shown inside a bubble: photos, files and stickers are drawn, so only the other
+/// attachment kinds get a label.
+pub fn bubble_text(m: &messages::Message) -> String {
+    let text = m.text.clone().unwrap_or_default();
+    let labels: Vec<&'static str> = media::attachments(m)
+        .iter()
+        .filter_map(|a| match a {
+            Attachment::Other { kind } => Some(attachment_label(kind)),
+            _ => None,
+        })
+        .collect();
+    match (text.is_empty(), labels.is_empty()) {
+        (_, true) => text,
+        (false, false) => format!("[{}] {text}", labels.join(", ")),
+        (true, false) => format!("[{}]", labels.join(", ")),
     }
 }
 
@@ -545,18 +846,7 @@ pub fn message_text(m: &messages::Message) -> String {
                     .and_then(|map| map.iter().find(|(k, _)| k.as_str() == Some("_type")))
                     .and_then(|(_, v)| v.as_str())
                     .unwrap_or("");
-            match kind {
-                "PHOTO" => "Фото",
-                "VIDEO" => "Видео",
-                "FILE" => "Файл",
-                "STICKER" => "Стикер",
-                "AUDIO" => "Голосовое сообщение",
-                "CONTACT" => "Контакт",
-                "LOCATION" => "Геопозиция",
-                "POLL" => "Опрос",
-                "CONTROL" => "Служебное сообщение",
-                _ => "Вложение",
-            }
+            attachment_label(kind)
         })
         .collect();
     match (text.is_empty(), attaches.is_empty()) {
@@ -816,7 +1106,7 @@ fn row(chat: &Chat, me_id: i64, contacts: &BTreeMap<i64, &Contact>) -> ChatRow {
     let preview = chat
         .last_message
         .as_ref()
-        .and_then(|m| m.text.clone())
+        .map(message_text)
         .unwrap_or_default();
     ChatRow {
         id: chat.id,

@@ -155,6 +155,34 @@ addresses; the extractor reads them from memory.
 - `CreateQr::Response` in the client: `trackId`, `pollingInterval`, `qrLink`; the server also
   sends `expiresAt`, `ttl`. `AuthCheck::Response::Status`: `loginAvailable`, `expiresAt`.
 
+### Attachments and uploads
+
+From `core.dll` / `network.dll` (verified layouts and strings):
+
+- Attachments are one polymorphic struct `T::BaseAttachment` keyed by `_type` (`PHOTO`,
+  `FILE`, `STICKER`, `VIDEO`, `AUDIO`, `CONTACT`, `LOCATION`, `POLL`, `CONTROL`, ...). A photo
+  carries `photoId`, `baseUrl`, `width`, `height`, `previewData`, `thumbhash`; a file
+  `fileId`, `name`, `size`, `token`.
+- `PHOTO_UPLOAD (80) {count, profile?}` -> `{url, urls?}`; `FILE_UPLOAD (87) {count}` ->
+  `{info: [{fileId, url, token}]}`; `FILE_DOWNLOAD (88) {fileId, chatId, postId?, messageId}`
+  -> `{url, unsafe?}`; `NOTIF_ATTACH (136) {videoId?, audioId?, fileId?, error?}`.
+- Photo uploads are `multipart/form-data` (`form-data; name="%1"; filename="%2"`,
+  `Network::SendRequestVisitor`), the answer is JSON with `photos` and `error_field`
+  (`oneme_upload_file.cpp`, `FUN_18151d2a0`). The MIME type comes from `QMimeDatabase` with
+  `application/octet-stream` as fallback (`FUN_18095f900`).
+
+From PyMax (hint, to verify on the real server):
+
+- Form field name `file`; answer `{"photos": {"<id>": {"token": "..."}}}`.
+- File upload: POST of the raw body with `Content-Disposition: attachment; filename=<urlencoded>`
+  and `Content-Range: 0-<n-1>/<n>` (no `bytes ` prefix), then wait for `NOTIF_ATTACH` with the
+  `fileId` before sending `{_type: "FILE", fileId}`.
+- Photo message: `{_type: "PHOTO", photoToken}`.
+
+Our client sends the HTTP user agent `OneMe Desktop/26.41.0.83760` (unconfirmed format) and
+checks media and upload hosts with the same rules as the API (ADR-011): `*.oneme.ru` against
+the bundled root, other hosts against the Mozilla roots.
+
 ### How the official client makes `deviceId` (decompiled, `desktop_utils.dll`)
 
 `Utilities::getDeviceId` (export, `0x180002fbd`) returns

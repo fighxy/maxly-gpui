@@ -15,6 +15,9 @@ pub enum CoreError {
     /// The server's answer to a login step has none of the expected outcomes.
     #[error("unexpected login answer: {0}")]
     UnexpectedAuthAnswer(String),
+    /// An HTTP request (media download, upload) failed.
+    #[error("http: {0}")]
+    Http(String),
     /// No saved login token; log in first.
     #[error("not logged in")]
     NotLoggedIn,

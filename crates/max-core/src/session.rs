@@ -7,7 +7,7 @@ use max_proto::packets::{
 use max_proto::schema::packets::auth;
 use max_proto::schema::packets::auth::one_me::PasswordChallenge;
 use max_store::Profile;
-use max_transport::{Incoming, Transport, connect, tls_config};
+use max_transport::{Incoming, Transport, connect, tls_config_for};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::UnboundedReceiver;
 use zeroize::Zeroizing;
@@ -35,7 +35,12 @@ impl Session {
         profile: &mut Profile,
         env: &Environment,
     ) -> Result<Session> {
-        let stream = connect(&config.endpoint, tls_config()?, config.connect_timeout).await?;
+        let stream = connect(
+            &config.endpoint,
+            tls_config_for(&config.endpoint.host)?,
+            config.connect_timeout,
+        )
+        .await?;
         Session::start(stream, config, profile, env).await
     }
 

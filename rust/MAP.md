@@ -21,6 +21,7 @@ Read first: `DECISIONS.md`, `GLOSSARY.md`, `research/protocol-and-telemetry.md`,
 | 008 | Random deviceId and device name instead of a hardware fingerprint |
 | 009 | SQLCipher database per profile; DB key and login token in the DPAPI-protected store |
 | 010 | UI stack pinned: gpui-kit =0.10.0 (gpui-pre 0.3.12); core on its own tokio runtime |
+| 011 | MAX hosts (*.oneme.ru) trust only the Russian Trusted Root CA bundled by the official client |
 
 ## Feature parity table
 

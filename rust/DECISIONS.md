@@ -123,3 +123,20 @@ own, after `--demo-walk` screenshots look the same.
 Consequences: Rust 1.97 builds it on Windows (MSVC) with no extra tools. GPUI's `test`
 attribute macro shadows `#[test]` under `use gpui_kit::*`: test modules import only what they
 need.
+
+## ADR-011: Trust only the Russian Trusted Root CA for MAX hosts
+Status: accepted (2026-11-19)
+Context: `api2.oneme.ru` presents `*.oneme.ru` (MAX LLC) issued by "Russian Trusted Sub CA",
+issued by "Russian Trusted Root CA" of the Ministry of Digital Development. That root is not in
+the Mozilla store (webpki-roots) nor in this machine's Windows stores, so rustls refuses the
+server (`UnknownIssuer`). The official client ships the root itself: Qt resources
+`:/certs/russiantrustedca.pem` and `:/certs/russiantrustedca2024.pem` in `network.dll` (both the
+same certificate, SHA-256 `D2:6D:2D:02:31:B7:C3:9F:92:CC:73:85:12:BA:54:10:35:19:E4:40:5D:68:B5:
+BD:70:3E:97:88:CA:8E:CF:31`, valid 2022-03-01 to 2032-02-27), checked by
+`McCerts::VerifyCertificateChain` and installed into its own `QSslConfiguration`.
+Decision: For hosts `oneme.ru` and `*.oneme.ru` the client trusts exactly this root, taken
+from the official client and embedded in `max-transport`, and nothing else. Other hosts keep the
+Mozilla roots. The root is never added to the Windows store.
+Consequences: A certificate for a MAX host from any other CA is refused, which is stricter than
+the official client. The root expires in 2032; when the server moves to the 2024 root or another
+one, the embedded set is updated from the then current official client.

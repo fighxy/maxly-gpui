@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use bytes::Bytes;
 use max_identity::Environment;
 use max_store::Profile;
-use max_transport::{Incoming, Response, Transport, connect, tls_config};
+use max_transport::{Incoming, Response, Transport, connect, tls_config_for};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -43,7 +43,7 @@ impl Connector for TlsConnector {
         Box::pin(async move {
             let stream = connect(
                 &self.config.endpoint,
-                tls_config()?,
+                tls_config_for(&self.config.endpoint.host)?,
                 self.config.connect_timeout,
             )
             .await?;

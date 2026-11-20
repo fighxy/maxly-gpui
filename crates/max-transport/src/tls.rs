@@ -39,6 +39,40 @@ impl std::fmt::Display for Endpoint {
     }
 }
 
+/// "Russian Trusted Root CA" as bundled by the official client (`network.dll`, Qt resource
+/// `:/certs/russiantrustedca.pem`), SHA-256 `D26D2D02...8ECF31`, valid 2022-03-01..2032-02-27.
+const RUSSIAN_TRUSTED_ROOT_CA: &[u8] = include_bytes!("../certs/russian_trusted_root_ca.pem");
+
+/// Whether `host` is a MAX API host (`oneme.ru` or a subdomain), which gets [`max_roots`].
+pub fn is_max_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "oneme.ru" || host.ends_with(".oneme.ru")
+}
+
+/// The roots MAX hosts are checked against: only the Russian Trusted Root CA (ADR-011).
+pub fn max_roots() -> Result<RootCertStore> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject as _;
+
+    let mut roots = RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(RUSSIAN_TRUSTED_ROOT_CA) {
+        let cert = cert.map_err(|e| {
+            TransportError::Tls(rustls::Error::General(format!("bundled root: {e}")))
+        })?;
+        roots.add(cert)?;
+    }
+    Ok(roots)
+}
+
+/// TLS client config for `host`: [`max_roots`] for MAX hosts, the Mozilla roots otherwise.
+pub fn tls_config_for(host: &str) -> Result<Arc<ClientConfig>> {
+    if is_max_host(host) {
+        tls_config_with_roots(max_roots()?)
+    } else {
+        tls_config()
+    }
+}
+
 /// TLS client config with the Mozilla root store (`webpki-roots`) and rustls' safe defaults
 /// (TLS 1.2 and 1.3).
 pub fn tls_config() -> Result<Arc<ClientConfig>> {
@@ -72,4 +106,36 @@ pub async fn connect(
     .map_err(|_| TransportError::ConnectTimeout(endpoint.to_string()))??;
     tcp.set_nodelay(true)?;
     Ok(TlsConnector::from(tls).connect(name, tcp).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_hosts_are_oneme_and_its_subdomains_only() {
+        for host in [
+            "oneme.ru",
+            "api2.oneme.ru",
+            "API2.ONEME.RU",
+            "api2.oneme.ru.",
+        ] {
+            assert!(is_max_host(host), "{host}");
+        }
+        for host in [
+            "evil-oneme.ru",
+            "oneme.ru.evil.com",
+            "max.ru",
+            "notoneme.ru",
+        ] {
+            assert!(!is_max_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn bundled_root_parses_to_one_anchor() {
+        assert_eq!(max_roots().unwrap().len(), 1);
+        assert!(tls_config_for("api2.oneme.ru").is_ok());
+        assert!(tls_config_for("example.com").is_ok());
+    }
 }

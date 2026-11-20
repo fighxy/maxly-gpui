@@ -13,7 +13,9 @@ mod transport;
 
 pub use backoff::Backoff;
 pub use error::TransportError;
-pub use tls::{Endpoint, connect, tls_config, tls_config_with_roots};
+pub use tls::{
+    Endpoint, connect, is_max_host, max_roots, tls_config, tls_config_for, tls_config_with_roots,
+};
 pub use transport::{Incoming, Response, Transport, TransportConfig};
 
 /// Result type of this crate.

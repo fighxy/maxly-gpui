@@ -78,6 +78,20 @@ pub enum UiEvent {
     SessionsFailed(String),
     /// Logged out: the token is gone and the login screens follow.
     LoggedOut,
+    /// A message already shown was edited.
+    MessageEdited { chat_id: i64, message: MessageRow },
+    /// Messages were deleted.
+    MessagesDeleted { chat_id: i64, ids: Vec<i64> },
+    /// Messages between two times (Unix ms, inclusive) were deleted.
+    MessagesDeletedRange { chat_id: i64, from: i64, to: i64 },
+    /// Someone is typing; `who` is their name, empty when unknown.
+    Typing { chat_id: i64, who: String },
+    /// We read the chat on another device; `unread` is what is left.
+    ReadElsewhere { chat_id: i64, unread: i32 },
+    /// Another participant read the chat up to `mark` (Unix ms).
+    PeerRead { chat_id: i64, mark: i64 },
+    /// A chat changed or was added.
+    ChatChanged(ChatRow),
     /// Something failed; shown with a way to start over.
     Error(String),
 }
@@ -130,6 +144,8 @@ pub enum UiCommand {
     CloseOtherSessions,
     /// End this session and forget the token.
     Logout,
+    /// We are typing in a chat.
+    Typing { chat_id: i64 },
 }
 
 /// One active session of the account, for the account panel.
@@ -196,6 +212,8 @@ pub struct MessageRow {
     pub delivery: Delivery,
     /// Photos, files and other attachments.
     pub attachments: Vec<Attachment>,
+    /// Edited after sending.
+    pub edited: bool,
 }
 
 impl MessageRow {
@@ -229,6 +247,8 @@ pub struct ChatRow {
     pub unread: i32,
     /// Time of the last event, Unix ms.
     pub time: i64,
+    /// The latest read mark of the other participants, Unix ms: our messages up to it are read.
+    pub peer_mark: i64,
 }
 
 /// Handles to a running backend.
@@ -379,6 +399,7 @@ async fn demo_flow(
             UiCommand::OpenChat(_) | UiCommand::SendText { .. } => {}
             UiCommand::LoadOlder { .. } | UiCommand::MarkRead { .. } => {}
             UiCommand::LoadSessions | UiCommand::CloseOtherSessions | UiCommand::Logout => {}
+            UiCommand::Typing { .. } => {}
             UiCommand::FetchImage(_)
             | UiCommand::DownloadFile { .. }
             | UiCommand::SendFile { .. } => {}
@@ -406,6 +427,7 @@ async fn demo_flow(
             preview: (*preview).into(),
             unread: *unread,
             time: t - minutes_ago * 60_000,
+            peer_mark: t - 3 * 60_000,
         })
         .collect();
     let _ = ui.send(UiEvent::LoggedIn {
@@ -463,7 +485,16 @@ async fn demo_flow(
                         chat_id,
                         message: row,
                     });
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let _ = ui.send(UiEvent::PeerRead {
+                        chat_id,
+                        mark: now_ms(),
+                    });
+                    let _ = ui.send(UiEvent::Typing {
+                        chat_id,
+                        who: String::new(),
+                    });
+                    tokio::time::sleep(Duration::from_millis(2500)).await;
                     let reply = demo_row(cid + 1, false, "👍", now_ms(), Delivery::Sent);
                     let _ = ui.send(UiEvent::MessageAdded {
                         chat_id,
@@ -581,6 +612,7 @@ fn demo_row(id: i64, out: bool, text: &str, time: i64, delivery: Delivery) -> Me
         text: text.into(),
         time,
         delivery,
+        edited: false,
         attachments: Vec::new(),
     }
 }
@@ -749,13 +781,14 @@ async fn run_logged_in(
                         }
                         continue;
                     }
-                    CoreEvent::Push(push) => match messages::new_message(&push) {
-                        Some(new) => {
-                            let names = names.read().unwrap_or_else(PoisonError::into_inner);
-                            UiEvent::MessageAdded { chat_id: new.chat_id, message: names.row(&new.message) }
+                    CoreEvent::Push(push) => {
+                        let Some(event) = max_core::events::decode(&push) else { continue };
+                        let names = names.read().unwrap_or_else(PoisonError::into_inner);
+                        match names.ui_event(event) {
+                            Some(msg) => msg,
+                            None => continue,
                         }
-                        None => continue,
-                    },
+                    }
                     CoreEvent::Disconnected(reason) => {
                         UiEvent::Status(format!("Нет связи, переподключение… ({reason})"))
                     }
@@ -910,6 +943,15 @@ async fn run_logged_in(
                                 Err(e) => {
                                     let _ = ui.send(UiEvent::SessionsFailed(message(&e)));
                                 }
+                            }
+                        });
+                    }
+                    UiCommand::Typing { chat_id } => {
+                        tokio::spawn(async move {
+                            if let Ok(t) = handle.transport()
+                                && let Err(e) = max_core::events::send_typing(&t, chat_id, max_core::events::TYPING_TEXT).await
+                            {
+                                crate::trace::note(&format!("typing failed: {e}"));
                             }
                         });
                     }
@@ -1074,6 +1116,55 @@ impl Names {
             .collect()
     }
 
+    /// What a server event means for the UI; `None` for our own typing and marks we ignore.
+    pub fn ui_event(&self, event: max_core::events::ServerEvent) -> Option<UiEvent> {
+        use max_core::events::ServerEvent as E;
+        Some(match event {
+            E::Message(new) => UiEvent::MessageAdded {
+                chat_id: new.chat_id,
+                message: self.row(&new.message),
+            },
+            E::Edited { chat_id, message } => UiEvent::MessageEdited {
+                chat_id,
+                message: self.row(&message),
+            },
+            E::Deleted {
+                chat_id,
+                message_ids,
+            } => UiEvent::MessagesDeleted {
+                chat_id,
+                ids: message_ids,
+            },
+            E::DeletedRange { chat_id, from, to } => {
+                UiEvent::MessagesDeletedRange { chat_id, from, to }
+            }
+            E::Typing {
+                chat_id, user_id, ..
+            } if user_id != self.me => UiEvent::Typing {
+                chat_id,
+                who: self.contacts.get(&user_id).cloned().unwrap_or_default(),
+            },
+            E::Typing { .. } => return None,
+            E::Mark {
+                chat_id,
+                user_id,
+                unread,
+                ..
+            } if user_id == self.me => UiEvent::ReadElsewhere {
+                chat_id,
+                unread: unread.unwrap_or(0),
+            },
+            E::Mark { chat_id, mark, .. } => UiEvent::PeerRead { chat_id, mark },
+            E::Chat(chat) => UiEvent::ChatChanged(self.chat_row(&chat)),
+        })
+    }
+
+    /// A chat list row, with names known so far.
+    pub fn chat_row(&self, chat: &Chat) -> ChatRow {
+        let title = |id: i64| self.contacts.get(&id).cloned();
+        chat_row_with(chat, self.me, title)
+    }
+
     /// A history row for a message. Channel posts have no sender: not ours, no name.
     pub fn row(&self, m: &messages::Message) -> MessageRow {
         MessageRow {
@@ -1090,6 +1181,7 @@ impl Names {
             time: m.time,
             delivery: Delivery::Sent,
             attachments: media::attachments(m),
+            edited: m.status.as_deref() == Some(max_core::events::EDITED),
         }
     }
 }
@@ -1415,13 +1507,13 @@ pub fn rows_from_login(login: &LoginResponse) -> (String, Vec<ChatRow>) {
     let mut rows: Vec<ChatRow> = login
         .chats
         .iter()
-        .map(|c| row(c, me_id, &contacts))
+        .map(|c| chat_row_with(c, me_id, |id| contacts.get(&id).map(|c| contact_name(c))))
         .collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.time));
     (contact_name(&login.profile.contact), rows)
 }
 
-fn row(chat: &Chat, me_id: i64, contacts: &BTreeMap<i64, &Contact>) -> ChatRow {
+fn chat_row_with(chat: &Chat, me_id: i64, name_of: impl Fn(i64) -> Option<String>) -> ChatRow {
     let title = chat
         .title
         .clone()
@@ -1436,9 +1528,7 @@ fn row(chat: &Chat, me_id: i64, contacts: &BTreeMap<i64, &Contact>) -> ChatRow {
             if other == me_id {
                 "Избранное".to_string()
             } else {
-                contacts
-                    .get(&other)
-                    .map_or_else(|| format!("id {other}"), |c| contact_name(c))
+                name_of(other).unwrap_or_else(|| format!("id {other}"))
             }
         });
     let preview = chat
@@ -1452,7 +1542,18 @@ fn row(chat: &Chat, me_id: i64, contacts: &BTreeMap<i64, &Contact>) -> ChatRow {
         preview,
         unread: chat.new_messages.unwrap_or(0),
         time: chat.last_event_time,
+        peer_mark: peer_mark(chat, me_id),
     }
+}
+
+/// The newest read mark among the other participants (`participants` maps id to read time).
+fn peer_mark(chat: &Chat, me_id: i64) -> i64 {
+    chat.participants
+        .iter()
+        .filter(|(id, _)| **id != me_id)
+        .map(|(_, mark)| *mark)
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1587,6 +1688,53 @@ mod tests {
         let rows = session_rows(&[s("old", 1, false), s("me", 5, true), s("new", 9, false)]);
         let order: Vec<&str> = rows.iter().map(|r| r.client.as_str()).collect();
         assert_eq!(order, ["me", "new", "old"]);
+    }
+
+    #[test]
+    fn server_events_map_to_ui_events() {
+        use max_core::events::ServerEvent as E;
+        let names = Names::from_login(&login_with(vec![]));
+        let typing = |user_id| E::Typing {
+            chat_id: 3,
+            user_id,
+            kind: None,
+        };
+        assert!(names.ui_event(typing(1)).is_none(), "our own typing");
+        assert!(matches!(
+            names.ui_event(typing(7)),
+            Some(UiEvent::Typing { chat_id: 3, who }) if who.is_empty()
+        ));
+        let mark = |user_id| E::Mark {
+            chat_id: 3,
+            user_id,
+            mark: 50,
+            unread: Some(2),
+        };
+        assert!(matches!(
+            names.ui_event(mark(1)),
+            Some(UiEvent::ReadElsewhere {
+                chat_id: 3,
+                unread: 2
+            })
+        ));
+        assert!(matches!(
+            names.ui_event(mark(7)),
+            Some(UiEvent::PeerRead {
+                chat_id: 3,
+                mark: 50
+            })
+        ));
+    }
+
+    #[test]
+    fn peer_mark_is_the_newest_other_mark() {
+        let chat = Chat {
+            id: 3,
+            participants: [(1, 900), (7, 40), (8, 60)].into_iter().collect(),
+            ..Chat::default()
+        };
+        let row = Names::from_login(&login_with(vec![])).chat_row(&chat);
+        assert_eq!(row.peer_mark, 60, "our own mark does not count");
     }
 
     #[test]

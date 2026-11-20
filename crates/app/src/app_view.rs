@@ -44,6 +44,11 @@ enum Screen {
     Error(String),
 }
 
+/// How long "typing" stays shown after the last typing event.
+const TYPING_SHOWN: std::time::Duration = std::time::Duration::from_secs(6);
+/// The least time between two typing notices we send for one chat.
+const TYPING_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The account panel: active sessions and logout.
 #[derive(Default)]
 struct AccountPanel {
@@ -117,6 +122,31 @@ impl History {
     }
 }
 
+/// Put a changed chat into the list: update it in place, or add it by time.
+fn upsert_chat(chats: &mut Vec<ChatRow>, new: ChatRow) {
+    if let Some(row) = chats.iter_mut().find(|c| c.id == new.id) {
+        let preview = if new.preview.is_empty() {
+            std::mem::take(&mut row.preview)
+        } else {
+            new.preview.clone()
+        };
+        let time = row.time.max(new.time);
+        let peer_mark = row.peer_mark.max(new.peer_mark);
+        *row = ChatRow {
+            preview,
+            time,
+            peer_mark,
+            ..new
+        };
+    } else {
+        let at = chats
+            .iter()
+            .position(|c| c.time < new.time)
+            .unwrap_or(chats.len());
+        chats.insert(at, new);
+    }
+}
+
 /// A photo or sticker image for display.
 enum ImageState {
     Loading,
@@ -172,6 +202,10 @@ pub struct AppView {
     commands: UnboundedSender<UiCommand>,
     /// Shown instead of a chat while open.
     account: Option<AccountPanel>,
+    /// Who is typing where, and since when.
+    typing: HashMap<i64, (String, std::time::Instant)>,
+    /// The last typing notice we sent: chat and time.
+    typing_sent: Option<(i64, std::time::Instant)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -191,14 +225,15 @@ impl AppView {
                 .placeholder("Пароль")
         });
         let composer = cx.new(|cx| InputState::new(window, cx).placeholder("Сообщение"));
-        let subscriptions =
-            vec![
-                cx.subscribe_in(&composer, window, |this, _, ev: &InputEvent, window, cx| {
-                    if let InputEvent::PressEnter { .. } = ev {
-                        this.send_message(window, cx);
-                    }
-                }),
-            ];
+        let subscriptions = vec![cx.subscribe_in(
+            &composer,
+            window,
+            |this, _, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => this.send_message(window, cx),
+                InputEvent::Change => this.composer_changed(cx),
+                _ => {}
+            },
+        )];
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this.update(cx, |view, cx| view.apply(event, cx)).is_err() {
@@ -218,6 +253,8 @@ impl AppView {
             images: HashMap::new(),
             commands,
             account: None,
+            typing: HashMap::new(),
+            typing_sent: None,
             _subscriptions: subscriptions,
         }
     }
@@ -276,6 +313,9 @@ impl AppView {
                 h.error = Some(error);
             }
             UiEvent::MessageAdded { chat_id, message } => {
+                if !message.out {
+                    self.typing.remove(&chat_id);
+                }
                 self.request_images(image_urls(&message));
                 self.message_added(chat_id, message);
                 self.mark_read(chat_id);
@@ -310,6 +350,64 @@ impl AppView {
                 self.histories.clear();
                 self.images.clear();
                 self.screen = Screen::Status("Вы вышли из аккаунта".into());
+            }
+            UiEvent::MessageEdited { chat_id, message } => {
+                if let Some(h) = self.histories.get_mut(&chat_id)
+                    && let Some(m) = h.messages.iter_mut().find(|m| m.id == message.id)
+                {
+                    *m = message;
+                }
+                self.refresh_preview(chat_id);
+            }
+            UiEvent::MessagesDeleted { chat_id, ids } => {
+                if let Some(h) = self.histories.get_mut(&chat_id) {
+                    h.messages.retain(|m| m.id == 0 || !ids.contains(&m.id));
+                }
+                self.refresh_preview(chat_id);
+            }
+            UiEvent::MessagesDeletedRange { chat_id, from, to } => {
+                if let Some(h) = self.histories.get_mut(&chat_id) {
+                    h.messages
+                        .retain(|m| m.id == 0 || m.time < from || m.time > to);
+                }
+                self.refresh_preview(chat_id);
+            }
+            UiEvent::Typing { chat_id, who } => {
+                self.typing
+                    .insert(chat_id, (who, std::time::Instant::now()));
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(TYPING_SHOWN).await;
+                    let _ = this.update(cx, |view, cx| {
+                        let stale = view
+                            .typing
+                            .get(&chat_id)
+                            .is_some_and(|(_, at)| at.elapsed() >= TYPING_SHOWN);
+                        if stale {
+                            view.typing.remove(&chat_id);
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+            UiEvent::ReadElsewhere { chat_id, unread } => {
+                if let Screen::Main { chats, .. } = &mut self.screen
+                    && let Some(row) = chats.iter_mut().find(|c| c.id == chat_id)
+                {
+                    row.unread = unread;
+                }
+            }
+            UiEvent::PeerRead { chat_id, mark } => {
+                if let Screen::Main { chats, .. } = &mut self.screen
+                    && let Some(row) = chats.iter_mut().find(|c| c.id == chat_id)
+                {
+                    row.peer_mark = row.peer_mark.max(mark);
+                }
+            }
+            UiEvent::ChatChanged(new) => {
+                if let Screen::Main { chats, .. } = &mut self.screen {
+                    upsert_chat(chats, new);
+                }
             }
             UiEvent::ChatTitles(titles) => {
                 if let Screen::Main { chats, .. } = &mut self.screen {
@@ -420,6 +518,7 @@ impl AppView {
             text: format!("Отправка: {name}"),
             time: cid,
             delivery: Delivery::Pending,
+            edited: false,
             attachments: Vec::new(),
         };
         if self
@@ -524,6 +623,54 @@ impl AppView {
         self.scroll.scroll_to_bottom();
         self.mark_read(chat_id);
         cx.notify();
+    }
+
+    /// Show the newest loaded message as the chat's preview (after an edit or a delete).
+    fn refresh_preview(&mut self, chat_id: i64) {
+        let Some(last) = self
+            .histories
+            .get(&chat_id)
+            .and_then(|h| h.messages.last())
+            .map(MessageRow::preview)
+        else {
+            return;
+        };
+        if let Screen::Main { chats, .. } = &mut self.screen
+            && let Some(row) = chats.iter_mut().find(|c| c.id == chat_id)
+        {
+            row.preview = last;
+        }
+    }
+
+    /// Tell the open chat we are typing, at most once per [`TYPING_EVERY`].
+    fn composer_changed(&mut self, cx: &mut Context<Self>) {
+        let Screen::Main {
+            selected: Some(chat_id),
+            ..
+        } = self.screen
+        else {
+            return;
+        };
+        if self.composer.read(cx).value().trim().is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let recent = self
+            .typing_sent
+            .is_some_and(|(id, at)| id == chat_id && now.duration_since(at) < TYPING_EVERY);
+        if !recent && self.commands.send(UiCommand::Typing { chat_id }).is_ok() {
+            self.typing_sent = Some((chat_id, now));
+        }
+    }
+
+    /// "печатает…" for a chat, with the name in group chats.
+    fn typing_label(&self, chat: &ChatRow) -> Option<String> {
+        let (who, _) = self.typing.get(&chat.id)?;
+        Some(if who.is_empty() || *who == chat.title {
+            "печатает…".to_string()
+        } else {
+            format!("{who} печатает…")
+        })
     }
 
     /// Open the account panel and ask for the sessions.
@@ -764,6 +911,7 @@ impl AppView {
             text: text.clone(),
             time: cid,
             delivery: Delivery::Pending,
+            edited: false,
             attachments: Vec::new(),
         };
         if self
@@ -982,7 +1130,12 @@ impl AppView {
         Self::centered(form, cx)
     }
 
-    fn chat_row(row: &ChatRow, selected: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn chat_row(
+        row: &ChatRow,
+        selected: bool,
+        typing: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let id = row.id;
         let initials: String = row
             .title
@@ -1034,9 +1187,13 @@ impl AppView {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_color(if typing.is_some() {
+                                        cx.theme().primary
+                                    } else {
+                                        cx.theme().muted_foreground
+                                    })
                                     .truncate()
-                                    .child(row.preview.clone()),
+                                    .child(typing.clone().unwrap_or_else(|| row.preview.clone())),
                             )
                             .when(row.unread > 0, |this| {
                                 this.child(
@@ -1143,6 +1300,7 @@ impl AppView {
         chat_id: i64,
         m: &MessageRow,
         chat_title: &str,
+        peer_mark: i64,
         cx: &mut Context<Self>,
     ) -> Div {
         let attachments: Vec<AnyElement> = m
@@ -1153,6 +1311,8 @@ impl AppView {
             .map(|(i, a)| self.attachment_view(chat_id, m, a, i, cx))
             .collect();
         let state = match m.delivery {
+            Delivery::Sent if m.out && m.time <= peer_mark => " · ✓✓".into(),
+            Delivery::Sent if m.out => " · ✓".into(),
             Delivery::Sent => String::new(),
             Delivery::Pending => " · отправка…".into(),
             Delivery::Failed => " · не отправлено".into(),
@@ -1199,12 +1359,11 @@ impl AppView {
                     .when(!m.text.is_empty(), |this| {
                         this.child(div().child(m.text.clone()))
                     })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("{}{state}", clock(m.time))),
-                    ),
+                    .child(div().text_xs().text_color(muted).child(format!(
+                        "{}{}{state}",
+                        if m.edited { "изменено · " } else { "" },
+                        clock(m.time)
+                    ))),
             )
     }
 
@@ -1230,7 +1389,10 @@ impl AppView {
                 );
                 last_day = day;
             }
-            items.push(self.bubble(chat.id, m, &chat.title, cx).into_any_element());
+            items.push(
+                self.bubble(chat.id, m, &chat.title, chat.peer_mark, cx)
+                    .into_any_element(),
+            );
         }
         let chat_id = chat.id;
         // None: no older page; Some(loading) otherwise.
@@ -1250,13 +1412,15 @@ impl AppView {
             .min_w_0()
             .h_full()
             .child(
-                div()
+                v_flex()
                     .px_4()
                     .py_3()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .font_semibold()
-                    .child(chat.title.clone()),
+                    .child(div().font_semibold().child(chat.title.clone()))
+                    .when_some(self.typing_label(chat), |this, label| {
+                        this.child(div().text_xs().text_color(cx.theme().primary).child(label))
+                    }),
             )
             .child(
                 v_flex()
@@ -1340,11 +1504,10 @@ impl AppView {
             .overflow_y_scroll()
             .p_2()
             .gap_1()
-            .children(
-                chats
-                    .iter()
-                    .map(|row| Self::chat_row(row, selected == Some(row.id), cx)),
-            );
+            .children(chats.iter().map(|row| {
+                let typing = self.typing_label(row);
+                Self::chat_row(row, selected == Some(row.id), typing, cx)
+            }));
         let sidebar = v_flex()
             .w(px(340.))
             .h_full()
@@ -1608,6 +1771,7 @@ mod tests {
             text: format!("m{id}"),
             time: id,
             delivery,
+            edited: false,
             attachments: Vec::new(),
         }
     }
@@ -1659,6 +1823,35 @@ mod media_tests {
 }
 
 #[cfg(test)]
+mod chat_list_tests {
+    use super::{ChatRow, upsert_chat};
+
+    fn chat(id: i64, time: i64, preview: &str) -> ChatRow {
+        ChatRow {
+            id,
+            title: format!("чат {id}"),
+            preview: preview.into(),
+            unread: 0,
+            time,
+            peer_mark: 0,
+        }
+    }
+
+    #[test]
+    fn changed_chat_keeps_its_preview_and_new_chat_goes_by_time() {
+        let mut chats = vec![chat(1, 300, "привет"), chat(2, 100, "пока")];
+        let mut renamed = chat(1, 200, "");
+        renamed.title = "Новое имя".into();
+        upsert_chat(&mut chats, renamed);
+        assert_eq!(chats[0].title, "Новое имя");
+        assert_eq!((chats[0].preview.as_str(), chats[0].time), ("привет", 300));
+        upsert_chat(&mut chats, chat(3, 150, ""));
+        let ids: Vec<i64> = chats.iter().map(|c| c.id).collect();
+        assert_eq!(ids, [1, 3, 2]);
+    }
+}
+
+#[cfg(test)]
 mod paging_tests {
     use super::{Delivery, History, MessageRow};
 
@@ -1671,6 +1864,7 @@ mod paging_tests {
             text: String::new(),
             time: id * 10,
             delivery,
+            edited: false,
             attachments: Vec::new(),
         }
     }

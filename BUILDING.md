@@ -42,7 +42,8 @@ cargo run -p maxrs -- --trace       # same, with a local protocol trace (rust/re
 ```
 
 `tools/window-shot.ps1 -ProcessName maxrs -Out shot.png` captures only the client window;
-`tools/window-click.ps1 -ProcessName maxrs -X 289 -Y 25` posts a click to it without moving the cursor.
+`tools/window-click.ps1 -ProcessName maxrs -X 289 -Y 25` posts a click to it without moving the cursor;
+`tools/window-type.ps1 -ProcessName maxrs -Text "Hi" -Enter` posts text the same way.
 
 ## Reverse engineering tools
 

@@ -43,7 +43,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | A4 | Failover hosts from server config | K `failover-hosts` | v1 | open |
 | A5 | Login sync (chats, contacts, config on `LOGIN`) | O 19, 22 | v1 | LOGIN with saved token and initial sync done (`max-core`); sync markers stay 0 until their update rule is decoded |
 | A6 | Server config flags, local feature gates | K (184 keys); O 134 `ConfigChangeData` | v1 | open |
-| A7 | Server push events dispatch | O 128-165, 216, 243, 277, 293 (CommonEvent) | v1 | NOTIF_MESSAGE (128) decoded and shown live (`max_core::messages::new_message`); other pushes delivered raw |
+| A7 | Server push events dispatch | O 128-165, 216, 243, 277, 293 (CommonEvent) | v1 | `max_core::events` decodes NOTIF_MESSAGE (new, EDITED, REMOVED), NOTIF_TYPING, NOTIF_MARK, NOTIF_CHAT, MESSAGES_DELETE, MESSAGES_DELETE_RANGE; all applied in the UI. Presence, reactions, contacts, folders, calls still delivered raw. NOTIF_MESSAGE layout seen live; the others not yet |
 | A8 | Network change handling | S `network_change_notifier` | v1 | open |
 | A9 | Upload/download HTTP endpoints, URL refresh | O 80, 82, 87, 88, 203; K `desktop-upload-url-failover`, `photo-url-refresh` | v1 | HTTP client with host-scoped roots (ADR-011) and the desktop User-Agent; photo and file upload and download done (`max_core::media`); URL refresh and failover open |
 
@@ -67,8 +67,8 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
 | C1 | Chat list with previews, counters, presence | O 53, 35, 132; Q `ChatListView`, `ChatDelegate`, `PresenceMarker` | v1 | list, last message, unread counter, live reordering on new messages done; presence open |
-| C2 | Mark read / unread | O 50, 130; K `readmark-validation-disabled` | v1 | mark read (CHAT_MARK READ_MESSAGE up to the newest server message) when a chat is opened or a message arrives in it, done; mark unread (SET_AS_UNREAD) and NOTIF_MARK from other devices open; unverified on the real server |
-| C3 | Typing indicators (send and show) | O 65, 129; K `typing-send-enabled`; Q `TypingControl` | v1 | open |
+| C2 | Mark read / unread | O 50, 130; K `readmark-validation-disabled` | v1 | mark read (CHAT_MARK READ_MESSAGE up to the newest incoming message) on open and on new messages; reads on other devices (own NOTIF_MARK) update the unread counter; the other participants' marks (chat `participants`, NOTIF_MARK) show ✓/✓✓ on our messages. Mark unread open |
+| C3 | Typing indicators (send and show) | O 65, 129; K `typing-send-enabled`; Q `TypingControl` | v1 | done: TYPING_SEND `{chatId, type: "TEXT"}` (type names from `Core::Typing::Interactor::doSend`) at most every 5 s while the composer changes; NOTIF_TYPING shown in the chat header and list for 6 s (both intervals chosen here, not read from the client); not tried on the real server |
 | C4 | Search: chats, messages, public, by phone | O 60, 68, 73, 46; Q `SearchPanel`, `SearchByPhoneDialog` | v1 | open |
 | C5 | Local search | K `local-search-ranker`, `recent-search-enabled` | v2 | open |
 | C6 | Folders: list, edit, reorder, delete, filters | O 272-277; K `folder-*`, `choose-default-folder`; Q `SettingsFolders*` | v2 | open |
@@ -83,7 +83,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 |---|---|---|---|---|
 | D1 | History load and scroll, day dividers, new-messages marker | O 49, 71; Q `HistoryListView`, `NewMessagesPanel` | v1 | first page (40, from now) with day dividers and scroll to the newest done; request values from PyMax, unverified on the real server; paging back (button at the top and scrolling up at the top, `from` = oldest shown) done; new-messages marker open |
 | D2 | Send text, formatting, links, mentions | O 64; Q `MessageTextInput`, `AddFormatLinkDialog`, `MentionContactList` | v1 | plain text with pending, sent and failed states done (cid = send time); formatting, links, mentions open |
-| D3 | Edit, delete (for me / for all), delete range | O 66, 67, 140, 142; K `delete-msg-fys-large-chat-disabled` | v1 | open |
+| D3 | Edit, delete (for me / for all), delete range | O 66, 67, 140, 142; K `delete-msg-fys-large-chat-disabled` | v1 | edits and deletes from the server shown ("изменено", removed from the history); editing and deleting our own messages open |
 | D4 | Reply, forward, quote navigation | Q `Reply*`, `MessageForwardDialog`; K `reply-navigation-highlight` | v1 | open |
 | D5 | Reactions: set, cancel, list, detailed | O 178-181, 155, 156; Q `ReactionPlate`; K `reactions-rank-config` | v1 | open |
 | D6 | Pinned messages and multipin | O 240-243, 86; K `multipin-*`; Q `PinBar`, `PinnedMessagesPage` | v2 | open |

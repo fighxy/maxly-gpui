@@ -65,3 +65,10 @@ Run 3 (stored token): login without QR (13 works); `CONTACT_INFO` with `contactI
 accepted and dialog names show; channel posts show as incoming. Images failed with
 `invalid peer certificate: UnknownIssuer`: `i.oneme.ru` is not under the Russian root. ADR-011
 amended: MAX hosts accept the Russian root or a Mozilla root.
+
+Run 4: photos load (58 `i.oneme.ru` images, no failures) with the amended ADR-011; step 8 works.
+Same run, continued: a text to Saved messages (`chatId` 0) is stored (6 works); a photo goes
+`PHOTO_UPLOAD` `{count: 1}` → upload to `iu.oneme.ru` → `MSG_SEND` with `photoToken` and comes
+back with `baseUrl` (9 works). The client also sent `CHAT_MARK` for its own messages; it no
+longer does. No pushes arrived during the run.
+Still to do: 4, 7, 10, 11, 12.

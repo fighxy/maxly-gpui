@@ -69,13 +69,14 @@ impl History {
         self.messages = fresh;
     }
 
-    /// The newest message from the server, if it is newer than the last read mark.
+    /// The newest incoming message, if it is newer than the last read mark. Our own messages
+    /// need no mark: the server moves it on send (`MSG_SEND` answers with `mark`).
     fn unread_mark(&self) -> Option<i64> {
         let newest = self
             .messages
             .iter()
             .rev()
-            .find(|m| m.id != 0 && m.delivery == Delivery::Sent)?
+            .find(|m| !m.out && m.id != 0 && m.delivery == Delivery::Sent)?
             .id;
         (newest != self.marked).then_some(newest)
     }
@@ -1474,5 +1475,10 @@ mod paging_tests {
         assert_eq!(h.unread_mark(), None);
         h.messages.push(row(3, Delivery::Sent));
         assert_eq!(h.unread_mark(), Some(3));
+        h.marked = 3;
+        let mut mine = row(4, Delivery::Sent);
+        mine.out = true;
+        h.messages.push(mine);
+        assert_eq!(h.unread_mark(), None, "our own message needs no read mark");
     }
 }

@@ -86,3 +86,25 @@ pub fn new_message(push: &Response) -> Option<NewMessage> {
         None
     }
 }
+
+/// `CHAT_MARK` type for "read up to this message" (`core.dll` converter `FUN_18122eb60`; the
+/// value set matches PyMax `ReadAction.READ_MESSAGE`).
+pub const READ_MESSAGE: &str = "READ_MESSAGE";
+
+/// The server's answer to [`mark_read`]: the new read mark and unread count.
+pub type MarkResponse = max_proto::schema::packets::chat::chat_mark::Response;
+
+/// Mark `chat_id` as read up to `message_id` (`CHAT_MARK`, `type` `READ_MESSAGE`, `mark` = now).
+pub async fn mark_read(
+    transport: &Transport,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<MarkResponse> {
+    let params = max_proto::schema::packets::chat::chat_mark::Parameters {
+        chat_id,
+        mark: Some(now_ms()),
+        message_id: Some(message_id),
+        type_: Some(READ_MESSAGE.to_string()),
+    };
+    Ok(transport.call(Opcode::ChatMark, &params).await?)
+}

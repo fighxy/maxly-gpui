@@ -716,3 +716,51 @@ async fn photo_and_file_upload_then_send() {
     assert_eq!(attach_ready(&push), Some((900, None)));
     let _keep = srv.await.unwrap();
 }
+
+#[tokio::test]
+async fn older_page_and_mark_read() {
+    use max_core::messages::{history, mark_read};
+
+    let root = tempfile::tempdir().unwrap();
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::new());
+    let mut p = profile(&root, &secrets);
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(async move {
+        let mut s = Server::new(server);
+        s.session_init().await;
+        // Older page: `from` is the time of the oldest message shown.
+        let (seq, body) = s.expect(Opcode::ChatHistory).await;
+        assert_eq!(get(&body, "from").as_i64(), Some(800));
+        let old = map(&[
+            ("id", 0i64.into()),
+            ("time", 700i64.into()),
+            ("type", "USER".into()),
+            ("text", "старое".into()),
+        ]);
+        s.reply(
+            Opcode::ChatHistory,
+            seq,
+            &map(&[("messages", Value::Array(vec![old]))]),
+        )
+        .await;
+        let (seq, body) = s.expect(Opcode::ChatMark).await;
+        assert_eq!(get(&body, "chatId").as_i64(), Some(42));
+        assert_eq!(get(&body, "messageId").as_i64(), Some(2));
+        assert_eq!(get(&body, "type").as_str(), Some("READ_MESSAGE"));
+        assert!(
+            get(&body, "mark").as_i64().unwrap() > 1_700_000_000_000,
+            "mark is the current time in ms"
+        );
+        s.reply(Opcode::ChatMark, seq, &map(&[("unread", 0i64.into())]))
+            .await;
+        s
+    });
+    let session = Session::start(client, &config(), &mut p, &env())
+        .await
+        .unwrap();
+    let older = history(session.transport(), 42, 800, 40).await.unwrap();
+    assert_eq!(older[0].text.as_deref(), Some("старое"));
+    let r = mark_read(session.transport(), 42, 2).await.unwrap();
+    assert_eq!(r.unread, Some(0));
+    let _keep = srv.await.unwrap();
+}

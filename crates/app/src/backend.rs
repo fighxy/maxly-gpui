@@ -42,10 +42,17 @@ pub enum UiEvent {
     },
     /// Logged in: who we are and the chat list.
     LoggedIn { me: String, chats: Vec<ChatRow> },
-    /// The history of a chat, oldest first.
+    /// The history of a chat, oldest first; `has_more` when older messages exist.
     History {
         chat_id: i64,
         messages: Vec<MessageRow>,
+        has_more: bool,
+    },
+    /// An older page of a chat, oldest first.
+    Older {
+        chat_id: i64,
+        messages: Vec<MessageRow>,
+        has_more: bool,
     },
     /// Loading a chat's history failed.
     HistoryFailed { chat_id: i64, error: String },
@@ -105,6 +112,10 @@ pub enum UiCommand {
         path: std::path::PathBuf,
         cid: i64,
     },
+    /// Load messages older than `before` (Unix ms).
+    LoadOlder { chat_id: i64, before: i64 },
+    /// Tell the server the chat is read up to `message_id`.
+    MarkRead { chat_id: i64, message_id: i64 },
 }
 
 /// Delivery state of a message in the history view.
@@ -306,6 +317,7 @@ async fn demo_flow(
             }
             UiCommand::Code(_) | UiCommand::Password(_) => break,
             UiCommand::OpenChat(_) | UiCommand::SendText { .. } => {}
+            UiCommand::LoadOlder { .. } | UiCommand::MarkRead { .. } => {}
             UiCommand::FetchImage(_)
             | UiCommand::DownloadFile { .. }
             | UiCommand::SendFile { .. } => {}
@@ -344,6 +356,7 @@ async fn demo_flow(
         let _ = ui.send(UiEvent::History {
             chat_id: 1,
             messages: demo_history(1, t),
+            has_more: true,
         });
         tokio::time::sleep(Duration::from_millis(800)).await;
         let cid = now_ms();
@@ -366,6 +379,16 @@ async fn demo_flow(
                 let _ = ui.send(UiEvent::History {
                     chat_id,
                     messages: demo_history(chat_id, t),
+                    has_more: true,
+                });
+            }
+            UiCommand::LoadOlder { chat_id, before } => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let (messages, has_more) = demo_older(chat_id, before, t);
+                let _ = ui.send(UiEvent::Older {
+                    chat_id,
+                    messages,
+                    has_more,
                 });
             }
             UiCommand::SendText { chat_id, text, cid } => {
@@ -468,6 +491,34 @@ fn demo_photo_svg() -> bytes::Bytes {
 <path d="M0 360 L200 280 L330 350 L470 260 L640 370 L640 420 L0 420 Z" fill="#2f6b3d"/>
 </svg>"##,
     )
+}
+
+/// Older made-up messages: two more pages, then the start of the chat.
+fn demo_older(chat_id: i64, before: i64, now: i64) -> (Vec<MessageRow>, bool) {
+    let page = ((now - before) / (24 * 3_600_000)).clamp(0, 2);
+    let base = before - 24 * 3_600_000;
+    let lines = [
+        (false, "Как съездили?"),
+        (true, "Отлично, фото пришлю позже"),
+        (false, "Жду!"),
+        (true, "Кстати, на выходных свободна?"),
+    ];
+    let rows = lines
+        .iter()
+        .enumerate()
+        .map(|(i, (out, text))| {
+            let mut row = demo_row(
+                chat_id * 1000 - page * 10 - i as i64,
+                *out,
+                text,
+                base + i as i64 * 600_000,
+                Delivery::Sent,
+            );
+            row.cid = None;
+            row
+        })
+        .collect();
+    (rows, page < 1)
 }
 
 /// A short made-up conversation ending a few minutes before `now`.
@@ -630,10 +681,35 @@ async fn real_flow(
                             let _ = ui.send(match result {
                                 Ok(list) => {
                                     let names = names.read().unwrap_or_else(PoisonError::into_inner);
-                                    UiEvent::History { chat_id, messages: list.iter().map(|m| names.row(m)).collect() }
+                                    let has_more = list.len() >= usize::try_from(messages::HISTORY_PAGE).unwrap_or(40);
+                                    UiEvent::History { chat_id, messages: list.iter().map(|m| names.row(m)).collect(), has_more }
                                 }
                                 Err(e) => UiEvent::HistoryFailed { chat_id, error: message(&e) },
                             });
+                        });
+                    }
+                    UiCommand::LoadOlder { chat_id, before } => {
+                        tokio::spawn(async move {
+                            let result = match handle.transport() {
+                                Ok(t) => messages::history(&t, chat_id, before, messages::HISTORY_PAGE).await,
+                                Err(e) => Err(e),
+                            };
+                            let _ = ui.send(match result {
+                                Ok(list) => {
+                                    let names = names.read().unwrap_or_else(PoisonError::into_inner);
+                                    let has_more = list.len() >= usize::try_from(messages::HISTORY_PAGE).unwrap_or(40);
+                                    UiEvent::Older { chat_id, messages: list.iter().map(|m| names.row(m)).collect(), has_more }
+                                }
+                                Err(e) => UiEvent::Notice(format!("Не удалось загрузить ранние сообщения: {}", message(&e))),
+                            });
+                        });
+                    }
+                    UiCommand::MarkRead { chat_id, message_id } => {
+                        tokio::spawn(async move {
+                            if let Ok(t) = handle.transport() {
+                                // A failed read mark is retried with the next one; nothing to show.
+                                let _ = messages::mark_read(&t, chat_id, message_id).await;
+                            }
                         });
                     }
                     UiCommand::SendText { chat_id, text, cid } => {

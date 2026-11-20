@@ -67,7 +67,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
 | C1 | Chat list with previews, counters, presence | O 53, 35, 132; Q `ChatListView`, `ChatDelegate`, `PresenceMarker` | v1 | list, last message, unread counter, live reordering on new messages done; presence open |
-| C2 | Mark read / unread | O 50, 130; K `readmark-validation-disabled` | v1 | open |
+| C2 | Mark read / unread | O 50, 130; K `readmark-validation-disabled` | v1 | mark read (CHAT_MARK READ_MESSAGE up to the newest server message) when a chat is opened or a message arrives in it, done; mark unread (SET_AS_UNREAD) and NOTIF_MARK from other devices open; unverified on the real server |
 | C3 | Typing indicators (send and show) | O 65, 129; K `typing-send-enabled`; Q `TypingControl` | v1 | open |
 | C4 | Search: chats, messages, public, by phone | O 60, 68, 73, 46; Q `SearchPanel`, `SearchByPhoneDialog` | v1 | open |
 | C5 | Local search | K `local-search-ranker`, `recent-search-enabled` | v2 | open |
@@ -81,7 +81,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
-| D1 | History load and scroll, day dividers, new-messages marker | O 49, 71; Q `HistoryListView`, `NewMessagesPanel` | v1 | first page (40, from now) with day dividers and scroll to the newest done; request values from PyMax, unverified on the real server; paging back and the new-messages marker open |
+| D1 | History load and scroll, day dividers, new-messages marker | O 49, 71; Q `HistoryListView`, `NewMessagesPanel` | v1 | first page (40, from now) with day dividers and scroll to the newest done; request values from PyMax, unverified on the real server; paging back (button at the top and scrolling up at the top, `from` = oldest shown) done; new-messages marker open |
 | D2 | Send text, formatting, links, mentions | O 64; Q `MessageTextInput`, `AddFormatLinkDialog`, `MentionContactList` | v1 | plain text with pending, sent and failed states done (cid = send time); formatting, links, mentions open |
 | D3 | Edit, delete (for me / for all), delete range | O 66, 67, 140, 142; K `delete-msg-fys-large-chat-disabled` | v1 | open |
 | D4 | Reply, forward, quote navigation | Q `Reply*`, `MessageForwardDialog`; K `reply-navigation-highlight` | v1 | open |

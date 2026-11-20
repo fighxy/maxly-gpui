@@ -50,9 +50,36 @@ struct History {
     messages: Vec<MessageRow>,
     loading: bool,
     error: Option<String>,
+    /// Older messages exist on the server.
+    has_more: bool,
+    /// An older page is on its way.
+    loading_older: bool,
+    /// The last message id we told the server we read.
+    marked: i64,
 }
 
 impl History {
+    /// Put an older page in front, skipping messages already shown.
+    fn prepend(&mut self, older: Vec<MessageRow>) {
+        let mut fresh: Vec<MessageRow> = older
+            .into_iter()
+            .filter(|m| m.id == 0 || !self.messages.iter().any(|k| k.id == m.id))
+            .collect();
+        fresh.append(&mut self.messages);
+        self.messages = fresh;
+    }
+
+    /// The newest message from the server, if it is newer than the last read mark.
+    fn unread_mark(&self) -> Option<i64> {
+        let newest = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.id != 0 && m.delivery == Delivery::Sent)?
+            .id;
+        (newest != self.marked).then_some(newest)
+    }
+
     /// Add a message, or replace our pending copy with the same `cid`; skip known ids.
     fn add(&mut self, message: MessageRow) {
         if let Some(cid) = message.cid
@@ -175,7 +202,11 @@ impl AppView {
 
     fn apply(&mut self, event: UiEvent, cx: &mut Context<Self>) {
         match event {
-            UiEvent::History { chat_id, messages } => {
+            UiEvent::History {
+                chat_id,
+                messages,
+                has_more,
+            } => {
                 let h = self.histories.entry(chat_id).or_default();
                 let pending: Vec<MessageRow> = h
                     .messages
@@ -185,6 +216,7 @@ impl AppView {
                 h.messages = messages;
                 h.loading = false;
                 h.error = None;
+                h.has_more = has_more;
                 for m in pending {
                     h.add(m);
                 }
@@ -202,6 +234,19 @@ impl AppView {
                     }
                 }
                 self.scroll.scroll_to_bottom();
+                self.mark_read(chat_id);
+            }
+            UiEvent::Older {
+                chat_id,
+                messages,
+                has_more,
+            } => {
+                let urls: Vec<String> = messages.iter().flat_map(image_urls).collect();
+                let h = self.histories.entry(chat_id).or_default();
+                h.prepend(messages);
+                h.has_more = has_more;
+                h.loading_older = false;
+                self.request_images(urls);
             }
             UiEvent::HistoryFailed { chat_id, error } => {
                 let h = self.histories.entry(chat_id).or_default();
@@ -211,6 +256,7 @@ impl AppView {
             UiEvent::MessageAdded { chat_id, message } => {
                 self.request_images(image_urls(&message));
                 self.message_added(chat_id, message);
+                self.mark_read(chat_id);
             }
             UiEvent::Image { url, bytes } => {
                 let state = match image_format(&bytes) {
@@ -227,6 +273,10 @@ impl AppView {
             UiEvent::Notice(text) => {
                 if let Screen::Main { status, .. } = &mut self.screen {
                     *status = Some(text);
+                }
+                // A failed older page must not block the next try.
+                for h in self.histories.values_mut() {
+                    h.loading_older = false;
                 }
             }
             UiEvent::SendFailed {
@@ -421,7 +471,49 @@ impl AppView {
             let _ = self.commands.send(UiCommand::OpenChat(chat_id));
         }
         self.scroll.scroll_to_bottom();
+        self.mark_read(chat_id);
         cx.notify();
+    }
+
+    /// Tell the server the open chat is read up to its newest message.
+    fn mark_read(&mut self, chat_id: i64) {
+        let open = matches!(self.screen, Screen::Main { selected: Some(id), .. } if id == chat_id);
+        if !open {
+            return;
+        }
+        if let Some(h) = self.histories.get_mut(&chat_id)
+            && let Some(message_id) = h.unread_mark()
+            && self
+                .commands
+                .send(UiCommand::MarkRead {
+                    chat_id,
+                    message_id,
+                })
+                .is_ok()
+        {
+            h.marked = message_id;
+        }
+    }
+
+    /// Ask for the page before the oldest message shown.
+    fn load_older(&mut self, chat_id: i64, cx: &mut Context<Self>) {
+        let Some(h) = self.histories.get_mut(&chat_id) else {
+            return;
+        };
+        if !h.has_more || h.loading_older || h.loading {
+            return;
+        }
+        let Some(before) = h.messages.iter().map(|m| m.time).filter(|t| *t > 0).min() else {
+            return;
+        };
+        if self
+            .commands
+            .send(UiCommand::LoadOlder { chat_id, before })
+            .is_ok()
+        {
+            h.loading_older = true;
+            cx.notify();
+        }
     }
 
     fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -913,6 +1005,11 @@ impl AppView {
             }
             items.push(self.bubble(chat.id, m, &chat.title, cx).into_any_element());
         }
+        let chat_id = chat.id;
+        // None: no older page; Some(loading) otherwise.
+        let older_state = history
+            .filter(|h| h.has_more && !h.messages.is_empty())
+            .map(|h| h.loading_older);
         let notice = match history {
             Some(h) if h.loading => Some("Загрузка…".to_string()),
             Some(History { error: Some(e), .. }) => {
@@ -941,9 +1038,35 @@ impl AppView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
+                    .on_scroll(cx.listener(move |this, ev: &ScrollEvent, _, cx| {
+                        // Scrolling up at the top loads the previous page.
+                        let up = ev.delta.pixel_delta(px(20.)).y > px(0.);
+                        if up && this.scroll.offset().y >= px(-4.) {
+                            this.load_older(chat_id, cx);
+                        }
+                    }))
                     .px_4()
                     .py_3()
                     .gap_2()
+                    .when(older_state.is_some(), |this| {
+                        let loading = older_state == Some(true);
+                        this.child(
+                            h_flex().w_full().justify_center().child(
+                                Button::new("older")
+                                    .ghost()
+                                    .small()
+                                    .label(if loading {
+                                        "Загрузка…"
+                                    } else {
+                                        "Показать более ранние"
+                                    })
+                                    .disabled(loading)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.load_older(chat_id, cx)
+                                    })),
+                            ),
+                        )
+                    })
                     .when_some(notice, |this, n| {
                         this.child(
                             h_flex()
@@ -1292,5 +1415,55 @@ mod media_tests {
         assert_eq!(human_size(512), "512 Б");
         assert_eq!(human_size(245_760), "240 КБ");
         assert_eq!(human_size(5 * 1024 * 1024), "5.0 МБ");
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::{Delivery, History, MessageRow};
+
+    fn row(id: i64, delivery: Delivery) -> MessageRow {
+        MessageRow {
+            id,
+            cid: None,
+            out: false,
+            sender: String::new(),
+            text: String::new(),
+            time: id * 10,
+            delivery,
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn older_page_goes_in_front_without_duplicates() {
+        let mut h = History {
+            messages: vec![row(5, Delivery::Sent), row(6, Delivery::Sent)],
+            ..History::default()
+        };
+        h.prepend(vec![
+            row(3, Delivery::Sent),
+            row(4, Delivery::Sent),
+            row(5, Delivery::Sent),
+        ]);
+        let ids: Vec<i64> = h.messages.iter().map(|m| m.id).collect();
+        assert_eq!(ids, [3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn read_mark_follows_the_newest_server_message_once() {
+        let mut h = History {
+            messages: vec![
+                row(1, Delivery::Sent),
+                row(2, Delivery::Sent),
+                row(0, Delivery::Pending),
+            ],
+            ..History::default()
+        };
+        assert_eq!(h.unread_mark(), Some(2), "pending copies have no server id");
+        h.marked = 2;
+        assert_eq!(h.unread_mark(), None);
+        h.messages.push(row(3, Delivery::Sent));
+        assert_eq!(h.unread_mark(), Some(3));
     }
 }

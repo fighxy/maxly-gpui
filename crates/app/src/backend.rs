@@ -228,11 +228,23 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Server error for a new device logging into an account with an active session and no
+/// 2FA password (seen live on `AUTH` CHECK_CODE).
+const NO_2FA: &str = "error.profile.active.session.no2fa";
+
 /// A readable message for a failed step: the server's own text when it sent one.
 fn message(e: &CoreError) -> String {
     if let CoreError::Transport(TransportError::Server { payload, .. }) = e
         && let Some(map) = payload.as_map()
     {
+        let error = map
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("error"))
+            .and_then(|(_, v)| v.as_str());
+        if error == Some(NO_2FA) {
+            return "Вход по коду закрыт: у аккаунта есть активный сеанс, а облачный пароль (2FA)                     не задан. Задайте пароль в приложении MAX на телефоне или войдите по QR-коду."
+                .into();
+        }
         for key in ["localizedMessage", "message", "error"] {
             if let Some(text) = map
                 .iter()

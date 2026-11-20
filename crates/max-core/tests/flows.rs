@@ -260,7 +260,7 @@ async fn sms_code_then_2fa_password() {
         let r = map(&[
             ("token", "t-sms".into()),
             ("codeLength", 6i64.into()),
-            ("altActionDuration", 60i64.into()),
+            ("altActionDuration", 60_000i64.into()),
         ]);
         s.reply(Opcode::AuthRequest, seq, &r).await;
         let (seq, body) = s.expect(Opcode::Auth).await;
@@ -294,6 +294,7 @@ async fn sms_code_then_2fa_password() {
         .await
         .unwrap();
     assert_eq!(req.code_length, 6);
+    assert_eq!(req.alt_action_after, 60, "altActionDuration comes in ms");
     let step = session.confirm_code(&req, "123456").await.unwrap();
     let AuthStep::PasswordRequired(challenge) = step else {
         panic!("expected a password step, got {step:?}")
@@ -322,7 +323,7 @@ async fn unknown_phone_needs_registration() {
             &map(&[
                 ("token", "t".into()),
                 ("codeLength", 4i64.into()),
-                ("altActionDuration", 30i64.into()),
+                ("altActionDuration", 30_000i64.into()),
             ]),
         )
         .await;

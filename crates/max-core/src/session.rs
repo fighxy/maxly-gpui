@@ -164,7 +164,8 @@ impl Session {
         Ok(CodeRequest {
             token: Zeroizing::new(r.token),
             code_length: r.code_length,
-            alt_action_after: r.alt_action_duration,
+            // Sent in milliseconds (60000 in a live answer); kept in whole seconds.
+            alt_action_after: (r.alt_action_duration + 999) / 1000,
             requests_left: r.request_count_left,
         })
     }

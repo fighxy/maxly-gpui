@@ -46,7 +46,7 @@ pub struct CodeRequest {
     pub(crate) token: Zeroizing<String>,
     /// Number of digits in the code.
     pub code_length: i64,
-    /// Seconds until another way to get the code is offered (`altActionDuration`).
+    /// Seconds until another way to get the code is offered (`altActionDuration`, sent in ms).
     pub alt_action_after: i64,
     /// Requests left, if the server says.
     pub requests_left: Option<i32>,

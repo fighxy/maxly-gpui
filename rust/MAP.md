@@ -243,6 +243,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 4. Platforms after Windows (open); ~~storage encryption~~ accepted: ADR-009.
 5. Where Tracer sends from (not through OpenSSL in the pre-login capture).
 6. Phone login with the desktop identity: the official desktop client offers it (`PhoneNumberPage`, `CodeEnterPage`, `CalloutPage`), so the server should accept it, possibly sending the code to the MAX app instead of SMS. If a test account shows the server refusing it for desktops, consider presenting as the Android client for login only; that needs RE of the Android APK (user agent, protocol version 10, opcodes) and a new ADR, since it contradicts ADR-003.
+   **Live check (test account):** the server accepts the desktop identity: `AUTH_REQUEST` START_AUTH sends the code (`requestMaxDuration` and `altActionDuration` are in ms). `AUTH` CHECK_CODE then answered `error.profile.active.session.no2fa` ("login restricted, set up 2FA"): an account with an active session elsewhere and no cloud password cannot log in a new device by code. The string is in `core.dll`, so the official client meets it too. By its name this is an account policy, not a refusal of desktops; QR login, or a 2FA password set on the phone, should get past it (not checked yet).
 
 ## Out of scope
 

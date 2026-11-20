@@ -1,13 +1,15 @@
 //! maxrs: a telemetry-free MAX desktop client (ADR-007: gpui + gpui-kit).
 //!
 //! `maxrs --demo` shows the screens on made-up data without any network access;
-//! `maxrs --demo-walk` steps through every screen on a timer (for screenshots).
+//! `maxrs --demo-walk` steps through every screen on a timer (for screenshots);
+//! `maxrs --trace` writes a local protocol trace without personal data (`trace.rs`).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_view;
 mod backend;
 mod qr;
+mod trace;
 
 use gpui_kit::assets::Assets;
 use gpui_kit::*;
@@ -18,6 +20,12 @@ use crate::backend::Backend;
 fn main() {
     let walk = std::env::args().any(|a| a == "--demo-walk");
     let demo = walk || std::env::args().any(|a| a == "--demo");
+    if !demo && std::env::args().any(|a| a == "--trace") {
+        match trace::enable() {
+            Ok(path) => eprintln!("protocol trace: {}", path.display()),
+            Err(e) => eprintln!("cannot start the protocol trace: {e}"),
+        }
+    }
     let backend = match Backend::start(demo, walk) {
         Ok(b) => b,
         Err(e) => {

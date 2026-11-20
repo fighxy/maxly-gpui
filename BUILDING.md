@@ -38,6 +38,7 @@ cargo test -p max-store --test os_secrets -- --ignored
 cargo run -p maxrs -- --demo        # made-up data, no network
 cargo run -p maxrs -- --demo-walk   # steps through every screen on a timer
 cargo run -p maxrs                  # connects to api2.oneme.ru
+cargo run -p maxrs -- --trace       # same, with a local protocol trace (rust/research/live-check.md)
 ```
 
 `tools/window-shot.ps1 -ProcessName maxrs -Out shot.png` captures only the client window.

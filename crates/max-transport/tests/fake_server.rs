@@ -342,3 +342,35 @@ async fn dropping_every_handle_stops_the_connection() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn trace_sees_both_directions_decompressed() {
+    use std::sync::{Arc, Mutex};
+    type Seen = Vec<(bool, u16, Vec<u8>)>;
+    let seen: Arc<Mutex<Seen>> = Arc::default();
+    let sink = seen.clone();
+    let cfg = TransportConfig {
+        trace: Some(max_transport::Trace::new(move |f| {
+            sink.lock()
+                .unwrap()
+                .push((f.sent, f.header.opcode, f.payload.to_vec()));
+        })),
+        ..no_ping()
+    };
+    let (t, _rx, mut srv) = start(cfg);
+    let server = tokio::spawn(async move {
+        let req = srv.next().await.unwrap();
+        srv.answer(&req, &"pong").await;
+    });
+    let ask = to_msgpack(&"ping").unwrap();
+    t.request(Opcode::ChatList.as_u16(), ask.clone())
+        .await
+        .unwrap();
+    server.await.unwrap();
+    let seen = seen.lock().unwrap();
+    let op = Opcode::ChatList.as_u16();
+    assert_eq!(
+        *seen,
+        [(true, op, ask), (false, op, to_msgpack(&"pong").unwrap())]
+    );
+}

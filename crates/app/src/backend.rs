@@ -573,7 +573,8 @@ async fn real_flow(
     let secrets: Arc<dyn SecretStore> = Arc::new(OsSecrets::new("maxrs"));
     let mut profile = Profile::open(&root, "default", secrets).map_err(|e| e.to_string())?;
     let env = Environment::detect();
-    let config = CoreConfig::default();
+    let mut config = CoreConfig::default();
+    config.transport.trace = crate::trace::transport_trace();
 
     if profile.auth_token().map_err(|e| e.to_string())?.is_none() {
         let _ = ui.send(UiEvent::Status("Подключение…".into()));
@@ -636,8 +637,14 @@ async fn real_flow(
                     UiCommand::FetchImage(url) => {
                         tokio::spawn(async move {
                             let _ = ui.send(match http.download(&url, media::MAX_DOWNLOAD).await {
-                                Ok(bytes) => UiEvent::Image { url, bytes },
-                                Err(_) => UiEvent::ImageFailed { url },
+                                Ok(bytes) => {
+                                    crate::trace::note(&format!("image {url} ok, {} bytes", bytes.len()));
+                                    UiEvent::Image { url, bytes }
+                                }
+                                Err(e) => {
+                                    crate::trace::note(&format!("image {url} failed: {e}"));
+                                    UiEvent::ImageFailed { url }
+                                }
                             });
                         });
                     }
@@ -654,7 +661,10 @@ async fn real_flow(
                                     Ok(path) => UiEvent::Notice(format!("Сохранено: {}", path.display())),
                                     Err(e) => UiEvent::Notice(format!("Не удалось сохранить {name}: {e}")),
                                 },
-                                Err(e) => UiEvent::Notice(format!("Не удалось скачать {name}: {}", message(&e))),
+                                Err(e) => {
+                                    crate::trace::note(&format!("file download failed: {e}"));
+                                    UiEvent::Notice(format!("Не удалось скачать {name}: {}", message(&e)))
+                                }
                             });
                         });
                     }
@@ -668,7 +678,10 @@ async fn real_flow(
                                     row.cid = Some(cid);
                                     UiEvent::MessageAdded { chat_id, message: row }
                                 }
-                                Err(e) => UiEvent::SendFailed { chat_id, cid, error: e },
+                                Err(e) => {
+                                    crate::trace::note(&format!("send file failed: {e}"));
+                                    UiEvent::SendFailed { chat_id, cid, error: e }
+                                }
                             });
                         });
                     }
@@ -708,7 +721,9 @@ async fn real_flow(
                         tokio::spawn(async move {
                             if let Ok(t) = handle.transport() {
                                 // A failed read mark is retried with the next one; nothing to show.
-                                let _ = messages::mark_read(&t, chat_id, message_id).await;
+                                if let Err(e) = messages::mark_read(&t, chat_id, message_id).await {
+                                    crate::trace::note(&format!("read mark failed: {e}"));
+                                }
                             }
                         });
                     }

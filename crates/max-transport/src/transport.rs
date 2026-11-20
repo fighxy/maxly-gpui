@@ -27,6 +27,45 @@ pub struct TransportConfig {
     pub interactive: bool,
     /// Largest decompressed payload accepted from the server.
     pub max_plain: usize,
+    /// Called for every frame sent and received; off by default (local protocol trace).
+    pub trace: Option<Trace>,
+}
+
+/// One frame as seen by a [`Trace`]: its header and its decompressed payload.
+#[derive(Debug)]
+pub struct TraceFrame<'a> {
+    /// `true` for frames this client sent.
+    pub sent: bool,
+    /// The frame header.
+    pub header: &'a Header,
+    /// Decompressed msgpack payload.
+    pub payload: &'a [u8],
+}
+
+/// Observer of the frames on a connection, for a local trace. It runs on the connection's
+/// tasks, so it should be quick.
+#[derive(Clone)]
+pub struct Trace(Arc<dyn Fn(&TraceFrame<'_>) + Send + Sync>);
+
+impl Trace {
+    /// Wrap an observer.
+    pub fn new(f: impl Fn(&TraceFrame<'_>) + Send + Sync + 'static) -> Trace {
+        Trace(Arc::new(f))
+    }
+
+    fn see(&self, sent: bool, header: &Header, payload: &[u8]) {
+        (self.0)(&TraceFrame {
+            sent,
+            header,
+            payload,
+        });
+    }
+}
+
+impl std::fmt::Debug for Trace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Trace")
+    }
 }
 
 impl Default for TransportConfig {
@@ -36,6 +75,7 @@ impl Default for TransportConfig {
             ping_interval: Some(Duration::from_secs(30)),
             interactive: true,
             max_plain: MAX_PLAIN_LEN,
+            trace: None,
         }
     }
 }
@@ -129,6 +169,7 @@ impl Transport {
             state.clone(),
             in_tx,
             config.max_plain,
+            config.trace.clone(),
             stop.clone(),
         ));
         let ping = config.ping_interval;
@@ -157,13 +198,18 @@ impl Transport {
             st.pending.insert(seq, (opcode, tx));
             seq
         };
-        let sent = match Frame::request(seq, opcode, payload) {
-            Ok(frame) => self
-                .inner
-                .out
-                .send(frame.encode())
-                .await
-                .map_err(|_| TransportError::Closed),
+        let payload: Bytes = payload.into();
+        let sent = match Frame::request(seq, opcode, payload.clone()) {
+            Ok(frame) => {
+                if let Some(trace) = &self.inner.config.trace {
+                    trace.see(true, &frame.header, &payload);
+                }
+                self.inner
+                    .out
+                    .send(frame.encode())
+                    .await
+                    .map_err(|_| TransportError::Closed)
+            }
             Err(e) => Err(e.into()),
         };
         if let Err(e) = sent {
@@ -248,6 +294,7 @@ async fn reader<R: AsyncRead>(
     state: Arc<Mutex<State>>,
     incoming: mpsc::UnboundedSender<Incoming>,
     max_plain: usize,
+    trace: Option<Trace>,
     stop: CancellationToken,
 ) {
     let mut rd = Box::pin(rd);
@@ -255,7 +302,7 @@ async fn reader<R: AsyncRead>(
     let mut decoder = FrameDecoder::new();
     let outcome: Option<TransportError> = loop {
         while let Some(frame) = decoder.decode(&mut buf) {
-            dispatch(frame, &state, &incoming, max_plain);
+            dispatch(frame, &state, &incoming, max_plain, trace.as_ref());
         }
         tokio::select! {
             () = stop.cancelled() => break None,
@@ -283,12 +330,16 @@ fn dispatch(
     state: &Mutex<State>,
     incoming: &mpsc::UnboundedSender<Incoming>,
     max_plain: usize,
+    trace: Option<&Trace>,
 ) {
     let header = frame.header;
     let cmd = header.cmd();
     let plain = frame
         .plain_payload(max_plain)
         .map(|p| Bytes::copy_from_slice(&p));
+    if let (Some(trace), Ok(payload)) = (trace, &plain) {
+        trace.see(false, &header, payload);
+    }
     let is_answer = matches!(cmd, Cmd::Response | Cmd::Error);
     let waiting = if is_answer {
         lock(state).pending.remove(&header.seq)

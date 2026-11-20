@@ -17,7 +17,7 @@ pub use tls::{
     Endpoint, ScopedVerifier, connect, http_tls_config, is_max_host, max_roots, tls_config,
     tls_config_for, tls_config_with_roots,
 };
-pub use transport::{Incoming, Response, Transport, TransportConfig};
+pub use transport::{Incoming, Response, Trace, TraceFrame, Transport, TransportConfig};
 
 /// Result type of this crate.
 pub type Result<T, E = TransportError> = std::result::Result<T, E>;

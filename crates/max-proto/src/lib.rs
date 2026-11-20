@@ -13,6 +13,7 @@ pub mod msgpack;
 mod opcode;
 pub mod packets;
 pub mod payload;
+pub mod redact;
 /// Every packet and type layout of the desktop client, generated from `core.dll`
 /// (`re/scripts/gen_schema_rs.mjs`; reference: `rust/research/packet-schemas.md`).
 pub mod schema;

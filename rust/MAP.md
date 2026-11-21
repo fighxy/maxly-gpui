@@ -107,7 +107,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | E3 | Video send and playback (embedded, speed) | O 82, 83; K `desktop-embed-video`, `video-speed`, `oneme-media-player` | v1 | preview in the history: `VIDEO` attach `thumbnail`, size, `duration` (ms, from PyMax) with ▶ and the length; playback (VIDEO_PLAY) open |
 | E4 | Voice messages play and record, waveform | O 301; K `audio-msg-send-enabled`; Q `AudioAttachmentDelegate`, `InputAudioRecorderPanel` | v1 (play), v2 (record) | open |
 | E5 | Video messages (circles) play and record | Q `VideoMessage*`, `InputVideoRecorderPanel`; K `ov-media-send-enabled` | v2 | open |
-| E6 | Fullscreen gallery | Q `FullscreenGalleryWindow`; S `fsg_gallery` | v1 | open |
+| E6 | Fullscreen gallery | Q `FullscreenGalleryWindow`; S `fsg_gallery` | v1 | photos: a click on a loaded photo opens a full-window viewer over the app with every loaded photo of the chat (arrows, ← →), zoom (buttons, wheel, + −, 0 to fit; 25%–1000% of the fitted size; drag when larger than the screen), quarter turns (button, R; pixels turned in memory, works for every format GPUI decodes), saving the loaded file to Downloads (button, Ctrl+S), closing (✕, Esc, a click on the backdrop); videos and saving the original size open |
 | E7 | Media editor (photo, video) | Q `FullscreenMediaEditorWindow`, `MeMediaEditor*`; K `edit-media-*` | v3 | open |
 | E8 | Stickers, sticker sets, favorites, suggest | O 26-29, 259, 261; Q `StickersView`, `EmojiStickerPicker` | v1 (view, send), v2 (manage) | stickers shown as images; sending and sets open |
 | E9 | Emoji, animoji (Lottie/thorvg) | Q `MeAnimojis*`, `EmojiView`; K `desktop-thorvg-enable`; S `lottie_player` | v1 (emoji), v2 (animoji) | open |

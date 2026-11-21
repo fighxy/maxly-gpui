@@ -7,6 +7,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, *};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -21,6 +22,7 @@ use crate::backend::{
 };
 use crate::qr;
 use crate::settings::{FONT_SIZES, ThemeChoice, UiSettings};
+use crate::viewer::{Viewer, ViewerPhoto, clamp_pan, fit_scale, rotate_pixels};
 use gpui_kit::assets::IconName as Lucide;
 
 enum Screen {
@@ -344,6 +346,12 @@ pub struct AppView {
     compose: Option<Compose>,
     /// The message row whose right-click menu is open (its element key), kept tinted.
     menu_row: Option<u64>,
+    /// The full-screen photo viewer, while open.
+    viewer: Option<Viewer>,
+    /// The viewer's photo, decoded and turned: (address, quarter turns, pixels).
+    viewer_image: Option<(String, u8, Arc<RenderImage>)>,
+    /// Keyboard focus of the viewer (Escape, arrows, zoom keys).
+    viewer_focus: FocusHandle,
     /// The section picked on the navigation rail.
     section: Section,
     /// The open settings page.
@@ -417,6 +425,9 @@ impl AppView {
             typing_sent: None,
             compose: None,
             menu_row: None,
+            viewer: None,
+            viewer_image: None,
+            viewer_focus: cx.focus_handle(),
             section: Section::Chats,
             settings_page: SettingsPage::Account,
             ui,
@@ -514,6 +525,7 @@ impl AppView {
                 }
             }
             UiEvent::LoggedOut => {
+                self.viewer = None;
                 self.account = None;
                 self.section = Section::Chats;
                 self.settings_page = SettingsPage::Account;
@@ -1587,9 +1599,408 @@ impl AppView {
         }
     }
 
+    /// Open the full-screen viewer on the photo at `url`, with every loaded photo of the chat to
+    /// page through.
+    fn open_viewer(
+        &mut self,
+        chat_id: i64,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let photos: Vec<ViewerPhoto> = self
+            .histories
+            .get(&chat_id)
+            .map(|h| h.messages.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|m| {
+                m.attachments.iter().filter_map(move |a| match a {
+                    Attachment::Photo { url, photo_id, .. } => Some(ViewerPhoto {
+                        url: url.clone(),
+                        photo_id: *photo_id,
+                        time: m.time,
+                        sender: if m.out {
+                            "Вы".to_string()
+                        } else {
+                            m.sender.clone()
+                        },
+                    }),
+                    _ => None,
+                })
+            })
+            .collect();
+        let index = photos.iter().position(|p| p.url == url).unwrap_or(0);
+        self.viewer = Some(Viewer::new(photos, index));
+        self.menu_row = None;
+        self.viewer_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn close_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.viewer = None;
+        if let Some((_, _, image)) = self.viewer_image.take() {
+            // Release the decoded pixels from the window's image atlas.
+            let _ = window.drop_image(image);
+        }
+        cx.notify();
+    }
+
+    /// The viewer's photo decoded and turned, decoded again only when the photo or the turn
+    /// changes.
+    fn viewer_frame(&mut self, window: &mut Window, cx: &App) -> Option<Arc<RenderImage>> {
+        let v = self.viewer.as_ref()?;
+        let photo = v.current()?;
+        if let Some((url, turns, image)) = &self.viewer_image
+            && *url == photo.url
+            && *turns == v.turns
+        {
+            return Some(image.clone());
+        }
+        let Some(ImageState::Ready(source)) = self.images.get(&photo.url) else {
+            return None;
+        };
+        let decoded = source.to_image_data(cx.svg_renderer()).ok()?;
+        let size = decoded.size(0);
+        let (w, h) = (
+            u32::try_from(size.width.0).ok()?,
+            u32::try_from(size.height.0).ok()?,
+        );
+        let (pixels, w, h) = rotate_pixels(decoded.as_bytes(0)?, w, h, v.turns);
+        let buffer = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(w, h, pixels)?;
+        let frame = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
+        let (url, turns) = (photo.url.clone(), v.turns);
+        if let Some((_, _, old)) = self.viewer_image.replace((url, turns, frame.clone())) {
+            let _ = window.drop_image(old);
+        }
+        Some(frame)
+    }
+
+    /// Save the shown photo, as loaded, into the Downloads folder.
+    fn save_viewed_photo(&mut self, cx: &mut Context<Self>) {
+        let Some(v) = &mut self.viewer else { return };
+        let Some(photo) = v.photos.get(v.index) else {
+            return;
+        };
+        let Some(ImageState::Ready(image)) = self.images.get(&photo.url) else {
+            return;
+        };
+        let ext = match image.format() {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpg",
+            ImageFormat::Webp => "webp",
+            ImageFormat::Gif => "gif",
+            ImageFormat::Svg => "svg",
+            ImageFormat::Bmp => "bmp",
+            _ => "img",
+        };
+        let name = match photo.photo_id {
+            Some(id) => format!("photo_{id}.{ext}"),
+            None => format!("photo_{}.{ext}", photo.time),
+        };
+        v.notice = Some(match crate::backend::save_download(&name, image.bytes()) {
+            Ok(path) => format!("Сохранено: {}", path.display()),
+            Err(e) => format!("Не удалось сохранить: {e}"),
+        });
+        cx.notify();
+    }
+
+    fn viewer_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = ev.keystroke.key.as_str();
+        if key == "escape" {
+            self.close_viewer(window, cx);
+            return;
+        }
+        let Some(v) = &mut self.viewer else { return };
+        match key {
+            "left" => v.step(-1),
+            "right" => v.step(1),
+            "=" | "+" => v.zoom_by(1),
+            "-" => v.zoom_by(-1),
+            "r" => v.rotate(),
+            "0" => {
+                v.zoom = 1.;
+                v.pan = (0., 0.);
+            }
+            "s" if ev.keystroke.modifiers.control => {
+                self.save_viewed_photo(cx);
+                return;
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// A round dark button of the viewer with a white icon.
+    fn viewer_button(
+        id: &'static str,
+        icon: impl Into<Icon>,
+        hint: &'static str,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .p_2()
+            .rounded_full()
+            .cursor_pointer()
+            .hover(|this| this.bg(gpui_kit::white().opacity(0.14)))
+            .tooltip(move |window, cx| Tooltip::new(hint).build(window, cx))
+            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+            .child(icon.into().size_5().text_color(gpui_kit::white()))
+    }
+
+    /// The full-screen viewer over the whole window: the photo, a toolbar with zoom, turning
+    /// and saving, and arrows to page through the chat's photos.
+    fn render_viewer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        let frame = self.viewer_frame(window, cx);
+        let viewport = window.viewport_size();
+        let (vw, vh) = (f32::from(viewport.width), f32::from(viewport.height));
+        const BAR: f32 = 56.;
+        const SIDE: f32 = 72.;
+        let area = ((vw - 2. * SIDE).max(100.), (vh - BAR - 24.).max(100.));
+        let v = self.viewer.as_mut()?;
+        let image_size = frame.as_ref().map_or((0., 0.), |f| {
+            let s = f.size(0);
+            (s.width.0 as f32, s.height.0 as f32)
+        });
+        let fit = fit_scale(image_size, area);
+        let shown = (image_size.0 * fit * v.zoom, image_size.1 * fit * v.zoom);
+        v.pan = clamp_pan(v.pan, shown, area);
+        let left = SIDE + (area.0 - shown.0) / 2. + v.pan.0;
+        let top = BAR + (area.1 - shown.1) / 2. + v.pan.1;
+        let rect = (left, top, shown.0, shown.1);
+        let draggable = shown.0 > area.0 + 0.5 || shown.1 > area.1 + 0.5;
+        let percent = (fit * v.zoom * 100.).round();
+        let count = v.photos.len();
+        let (index, notice) = (v.index, v.notice.clone());
+        let title = v.current().map_or_else(String::new, |p| {
+            let when = zoned(p.time, &jiff::tz::TimeZone::system())
+                .map(|z| z.strftime("%d.%m.%Y, %H:%M").to_string())
+                .unwrap_or_default();
+            [p.sender.as_str(), when.as_str()]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ")
+        });
+        let light = gpui_kit::white();
+        let dim = light.opacity(0.65);
+        let inside = move |x: f32, y: f32| {
+            x >= rect.0 && x <= rect.0 + rect.2 && y >= rect.1 && y <= rect.1 + rect.3
+        };
+        let photo = match frame {
+            Some(frame) => img(frame)
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(shown.0))
+                .h(px(shown.1))
+                .into_any_element(),
+            None => div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(dim)
+                .child("Фото не загрузилось")
+                .into_any_element(),
+        };
+        let arrow = |id: &'static str, icon: Lucide, by: isize, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .absolute()
+                .top(px(BAR))
+                .bottom_0()
+                .w(px(SIDE))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|this| this.bg(light.opacity(0.06)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(v) = &mut this.viewer {
+                        v.step(by);
+                    }
+                    cx.notify();
+                }))
+                .child(Icon::new(icon).size_8().text_color(light))
+        };
+        let toolbar = h_flex()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(BAR))
+            .px_4()
+            .gap_4()
+            .items_center()
+            .justify_between()
+            .bg(gpui_kit::black().opacity(0.35))
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .child(div().text_sm().text_color(light).truncate().child(title))
+                    .child(div().text_xs().text_color(dim).truncate().child(
+                        notice.unwrap_or_else(|| {
+                            if count > 1 {
+                                format!("{} из {count}", index + 1)
+                            } else {
+                                String::new()
+                            }
+                        }),
+                    )),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .items_center()
+                    .child(Self::viewer_button(
+                        "viewer-zoom-out",
+                        Lucide::ZoomOut,
+                        "Уменьшить (−)",
+                        |this, _, _| {
+                            if let Some(v) = &mut this.viewer {
+                                v.zoom_by(-1);
+                            }
+                        },
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .id("viewer-percent")
+                            .w(px(56.))
+                            .text_center()
+                            .text_sm()
+                            .text_color(light)
+                            .cursor_pointer()
+                            .tooltip(|window, cx| Tooltip::new("Вписать (0)").build(window, cx))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(v) = &mut this.viewer {
+                                    v.zoom = 1.;
+                                    v.pan = (0., 0.);
+                                }
+                                cx.notify();
+                            }))
+                            .child(format!("{percent}%")),
+                    )
+                    .child(Self::viewer_button(
+                        "viewer-zoom-in",
+                        Lucide::ZoomIn,
+                        "Увеличить (+)",
+                        |this, _, _| {
+                            if let Some(v) = &mut this.viewer {
+                                v.zoom_by(1);
+                            }
+                        },
+                        cx,
+                    ))
+                    .child(Self::viewer_button(
+                        "viewer-rotate",
+                        Lucide::RotateCw,
+                        "Повернуть (R)",
+                        |this, _, _| {
+                            if let Some(v) = &mut this.viewer {
+                                v.rotate();
+                            }
+                        },
+                        cx,
+                    ))
+                    .child(Self::viewer_button(
+                        "viewer-save",
+                        Lucide::Download,
+                        "Скачать (Ctrl+S)",
+                        |this, _, cx| this.save_viewed_photo(cx),
+                        cx,
+                    ))
+                    .child(Self::viewer_button(
+                        "viewer-close",
+                        Lucide::X,
+                        "Закрыть (Esc)",
+                        |this, window, cx| this.close_viewer(window, cx),
+                        cx,
+                    )),
+            );
+        Some(
+            div()
+                .id("viewer")
+                .absolute()
+                .inset_0()
+                .bg(gpui_kit::black().opacity(0.96))
+                .track_focus(&self.viewer_focus)
+                .on_key_down(cx.listener(Self::viewer_key))
+                .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
+                    let dy = f32::from(ev.delta.pixel_delta(px(20.)).y);
+                    if let Some(v) = &mut this.viewer
+                        && dy.abs() > 0.5
+                    {
+                        v.zoom_by(if dy > 0. { 1 } else { -1 });
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        let in_area = y > BAR && x > SIDE && x < vw - SIDE;
+                        if inside(x, y) {
+                            if draggable && let Some(v) = &mut this.viewer {
+                                v.drag = Some((x, y));
+                            }
+                        } else if in_area {
+                            // A click on the dark backdrop closes the viewer.
+                            this.close_viewer(window, cx);
+                        }
+                    }),
+                )
+                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                    let Some(v) = &mut this.viewer else { return };
+                    let Some((lx, ly)) = v.drag else { return };
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        v.drag = None;
+                        return;
+                    }
+                    let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                    v.pan = (v.pan.0 + x - lx, v.pan.1 + y - ly);
+                    v.drag = Some((x, y));
+                    cx.notify();
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, _| {
+                        if let Some(v) = &mut this.viewer {
+                            v.drag = None;
+                        }
+                    }),
+                )
+                .child(photo)
+                .when(index > 0, |this| {
+                    this.child(arrow("viewer-prev", Lucide::ChevronLeft, -1, cx).left_0())
+                })
+                .when(index + 1 < count, |this| {
+                    this.child(arrow("viewer-next", Lucide::ChevronRight, 1, cx).right_0())
+                })
+                .child(toolbar)
+                .when(draggable, |this| this.cursor_grab()),
+        )
+    }
+
     /// Photos and videos of one message laid out as a grid ([`album::layout`]); returns its
     /// width with the element.
-    fn album_view(&self, items: &[&Attachment], cx: &mut Context<Self>) -> (f32, AnyElement) {
+    fn album_view(
+        &self,
+        chat_id: i64,
+        message_key: u64,
+        items: &[&Attachment],
+        cx: &mut Context<Self>,
+    ) -> (f32, AnyElement) {
         let sizes: Vec<(f32, f32)> = items
             .iter()
             .map(|a| match a {
@@ -1604,7 +2015,17 @@ impl AppView {
         let cells: Vec<AnyElement> = items
             .iter()
             .zip(&layout.cells)
-            .map(|(a, c)| {
+            .enumerate()
+            .map(|(i, (a, c))| {
+                // A loaded photo opens the full-screen viewer.
+                let photo_url = match a {
+                    Attachment::Photo { url, .. }
+                        if matches!(self.images.get(url), Some(ImageState::Ready(_))) =>
+                    {
+                        Some(url.clone())
+                    }
+                    _ => None,
+                };
                 let (url, duration) = match a {
                     Attachment::Photo { url, .. } => (Some(url), None),
                     Attachment::Video {
@@ -1634,6 +2055,7 @@ impl AppView {
                         .into_any_element(),
                 };
                 div()
+                    .id(("cell", message_key.wrapping_mul(31).wrapping_add(i as u64)))
                     .absolute()
                     .left(px(c.x))
                     .top(px(c.y))
@@ -1642,6 +2064,12 @@ impl AppView {
                     .rounded(px(6.))
                     .overflow_hidden()
                     .bg(muted_bg)
+                    .when_some(photo_url, |this, url| {
+                        this.cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_viewer(chat_id, &url, window, cx)
+                            }))
+                    })
                     .child(content)
                     .when_some(duration, |this, ms| {
                         this.child(
@@ -1706,7 +2134,9 @@ impl AppView {
             .iter()
             .filter(|a| matches!(a, Attachment::Photo { .. } | Attachment::Video { .. }))
             .collect();
-        let album = (!media.is_empty()).then(|| self.album_view(&media, cx));
+        let message_key =
+            u64::from_ne_bytes(if m.id != 0 { m.id } else { m.cid.unwrap_or(0) }.to_ne_bytes());
+        let album = (!media.is_empty()).then(|| self.album_view(chat_id, message_key, &media, cx));
         let album_width = album.as_ref().map(|(w, _)| *w);
         let mut attachments: Vec<AnyElement> = album.map(|(_, e)| e).into_iter().collect();
         attachments.extend(
@@ -2978,7 +3408,7 @@ fn day_label_in(ms: i64, now: jiff::Timestamp, tz: &jiff::tz::TimeZone) -> Strin
 }
 
 impl Render for AppView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match &self.screen {
             Screen::Status(s) => Self::centered(
                 v_flex()
@@ -3023,7 +3453,12 @@ impl Render for AppView {
             } => {
                 let (me, chats, selected, status) =
                     (me.clone(), chats.clone(), *selected, status.clone());
-                self.render_main(&me, &chats, selected, &status, cx)
+                let viewer = self.render_viewer(window, cx);
+                div()
+                    .size_full()
+                    .relative()
+                    .child(self.render_main(&me, &chats, selected, &status, cx))
+                    .children(viewer)
             }
             Screen::Error(e) => Self::centered(
                 v_flex()

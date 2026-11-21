@@ -12,6 +12,7 @@ mod backend;
 mod qr;
 mod settings;
 mod trace;
+mod viewer;
 
 use std::borrow::Cow;
 
@@ -70,11 +71,23 @@ fn main() {
     drop(runtime);
 }
 
-// Lucide icons beyond the component set: the navigation rail, the settings pages and the
-// message menu.
+// Lucide icons beyond the component set: the navigation rail, the settings pages, the message
+// menu and the photo viewer.
 icon_assets!(
     ExtraIcons,
-    [MessageCircle, Phone, Contact, Laptop, Reply, Pencil, Trash]
+    [
+        MessageCircle,
+        Phone,
+        Contact,
+        Laptop,
+        Reply,
+        Pencil,
+        Trash,
+        ZoomIn,
+        ZoomOut,
+        Download,
+        X
+    ]
 );
 
 /// The component icons plus [`ExtraIcons`].

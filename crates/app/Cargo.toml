@@ -17,6 +17,8 @@ path = "src/main.rs"
 bytes = "1.12.2"
 dirs = "7.0.0"
 gpui-kit = "=0.10.0"
+# Same version GPUI decodes with; used to rebuild a rotated frame for the photo viewer.
+image = { version = "0.25.9", default-features = false }
 jiff = "1.0.1"
 max-core = { path = "../max-core" }
 max-identity = { path = "../max-identity" }

@@ -3905,6 +3905,7 @@ dependencies = [
  "bytes",
  "dirs 7.0.0",
  "gpui-kit",
+ "image",
  "jiff",
  "max-core",
  "max-identity",

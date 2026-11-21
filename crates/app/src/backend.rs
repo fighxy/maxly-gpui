@@ -1356,7 +1356,7 @@ async fn send_file(
 }
 
 /// Save bytes into the Downloads folder under a name that does not overwrite anything.
-fn save_download(name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+pub fn save_download(name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
     let dir = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
     let clean: String = name
         .chars()

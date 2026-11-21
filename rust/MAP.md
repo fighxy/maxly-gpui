@@ -152,7 +152,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | H1 | Own profile edit, avatar | O 16; Q `SettingsUserProfile*`, `SettingsNewAvatar` | v1 | open |
 | H2 | Avatar creator | Q `AvatarCreatorComponent_*` | v3 | open |
 | H3 | Privacy settings | Q `SettingsPrivacy*`, `PrivacySettingsPage` | v1 | open |
-| H4 | Notification settings | K `notification-settings`, `notification-in-call-setting` | v1 | open |
+| H4 | Notification settings | K `notification-settings`, `notification-in-call-setting` | v1 | Settings → «Уведомления»: notifications on/off, message text in them on/off, close to tray on/off (local, `ui.txt`); per-chat and server-side settings open |
 | H5 | Appearance: theme, fonts, font size | K `font-size-slider`, `glass-enabled`; Q `SettingsAppearance`, `SettingsFonts` | v1 | theme (system, light, dark; system follows Windows) and font size (14–18) in Settings → "Оформление", kept locally in `ui.txt`; fonts open |
 | H6 | Data and memory (cache, download path) | Q `DataAndMemorySettings`, `SettingsDownloadPathButton` | v1 | Settings → "Данные и память" shows the download folder (open button), the profile folder and the settings file; choosing the download path and cache management open |
 | H7 | Keyboard shortcuts | Q `SettingsShortcuts`; S `shortcuts` | v2 | open |
@@ -195,9 +195,9 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
-| M1 | System notifications, unread badge | S `notifications`; Q `NotificationsModule_*` | v1 | open |
-| M2 | Tray icon | Q `TrayIcon` | v1 | open |
-| M3 | Single instance, `max://` deep links, local pipe | config `single_instance_id`, `internal_url_scheme`, `local_server_pipe_name` | v1 | open |
+| M1 | System notifications, unread badge | S `notifications`; Q `NotificationsModule_*` | v1 | Windows toasts through GPUI (`set_app_identity` "maxrs.desktop", which registers the AUMID under HKCU on the first toast) for incoming messages unless that chat is open in the focused, visible window; one toast per chat (tag `chat:<id>`), a click shows the window and opens the chat; silent (GPUI sets `audio silent`). Unread total in the window title "(N) maxrs", the tray tooltip and a red dot on the tray icon; taskbar overlay badge and muted chats open |
+| M2 | Tray icon | Q `TrayIcon` | v1 | done: `tray-icon` icon drawn in code (blue disc, white bubble, red dot when unread), left click shows the window, menu «Открыть maxrs» / «Выйти»; closing the window hides it to the tray (setting, on by default) through `winsafe` (GPUI cannot hide a window on Windows), no unsafe code of ours |
+| M3 | Single instance, `max://` deep links, local pipe | config `single_instance_id`, `internal_url_scheme`, `local_server_pipe_name` | v1 | single instance done: named pipe `\\.\pipe\maxrs-<user>-<fnv hash>` (first instance only; tokio refuses remote clients); a second start, before it connects to the server, asks the first to show its window and exits; the demo skips it; `max://` links open |
 | M4 | Drag and drop, paste files | Q `HistoryDropArea` | v1 | open |
 | M5 | Window state, title bar | S `window_state` | v1 | open |
 

@@ -9,6 +9,8 @@
 mod album;
 mod app_view;
 mod backend;
+mod desktop;
+mod instance;
 mod qr;
 mod settings;
 mod trace;
@@ -31,6 +33,18 @@ fn main() {
             Err(e) => eprintln!("cannot start the protocol trace: {e}"),
         }
     }
+    // One client per user: a second start raises the running one and leaves before it connects.
+    // The demo skips the check, so it can run next to a real client.
+    let instance = if demo {
+        instance::Claim::Alone
+    } else {
+        instance::claim()
+    };
+    let instance = match instance {
+        instance::Claim::Running => return,
+        instance::Claim::First(i) => Some(i),
+        instance::Claim::Alone => None,
+    };
     let backend = match Backend::start(demo, walk) {
         Ok(b) => b,
         Err(e) => {
@@ -48,20 +62,20 @@ fn main() {
         .with_assets(AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            // The AppUserModelID Windows shows notifications under (registered for this user on
+            // the first notification, as GPUI does for unpackaged apps).
+            cx.set_app_identity("maxrs.desktop", "maxrs");
+            let title: SharedString = if demo { "maxrs — демо" } else { "maxrs" }.into();
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1100.), px(720.)), cx)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some(if demo {
-                        "maxrs — демо".into()
-                    } else {
-                        "maxrs".into()
-                    }),
+                    title: Some(title.clone()),
                     ..Default::default()
                 }),
                 ..Default::default()
             };
             let opened = gpui_kit::open_window(options, cx, move |window, cx| {
-                cx.new(|cx| AppView::new(events, commands, window, cx))
+                cx.new(|cx| AppView::new(events, commands, instance, title, window, cx))
             });
             if let Err(e) = opened {
                 eprintln!("cannot open the main window: {e}");

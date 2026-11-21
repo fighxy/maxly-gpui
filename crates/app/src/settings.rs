@@ -44,6 +44,12 @@ pub struct UiSettings {
     pub theme: ThemeChoice,
     /// Base font size in px, one of [`FONT_SIZES`].
     pub font_size: u8,
+    /// Windows notifications for new messages.
+    pub notifications: bool,
+    /// Show the message text in notifications (off: only who wrote).
+    pub preview: bool,
+    /// Closing the window hides it to the tray instead of quitting.
+    pub close_to_tray: bool,
 }
 
 impl Default for UiSettings {
@@ -51,8 +57,16 @@ impl Default for UiSettings {
         UiSettings {
             theme: ThemeChoice::System,
             font_size: 16,
+            notifications: true,
+            preview: true,
+            close_to_tray: true,
         }
     }
+}
+
+/// `on` / `off` for the file.
+fn flag(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
 }
 
 impl UiSettings {
@@ -76,6 +90,18 @@ impl UiSettings {
                         s.font_size = n;
                     }
                 }
+                key @ ("notifications" | "preview" | "close_to_tray") => {
+                    let on = match value.trim() {
+                        "on" => true,
+                        "off" => false,
+                        _ => continue,
+                    };
+                    match key {
+                        "notifications" => s.notifications = on,
+                        "preview" => s.preview = on,
+                        _ => s.close_to_tray = on,
+                    }
+                }
                 _ => {}
             }
         }
@@ -84,7 +110,14 @@ impl UiSettings {
 
     /// The file text.
     pub fn render(&self) -> String {
-        format!("theme={}\nfont_size={}\n", self.theme.key(), self.font_size)
+        format!(
+            "theme={}\nfont_size={}\nnotifications={}\npreview={}\nclose_to_tray={}\n",
+            self.theme.key(),
+            self.font_size,
+            flag(self.notifications),
+            flag(self.preview),
+            flag(self.close_to_tray),
+        )
     }
 
     /// The settings file, next to the profiles folder.
@@ -119,8 +152,18 @@ mod tests {
         let s = UiSettings {
             theme: ThemeChoice::Dark,
             font_size: 18,
+            notifications: false,
+            preview: false,
+            close_to_tray: false,
         };
         assert_eq!(UiSettings::parse(&s.render()), s);
+        // Files from before the notification keys keep notifications on.
+        let old = UiSettings::parse("theme=dark\nfont_size=14\n");
+        assert!(old.notifications && old.preview && old.close_to_tray);
+        assert!(
+            UiSettings::parse("preview=maybe").preview,
+            "bad values keep the default"
+        );
         let bad = UiSettings::parse("theme=purple\nfont_size=99\nother=1\nnoise");
         assert_eq!(bad, UiSettings::default());
         assert_eq!(UiSettings::parse("").theme, ThemeChoice::System);

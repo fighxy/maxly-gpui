@@ -7,6 +7,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, *};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -20,6 +21,8 @@ use crate::backend::{
     ChatKind, ChatRow, ContactRow, Delivery, MessageRow, Quote, SessionRow, UiCommand, UiEvent,
     one_line,
 };
+use crate::desktop::{self, DesktopEvent};
+use crate::instance::Instance;
 use crate::qr;
 use crate::settings::{FONT_SIZES, ThemeChoice, UiSettings};
 use crate::viewer::{Viewer, ViewerPhoto, clamp_pan, fit_scale, rotate_pixels};
@@ -90,6 +93,8 @@ enum Section {
 enum SettingsPage {
     /// Who we are, sessions, logout.
     Account,
+    /// Windows notifications and the tray.
+    Notifications,
     /// Theme and font size.
     Appearance,
     /// Where files and the profile are kept.
@@ -99,8 +104,9 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 4] = [
+    const ALL: [SettingsPage; 5] = [
         SettingsPage::Account,
+        SettingsPage::Notifications,
         SettingsPage::Appearance,
         SettingsPage::Data,
         SettingsPage::About,
@@ -109,6 +115,7 @@ impl SettingsPage {
     fn title(self) -> &'static str {
         match self {
             SettingsPage::Account => "Аккаунт и устройства",
+            SettingsPage::Notifications => "Уведомления",
             SettingsPage::Appearance => "Оформление",
             SettingsPage::Data => "Данные и память",
             SettingsPage::About => "О программе",
@@ -118,11 +125,41 @@ impl SettingsPage {
     fn icon(self) -> Icon {
         match self {
             SettingsPage::Account => Icon::new(Lucide::Laptop),
+            SettingsPage::Notifications => Icon::new(IconName::Bell),
             SettingsPage::Appearance => Icon::new(IconName::Palette),
             SettingsPage::Data => Icon::new(IconName::HardDrive),
             SettingsPage::About => Icon::new(IconName::Info),
         }
     }
+}
+
+/// Prefix of a notification's tag; the chat id follows, so a click opens that chat.
+const NOTIFY_TAG: &str = "chat:";
+
+/// Title and text of a new-message notification: the chat, then the message (with its sender
+/// in groups). Without `preview` it says only that a message came.
+fn notification_text(chat: &ChatRow, m: &MessageRow, preview: bool) -> (String, String) {
+    let title = chat.title.clone();
+    if !preview {
+        return (title, "Новое сообщение".to_string());
+    }
+    let text = match m.preview() {
+        t if t.is_empty() => "Сообщение".to_string(),
+        t => t,
+    };
+    let body = match chat.kind {
+        ChatKind::Group if !m.sender.is_empty() && m.sender != chat.title => {
+            format!("{}: {text}", m.sender)
+        }
+        _ => text,
+    };
+    // Windows cuts long toasts anyway; keep them short and on whole characters.
+    let body = if body.chars().count() > 200 {
+        format!("{}…", body.chars().take(199).collect::<String>())
+    } else {
+        body
+    };
+    (title, body)
 }
 
 /// Apply the theme and font size to the app.
@@ -352,6 +389,16 @@ pub struct AppView {
     viewer_image: Option<(String, u8, Arc<RenderImage>)>,
     /// Keyboard focus of the viewer (Escape, arrows, zoom keys).
     viewer_focus: FocusHandle,
+    /// The tray icon and window hiding.
+    desktop: desktop::Desktop,
+    /// The single-instance pipe; later starts of the client show this window.
+    instance: Option<Instance>,
+    /// The window title without the unread count.
+    title: SharedString,
+    /// The window has the focus.
+    window_active: bool,
+    /// The unread count the title and tray show now.
+    shown_unread: Option<i32>,
     /// The section picked on the navigation rail.
     section: Section,
     /// The open settings page.
@@ -372,6 +419,8 @@ impl AppView {
     pub fn new(
         mut events: UnboundedReceiver<UiEvent>,
         commands: UnboundedSender<UiCommand>,
+        instance: Option<Instance>,
+        title: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AppView {
@@ -399,6 +448,10 @@ impl AppView {
                     apply_ui(&this.ui, window, cx);
                 }
             }),
+            // Notifications are for messages the user is not looking at.
+            cx.observe_window_activation(window, |this, window, _| {
+                this.window_active = window.is_window_active();
+            }),
         ];
         let ui = UiSettings::load();
         apply_ui(&ui, window, cx);
@@ -410,7 +463,56 @@ impl AppView {
             }
         })
         .detach();
+        // The tray and a second start of the client report through channels; look at them a few
+        // times a second.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+                if this.update(cx, |view, cx| view.poll_desktop(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        // Closing the window hides it to the tray while the tray is there and the user wants it.
+        let view = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            let to_tray = view
+                .update(cx, |this, _| {
+                    this.ui.close_to_tray && this.desktop.has_tray()
+                })
+                .unwrap_or(false);
+            if to_tray {
+                desktop::hide_window();
+                return false;
+            }
+            cx.quit();
+            true
+        });
+        // A click on a notification shows the window and opens its chat.
+        let view = cx.entity().downgrade();
+        cx.on_system_notification_response(move |response, cx| {
+            desktop::show_window();
+            let chat_id = response
+                .tag
+                .strip_prefix(NOTIFY_TAG)
+                .and_then(|id| id.parse::<i64>().ok());
+            let _ = view.update(cx, |this, cx| {
+                this.section = Section::Chats;
+                if let Some(chat_id) = chat_id {
+                    this.open_chat(chat_id, cx);
+                }
+                cx.notify();
+            });
+        });
         AppView {
+            desktop: desktop::Desktop::new(),
+            instance,
+            title,
+            window_active: true,
+            shown_unread: None,
             screen: Screen::Status("Запуск…".into()),
             histories: HashMap::new(),
             phone,
@@ -496,6 +598,7 @@ impl AppView {
                     self.typing.remove(&chat_id);
                 }
                 self.request_images(image_urls(&message));
+                self.notify_message(chat_id, &message, cx);
                 self.message_added(chat_id, message);
                 self.mark_read(chat_id);
             }
@@ -1597,6 +1700,72 @@ impl AppView {
             }
             _ => div().into_any_element(),
         }
+    }
+
+    /// Put the unread count into the window title and the tray when it changes.
+    fn sync_unread(&mut self, window: &mut Window) {
+        let total: i32 = match &self.screen {
+            Screen::Main { chats, .. } => chats.iter().map(|c| c.unread.max(0)).sum(),
+            _ => 0,
+        };
+        if self.shown_unread == Some(total) {
+            return;
+        }
+        self.shown_unread = Some(total);
+        let title = if total > 0 {
+            format!("({total}) {}", self.title)
+        } else {
+            self.title.to_string()
+        };
+        window.set_window_title(&title);
+        self.desktop.set_unread(total);
+    }
+
+    /// Act on tray clicks and on later starts of the client.
+    fn poll_desktop(&mut self, cx: &mut Context<Self>) {
+        let mut events = self.desktop.poll();
+        if let Some(instance) = &self.instance {
+            while instance.wakeups.try_recv().is_ok() {
+                events.push(DesktopEvent::Show);
+            }
+        }
+        for event in events {
+            match event {
+                DesktopEvent::Show => desktop::show_window(),
+                DesktopEvent::Quit => cx.quit(),
+            }
+        }
+    }
+
+    /// A Windows notification for a new incoming message, unless the user is looking at that
+    /// chat or turned notifications off. One notification per chat: a newer one replaces it.
+    fn notify_message(&self, chat_id: i64, message: &MessageRow, cx: &mut Context<Self>) {
+        if !self.ui.notifications || message.out || message.delivery != Delivery::Sent {
+            return;
+        }
+        let Screen::Main {
+            chats, selected, ..
+        } = &self.screen
+        else {
+            return;
+        };
+        let looking = self.window_active
+            && self.section == Section::Chats
+            && *selected == Some(chat_id)
+            && desktop::window_visible();
+        if looking {
+            return;
+        }
+        let Some(chat) = chats.iter().find(|c| c.id == chat_id) else {
+            return;
+        };
+        let (title, body) = notification_text(chat, message, self.ui.preview);
+        cx.show_system_notification(SystemNotification {
+            tag: format!("{NOTIFY_TAG}{chat_id}").into(),
+            title: title.into(),
+            body: body.into(),
+            actions: Vec::new(),
+        });
     }
 
     /// Open the full-screen viewer on the photo at `url`, with every loaded photo of the chat to
@@ -2813,6 +2982,7 @@ impl AppView {
                     Some(panel) => self.render_account(me, panel, cx),
                     None => Self::placeholder("Загрузка…", None, cx),
                 },
+                SettingsPage::Notifications => self.render_notifications(cx),
                 SettingsPage::Appearance => self.render_appearance(cx),
                 SettingsPage::Data => self.render_data(cx),
                 SettingsPage::About => self.render_about(cx),
@@ -3154,6 +3324,89 @@ impl AppView {
             })
     }
 
+    fn render_notifications(&self, cx: &mut Context<Self>) -> Div {
+        let ui = self.ui;
+        let muted = cx.theme().muted_foreground;
+        let toggle = |id: &'static str,
+                      label: &'static str,
+                      hint: &'static str,
+                      on: bool,
+                      enabled: bool,
+                      set: fn(&mut UiSettings, bool),
+                      cx: &mut Context<Self>| {
+            h_flex()
+                .gap_4()
+                .justify_between()
+                .items_center()
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .child(div().child(label))
+                        .child(div().text_sm().text_color(muted).child(hint)),
+                )
+                .child(
+                    Switch::new(id)
+                        .checked(on)
+                        .disabled(!enabled)
+                        .on_click(cx.listener(move |this, checked: &bool, window, cx| {
+                            let mut ui = this.ui;
+                            set(&mut ui, *checked);
+                            this.set_ui(ui, window, cx);
+                        })),
+                )
+                .into_any_element()
+        };
+        let tray = self.desktop.has_tray();
+        Self::page(
+            "notifications",
+            SettingsPage::Notifications.title(),
+            vec![
+                Self::group(
+                    "Новые сообщения",
+                    vec![
+                        toggle(
+                            "notify-on",
+                            "Уведомления Windows",
+                            "О сообщениях в чатах, которые сейчас не открыты перед вами",
+                            ui.notifications,
+                            true,
+                            |ui, on| ui.notifications = on,
+                            cx,
+                        ),
+                        toggle(
+                            "notify-preview",
+                            "Показывать текст",
+                            "Выключите, чтобы в уведомлении было только название чата",
+                            ui.preview,
+                            ui.notifications,
+                            |ui, on| ui.preview = on,
+                            cx,
+                        ),
+                    ],
+                    cx,
+                ),
+                Self::group(
+                    "Окно",
+                    vec![toggle(
+                        "close-to-tray",
+                        "Закрывать в трей",
+                        if tray {
+                            "Крестик прячет окно в трей, клиент продолжает получать сообщения"
+                        } else {
+                            "Значок в трее не создался, поэтому крестик закрывает клиент"
+                        },
+                        ui.close_to_tray,
+                        tray,
+                        |ui, on| ui.close_to_tray = on,
+                        cx,
+                    )],
+                    cx,
+                ),
+            ],
+            cx,
+        )
+    }
+
     fn render_appearance(&self, cx: &mut Context<Self>) -> Div {
         let ui = self.ui;
         let themes = [
@@ -3409,6 +3662,7 @@ fn day_label_in(ms: i64, now: jiff::Timestamp, tz: &jiff::tz::TimeZone) -> Strin
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_unread(window);
         match &self.screen {
             Screen::Status(s) => Self::centered(
                 v_flex()
@@ -3791,5 +4045,49 @@ mod duration_tests {
         assert_eq!(media_duration(42_000), "0:42");
         assert_eq!(media_duration(725_400), "12:05");
         assert_eq!(media_duration(3_723_000), "1:02:03");
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::{ChatKind, ChatRow, MessageRow, notification_text};
+
+    fn chat(kind: ChatKind) -> ChatRow {
+        ChatRow {
+            id: 1,
+            title: "Семья".into(),
+            kind,
+            ..ChatRow::default()
+        }
+    }
+
+    fn msg(sender: &str, text: &str) -> MessageRow {
+        MessageRow {
+            id: 5,
+            sender: sender.into(),
+            text: text.into(),
+            ..MessageRow::default()
+        }
+    }
+
+    #[test]
+    fn titles_senders_and_hidden_text() {
+        let group = chat(ChatKind::Group);
+        assert_eq!(
+            notification_text(&group, &msg("Мама", "Купи\nхлеба"), true),
+            ("Семья".to_string(), "Мама: Купи хлеба".to_string())
+        );
+        let dialog = chat(ChatKind::Dialog);
+        assert_eq!(
+            notification_text(&dialog, &msg("Семья", "Привет"), true).1,
+            "Привет"
+        );
+        assert_eq!(
+            notification_text(&group, &msg("Мама", "секрет"), false).1,
+            "Новое сообщение"
+        );
+        let long = notification_text(&dialog, &msg("", &"я".repeat(500)), true).1;
+        assert_eq!(long.chars().count(), 200);
+        assert!(long.ends_with('…'));
     }
 }

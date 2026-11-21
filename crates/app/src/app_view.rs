@@ -2941,17 +2941,18 @@ impl AppView {
         if marks.is_empty() {
             return div().child(text.to_string()).into_any_element();
         }
-        // On our own (accent-coloured) bubbles links keep the text colour and are underlined.
+        // On our own bubbles links keep the text colour and are underlined.
         // The neutral themes draw links in the text colour; messengers use blue.
+        let (_, fg, _) = Self::bubble_colors(out, cx);
         let link_color = if out {
-            cx.theme().primary_foreground
+            fg
         } else if cx.theme().is_dark() {
             rgb(0x6c_b4_ff).into()
         } else {
             rgb(0x1a_6f_d6).into()
         };
         let mono_bg = if out {
-            cx.theme().primary_foreground.opacity(0.15)
+            fg.opacity(0.15)
         } else {
             cx.theme().foreground.opacity(0.08)
         };
@@ -3677,6 +3678,23 @@ impl AppView {
         )
     }
 
+    /// Fill, text and the dimmer time colour of a message bubble.
+    ///
+    /// Own messages are blue in both themes. The theme primary is a button:
+    /// near-black on a light window and white on a dark one.
+    fn bubble_colors(out: bool, cx: &App) -> (Hsla, Hsla, Hsla) {
+        if out {
+            let fg: Hsla = rgb(0xffffff).into();
+            (rgb(0x2563eb).into(), fg, fg.opacity(0.72))
+        } else {
+            (
+                cx.theme().secondary,
+                cx.theme().secondary_foreground,
+                cx.theme().muted_foreground,
+            )
+        }
+    }
+
     fn bubble(
         &self,
         chat_id: i64,
@@ -3719,19 +3737,7 @@ impl AppView {
             Delivery::Pending => " · отправка…".into(),
             Delivery::Failed => " · не отправлено".into(),
         };
-        let (bg, fg, muted) = if m.out {
-            (
-                cx.theme().primary,
-                cx.theme().primary_foreground,
-                cx.theme().primary_foreground.opacity(0.7),
-            )
-        } else {
-            (
-                cx.theme().secondary,
-                cx.theme().secondary_foreground,
-                cx.theme().muted_foreground,
-            )
-        };
+        let (bg, fg, muted) = Self::bubble_colors(m.out, cx);
         let show_sender = !m.out && !m.sender.is_empty() && m.sender != chat_title;
         let accent = if m.out { fg } else { cx.theme().primary };
         // With an album the caption wraps at the album's width, as in other messengers.

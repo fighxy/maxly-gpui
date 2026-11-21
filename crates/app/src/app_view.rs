@@ -13,6 +13,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use max_core::media::Attachment;
 
+use crate::album;
 use crate::backend::{
     ChatKind, ChatRow, ContactRow, Delivery, MessageRow, Quote, SessionRow, UiCommand, UiEvent,
     one_line,
@@ -1598,6 +1599,111 @@ impl AppView {
         }
     }
 
+    /// Photos and videos of one message laid out as a grid ([`album::layout`]); returns its
+    /// width with the element.
+    fn album_view(&self, items: &[&Attachment], cx: &mut Context<Self>) -> (f32, AnyElement) {
+        let sizes: Vec<(f32, f32)> = items
+            .iter()
+            .map(|a| match a {
+                Attachment::Photo { width, height, .. }
+                | Attachment::Video { width, height, .. } => (*width as f32, *height as f32),
+                _ => (0., 0.),
+            })
+            .collect();
+        let layout = album::layout(&sizes, &album::LIMITS);
+        let muted_bg = cx.theme().muted;
+        let muted_fg = cx.theme().muted_foreground;
+        let cells: Vec<AnyElement> = items
+            .iter()
+            .zip(&layout.cells)
+            .map(|(a, c)| {
+                let (url, duration) = match a {
+                    Attachment::Photo { url, .. } => (Some(url), None),
+                    Attachment::Video {
+                        thumbnail,
+                        duration,
+                        ..
+                    } => (thumbnail.as_ref(), Some(*duration)),
+                    _ => (None, None),
+                };
+                let content = match url.and_then(|u| self.images.get(u)) {
+                    Some(ImageState::Ready(image)) => img(image.clone())
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        .into_any_element(),
+                    state => div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(muted_fg)
+                        .child(match (state, duration) {
+                            (Some(ImageState::Failed), _) => "Не загрузилось",
+                            (_, Some(_)) if url.is_none() => "Видео",
+                            _ => "",
+                        })
+                        .into_any_element(),
+                };
+                div()
+                    .absolute()
+                    .left(px(c.x))
+                    .top(px(c.y))
+                    .w(px(c.w))
+                    .h(px(c.h))
+                    .rounded(px(6.))
+                    .overflow_hidden()
+                    .bg(muted_bg)
+                    .child(content)
+                    .when_some(duration, |this, ms| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .size(px(44.))
+                                        .rounded_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .bg(gpui_kit::black().opacity(0.5))
+                                        .text_color(gpui_kit::white())
+                                        .child("▶"),
+                                ),
+                        )
+                        .when(ms > 0, |this| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .top(px(6.))
+                                    .left(px(6.))
+                                    .px(px(6.))
+                                    .rounded(px(6.))
+                                    .text_xs()
+                                    .bg(gpui_kit::black().opacity(0.55))
+                                    .text_color(gpui_kit::white())
+                                    .child(media_duration(ms)),
+                            )
+                        })
+                    })
+                    .into_any_element()
+            })
+            .collect();
+        (
+            layout.width,
+            div()
+                .relative()
+                .w(px(layout.width))
+                .h(px(layout.height))
+                .children(cells)
+                .into_any_element(),
+        )
+    }
+
     fn bubble(
         &self,
         chat_id: i64,
@@ -1606,13 +1712,29 @@ impl AppView {
         peer_mark: i64,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let attachments: Vec<AnyElement> = m
+        // Photos and videos go into one grid; files and stickers follow it one by one.
+        let media: Vec<&Attachment> = m
             .attachments
             .iter()
-            .enumerate()
-            .filter(|(_, a)| !matches!(a, Attachment::Other { .. }))
-            .map(|(i, a)| self.attachment_view(chat_id, m, a, i, cx))
+            .filter(|a| matches!(a, Attachment::Photo { .. } | Attachment::Video { .. }))
             .collect();
+        let album = (!media.is_empty()).then(|| self.album_view(&media, cx));
+        let album_width = album.as_ref().map(|(w, _)| *w);
+        let mut attachments: Vec<AnyElement> = album.map(|(_, e)| e).into_iter().collect();
+        attachments.extend(
+            m.attachments
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| {
+                    !matches!(
+                        a,
+                        Attachment::Other { .. }
+                            | Attachment::Photo { .. }
+                            | Attachment::Video { .. }
+                    )
+                })
+                .map(|(i, a)| self.attachment_view(chat_id, m, a, i, cx)),
+        );
         let state = match m.delivery {
             Delivery::Sent if m.out && m.time <= peer_mark => " · ✓✓".into(),
             Delivery::Sent if m.out => " · ✓".into(),
@@ -1635,8 +1757,10 @@ impl AppView {
         };
         let show_sender = !m.out && !m.sender.is_empty() && m.sender != chat_title;
         let accent = if m.out { fg } else { cx.theme().primary };
+        // With an album the caption wraps at the album's width, as in other messengers.
+        let max_w = album_width.map_or(520., |w| w + 24.);
         let bubble = v_flex()
-            .max_w(px(520.))
+            .max_w(px(max_w))
             .px_3()
             .py_2()
             .gap_1()
@@ -2741,9 +2865,21 @@ fn image_urls(m: &MessageRow) -> Vec<String> {
         .iter()
         .filter_map(|a| match a {
             Attachment::Photo { url, .. } | Attachment::Sticker { url } => Some(url.clone()),
+            Attachment::Video { thumbnail, .. } => thumbnail.clone(),
             _ => None,
         })
         .collect()
+}
+
+/// "0:42", "12:05" or "1:02:03" for a length in ms.
+fn media_duration(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 /// `+79000000000` from what the user typed: digits with a leading `+`; a Russian `8...` or
@@ -3181,5 +3317,18 @@ mod compose_tests {
             "Канал",
             "channel posts have no sender"
         );
+    }
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::media_duration;
+
+    #[test]
+    fn durations() {
+        assert_eq!(media_duration(0), "0:00");
+        assert_eq!(media_duration(42_000), "0:42");
+        assert_eq!(media_duration(725_400), "12:05");
+        assert_eq!(media_duration(3_723_000), "1:02:03");
     }
 }

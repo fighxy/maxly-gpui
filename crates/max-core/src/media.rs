@@ -47,6 +47,20 @@ pub enum Attachment {
         /// Size in bytes.
         size: i64,
     },
+    /// A video, shown by its preview image (`VIDEO` attach: `videoId`, `thumbnail`, `width`,
+    /// `height`, `duration` in ms; names in `core.dll`, the unit from PyMax).
+    Video {
+        /// Video id, for `VIDEO_PLAY`.
+        video_id: i64,
+        /// Preview image address, if given.
+        thumbnail: Option<String>,
+        /// Pixel width (0 if unknown).
+        width: i32,
+        /// Pixel height (0 if unknown).
+        height: i32,
+        /// Length in ms (0 if unknown).
+        duration: i64,
+    },
     /// A sticker image.
     Sticker {
         /// Image address.
@@ -99,6 +113,17 @@ pub fn attachments(m: &Message) -> Vec<Attachment> {
                     file_id: int(v, "fileId").unwrap_or(0),
                     name: text(v, "name").unwrap_or_else(|| "файл".into()),
                     size: int(v, "size").unwrap_or(0),
+                },
+                "VIDEO" => Attachment::Video {
+                    video_id: int(v, "videoId").unwrap_or(0),
+                    thumbnail: text(v, "thumbnail").filter(|u| !u.is_empty()),
+                    width: int(v, "width")
+                        .and_then(|w| i32::try_from(w).ok())
+                        .unwrap_or(0),
+                    height: int(v, "height")
+                        .and_then(|h| i32::try_from(h).ok())
+                        .unwrap_or(0),
+                    duration: int(v, "duration").unwrap_or(0),
                 },
                 "STICKER" => match text(v, "url") {
                     Some(url) => Attachment::Sticker { url },
@@ -409,6 +434,43 @@ mod tests {
                 },
                 Attachment::Other {
                     kind: "POLL".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_video_previews() {
+        let m = Message {
+            attaches: Some(vec![
+                Any(map(&[
+                    ("_type", "VIDEO".into()),
+                    ("videoId", 77.into()),
+                    ("thumbnail", "https://i.example/t".into()),
+                    ("width", 1280.into()),
+                    ("height", 720.into()),
+                    ("duration", 42_000.into()),
+                ])),
+                Any(map(&[("_type", "VIDEO".into()), ("thumbnail", "".into())])),
+            ]),
+            ..Message::default()
+        };
+        assert_eq!(
+            attachments(&m),
+            [
+                Attachment::Video {
+                    video_id: 77,
+                    thumbnail: Some("https://i.example/t".into()),
+                    width: 1280,
+                    height: 720,
+                    duration: 42_000
+                },
+                Attachment::Video {
+                    video_id: 0,
+                    thumbnail: None,
+                    width: 0,
+                    height: 0,
+                    duration: 0
                 },
             ]
         );

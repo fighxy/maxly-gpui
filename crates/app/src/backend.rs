@@ -254,10 +254,19 @@ impl MessageRow {
         if !self.text.is_empty() {
             return one_line(&self.text);
         }
+        let media = self
+            .attachments
+            .iter()
+            .filter(|a| matches!(a, Attachment::Photo { .. } | Attachment::Video { .. }))
+            .count();
+        if media > 1 {
+            return "Альбом".to_string();
+        }
         self.attachments
             .first()
             .map(|a| match a {
                 Attachment::Photo { .. } => "Фото".to_string(),
+                Attachment::Video { .. } => "Видео".to_string(),
                 Attachment::File { name, .. } => format!("Файл: {name}"),
                 Attachment::Sticker { .. } => "Стикер".to_string(),
                 Attachment::Other { kind } => attachment_label(kind).to_string(),
@@ -694,6 +703,12 @@ async fn demo_flow(
             UiCommand::FetchImage(url) => {
                 let bytes = if url == "demo://photo" {
                     Some(demo_photo_svg())
+                } else if let Some((w, h)) = url
+                    .strip_prefix("demo://photo/")
+                    .and_then(|s| s.split_once('x'))
+                    .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                {
+                    Some(demo_photo_sized(w, h))
                 } else if let Some(n) = url.strip_prefix("demo://avatar/") {
                     Some(demo_avatar_svg(n))
                 } else {
@@ -824,6 +839,38 @@ fn demo_avatar_svg(n: &str) -> bytes::Bytes {
     ))
 }
 
+/// A made-up landscape of any size for demo albums: sky, sun and hills scaled to `w`×`h`.
+fn demo_photo_sized(w: u32, h: u32) -> bytes::Bytes {
+    let (wf, hf) = (f64::from(w), f64::from(h));
+    let sun = (wf.min(hf) * 0.08).max(8.);
+    let hill = |y: f64| hf * y;
+    bytes::Bytes::from(format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">
+<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7cb7ff"/><stop offset="1" stop-color="#d9ecff"/></linearGradient></defs>
+<rect width="{w}" height="{h}" fill="url(#g)"/>
+<circle cx="{sx}" cy="{sy}" r="{sun}" fill="#ffd54f"/>
+<path d="M0 {a} L{b} {c} L{d} {e} L{f} {g} L{w} {i} L{w} {h} L0 {h} Z" fill="#4e8a5a"/>
+<path d="M0 {j} L{k} {l} L{m} {n} L{w} {o} L{w} {h} L0 {h} Z" fill="#2f6b3d"/>
+</svg>"##,
+        sx = wf * 0.8,
+        sy = hf * 0.2,
+        a = hill(0.78),
+        b = wf * 0.25,
+        c = hill(0.5),
+        d = wf * 0.45,
+        e = hill(0.7),
+        f = wf * 0.62,
+        g = hill(0.42),
+        i = hill(0.8),
+        j = hill(0.86),
+        k = wf * 0.3,
+        l = hill(0.67),
+        m = wf * 0.7,
+        n = hill(0.83),
+        o = hill(0.62),
+    ))
+}
+
 /// A made-up photo for the demo: an SVG drawn in memory, no network.
 fn demo_photo_svg() -> bytes::Bytes {
     bytes::Bytes::from_static(
@@ -898,13 +945,29 @@ fn demo_history(chat_id: i64, now: i64) -> Vec<MessageRow> {
             if i == 5 {
                 row.forwarded = Some("Пригородные поезда".into());
             }
+            let photo = |w: i32, h: i32| Attachment::Photo {
+                photo_id: None,
+                url: format!("demo://photo/{w}x{h}"),
+                width: w,
+                height: h,
+            };
             if i == 4 {
-                row.attachments = vec![Attachment::Photo {
-                    photo_id: None,
-                    url: "demo://photo".into(),
-                    width: 640,
-                    height: 420,
-                }];
+                // An album: wide, tall and square photos and a video.
+                row.attachments = vec![
+                    photo(640, 420),
+                    photo(420, 640),
+                    photo(600, 600),
+                    Attachment::Video {
+                        video_id: 1,
+                        thumbnail: Some("demo://photo/1280x720".into()),
+                        width: 1280,
+                        height: 720,
+                        duration: 42_000,
+                    },
+                ];
+            }
+            if i == 1 {
+                row.attachments = vec![photo(420, 640), photo(640, 420), photo(640, 420)];
             }
             if i == 3 {
                 row.attachments = vec![Attachment::File {
@@ -2333,6 +2396,29 @@ mod tests {
         };
         let row = Names::from_login(&login_with(vec![])).chat_row(&chat);
         assert_eq!(row.peer_mark, 60, "our own mark does not count");
+    }
+
+    #[test]
+    fn media_previews_name_albums_and_videos() {
+        let video = Attachment::Video {
+            video_id: 1,
+            thumbnail: None,
+            width: 0,
+            height: 0,
+            duration: 0,
+        };
+        let photo = Attachment::Photo {
+            photo_id: None,
+            url: String::new(),
+            width: 0,
+            height: 0,
+        };
+        let row = |attachments| MessageRow {
+            attachments,
+            ..MessageRow::default()
+        };
+        assert_eq!(row(vec![video.clone()]).preview(), "Видео");
+        assert_eq!(row(vec![photo, video]).preview(), "Альбом");
     }
 
     #[test]

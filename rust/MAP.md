@@ -102,9 +102,9 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
-| E1 | Photo send/view, image quality, WebP | O 80; K `image-quality`, `image-width`, `webp-config`, `desktop-webp-conversion` | v1 | view (baseUrl, aspect kept) and send (PHOTO_UPLOAD, multipart, photoToken) done; quality settings, WebP conversion open; upload unverified on the real server |
+| E1 | Photo send/view, image quality, WebP | O 80; K `image-quality`, `image-width`, `webp-config`, `desktop-webp-conversion` | v1 | view (baseUrl, aspect kept; several photos and videos of one message as an album grid: 2 side by side or stacked, 3 and 4 with a large first item, 5+ in rows chosen to come closest to 400 px, after Telegram's grouped layout; caption wraps at the album width) and send (PHOTO_UPLOAD, multipart, photoToken) done; quality settings, WebP conversion open; upload unverified on the real server |
 | E2 | Files send/download, retries, download path | O 87, 88; K `desktop-attachmnets-upload-retries`; Q `FileAttachmentItem` | v1 | send (FILE_UPLOAD, raw body, NOTIF_ATTACH wait) and download to Downloads (FILE_DOWNLOAD) done; retries open; unverified on the real server |
-| E3 | Video send and playback (embedded, speed) | O 82, 83; K `desktop-embed-video`, `video-speed`, `oneme-media-player` | v1 | open |
+| E3 | Video send and playback (embedded, speed) | O 82, 83; K `desktop-embed-video`, `video-speed`, `oneme-media-player` | v1 | preview in the history: `VIDEO` attach `thumbnail`, size, `duration` (ms, from PyMax) with ▶ and the length; playback (VIDEO_PLAY) open |
 | E4 | Voice messages play and record, waveform | O 301; K `audio-msg-send-enabled`; Q `AudioAttachmentDelegate`, `InputAudioRecorderPanel` | v1 (play), v2 (record) | open |
 | E5 | Video messages (circles) play and record | Q `VideoMessage*`, `InputVideoRecorderPanel`; K `ov-media-send-enabled` | v2 | open |
 | E6 | Fullscreen gallery | Q `FullscreenGalleryWindow`; S `fsg_gallery` | v1 | open |

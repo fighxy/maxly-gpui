@@ -39,8 +39,8 @@ close it in the phone app's list of active sessions and delete the profile folde
 | 11 | Download a file from a message | `FILE_DOWNLOAD` URL, saved in Downloads | — |
 | 12 | Turn the network off and on | reconnect, `LOGIN` with the stored token | — |
 | 13 | Restart the client | no new login; chat list from the stored token | — |
-| 14 | Reply to a message (hover → «Ответить») | `MSG_SEND` with `link` {type REPLY, messageId}; the phone shows the quote; the answer's `link` carries the quoted message | PyMax hint |
-| 15 | Edit our text (hover → «Изменить», Enter) | `MSG_EDIT` with `text` only is accepted; photos and files of the message stay | unverified |
+| 14 | Reply to a message (right-click → «Ответить») | `MSG_SEND` with `link` {type REPLY, messageId}; the phone shows the quote; the answer's `link` carries the quoted message | PyMax hint |
+| 15 | Edit our text (right-click → «Изменить», Enter) | `MSG_EDIT` with `text` only is accepted; photos and files of the message stay | unverified |
 | 16 | Delete ours for everyone, then one for us | `MSG_DELETE` `forMe` false / true; the phone loses only the first | `failedMessageIds` |
 | 17 | Open a chat with a forwarded message | text and attachments come from `link.message`; `chatName` for channels | — |
 

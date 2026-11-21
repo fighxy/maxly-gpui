@@ -6,6 +6,7 @@ use std::sync::Arc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, *};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -341,10 +342,6 @@ pub struct AppView {
     typing_sent: Option<(i64, std::time::Instant)>,
     /// Reply or edit in the open chat's composer.
     compose: Option<Compose>,
-    /// The message under the mouse, whose actions are shown.
-    hovered: Option<i64>,
-    /// The message whose delete choice is shown.
-    confirm_delete: Option<i64>,
     /// The section picked on the navigation rail.
     section: Section,
     /// The open settings page.
@@ -417,8 +414,6 @@ impl AppView {
             typing: HashMap::new(),
             typing_sent: None,
             compose: None,
-            hovered: None,
-            confirm_delete: None,
             section: Section::Chats,
             settings_page: SettingsPage::Account,
             ui,
@@ -538,12 +533,6 @@ impl AppView {
                     h.messages.retain(|m| m.id == 0 || !ids.contains(&m.id));
                 }
                 let gone = |id: i64| ids.contains(&id);
-                if self.confirm_delete.is_some_and(gone) {
-                    self.confirm_delete = None;
-                }
-                if self.hovered.is_some_and(gone) {
-                    self.hovered = None;
-                }
                 if let Some(Compose::Reply { quote }) = &self.compose
                     && gone(quote.id)
                 {
@@ -804,8 +793,6 @@ impl AppView {
         };
         if *selected != Some(chat_id) {
             self.compose = None;
-            self.hovered = None;
-            self.confirm_delete = None;
         }
         *selected = Some(chat_id);
         self.section = Section::Chats;
@@ -882,7 +869,6 @@ impl AppView {
     /// Switch the rail section; the account page loads the sessions each time it is shown.
     fn switch_section(&mut self, section: Section, cx: &mut Context<Self>) {
         self.section = section;
-        self.hovered = None;
         if section == Section::Settings && self.settings_page == SettingsPage::Account {
             self.open_account(cx);
         }
@@ -1197,7 +1183,6 @@ impl AppView {
         self.compose = Some(Compose::Reply {
             quote: quote_of(m, chat_title),
         });
-        self.confirm_delete = None;
         self.focus_composer(window, cx);
         cx.notify();
     }
@@ -1211,7 +1196,6 @@ impl AppView {
             message_id: m.id,
             original: text,
         });
-        self.confirm_delete = None;
         self.focus_composer(window, cx);
         cx.notify();
     }
@@ -1241,7 +1225,6 @@ impl AppView {
             })
             .is_ok()
         {
-            self.confirm_delete = None;
             cx.notify();
         }
     }
@@ -1814,138 +1797,152 @@ impl AppView {
                 if m.edited { "изменено · " } else { "" },
                 clock(m.time)
             )));
-        let actions = self.message_actions(chat_id, m, chat_title, cx);
-        let key = if m.id != 0 { m.id } else { m.cid.unwrap_or(0) };
-        let id = m.id;
-        let row = h_flex()
-            .id(("msg", u64::from_ne_bytes(key.to_ne_bytes())))
+        let key =
+            u64::from_ne_bytes(if m.id != 0 { m.id } else { m.cid.unwrap_or(0) }.to_ne_bytes());
+        let bubble = bubble
+            .id(("bubble", key))
+            .context_menu(self.message_menu(chat_id, m, chat_title, cx));
+        h_flex()
+            .id(("msg", key))
             .w_full()
-            .gap_2()
-            .items_center()
             .when(m.out, |this| this.justify_end())
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if *hovered {
-                    this.hovered = Some(id);
-                } else if this.hovered == Some(id) {
-                    this.hovered = None;
-                }
-                cx.notify();
-            }));
-        if m.out {
-            row.children(actions).child(bubble)
-        } else {
-            row.child(bubble).children(actions)
-        }
+            .child(bubble)
     }
 
-    /// Buttons beside a message: reply, copy, edit and delete while the mouse is over it, or
-    /// the delete choice once asked.
-    fn message_actions(
+    /// The right-click menu of a message: reply, copy text, edit our own, delete. A message
+    /// still on its way or refused offers only copying.
+    fn message_menu(
         &self,
         chat_id: i64,
         m: &MessageRow,
         chat_title: &str,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if m.id == 0 || m.delivery != Delivery::Sent {
-            return None;
-        }
-        let key = u64::from_ne_bytes(m.id.to_ne_bytes());
-        let id = m.id;
-        if self.confirm_delete == Some(id) {
-            return Some(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Удалить?"),
-                    )
-                    .when(m.out, |this| {
-                        this.child(
-                            Button::new(("del-all", key))
-                                .small()
-                                .danger()
-                                .label("У всех")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.delete_message(chat_id, id, false, cx)
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new(("del-me", key))
-                            .small()
-                            .warning()
-                            .label("У меня")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.delete_message(chat_id, id, true, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new(("del-cancel", key))
-                            .small()
-                            .ghost()
-                            .label("Отмена")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.confirm_delete = None;
-                                cx.notify();
-                            })),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if self.hovered != Some(id) {
-            return None;
-        }
-        let (row, title) = (m.clone(), chat_title.to_string());
-        let reply = Button::new(("reply", key))
-            .small()
-            .ghost()
-            .label("Ответить")
-            .on_click(
-                cx.listener(move |this, _, window, cx| this.start_reply(&row, &title, window, cx)),
-            );
-        let text = m.text.clone();
-        let copy = (!text.is_empty()).then(|| {
-            Button::new(("copy", key))
-                .small()
-                .ghost()
-                .label("Копировать")
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                    if let Screen::Main { status, .. } = &mut this.screen {
-                        *status = Some("Текст скопирован".into());
-                    }
-                    cx.notify();
-                }))
-        });
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let view = cx.entity().downgrade();
         let row = m.clone();
-        let edit = editable(m).then(|| {
-            Button::new(("edit", key))
-                .small()
-                .ghost()
-                .label("Изменить")
-                .on_click(cx.listener(move |this, _, window, cx| this.start_edit(&row, window, cx)))
+        let title = chat_title.to_string();
+        let on_server = m.id != 0 && m.delivery == Delivery::Sent;
+        let can_edit = editable(m);
+        move |menu, _, _| {
+            let mut menu = menu;
+            if on_server {
+                let (view, row, title) = (view.clone(), row.clone(), title.clone());
+                menu = menu.item(
+                    PopupMenuItem::new("Ответить")
+                        .icon(Icon::new(Lucide::Reply))
+                        .on_click(move |_, window, cx| {
+                            let _ = view
+                                .update(cx, |this, cx| this.start_reply(&row, &title, window, cx));
+                        }),
+                );
+            }
+            if !row.text.is_empty() {
+                let (view, text) = (view.clone(), row.text.clone());
+                menu = menu.item(
+                    PopupMenuItem::new("Копировать текст")
+                        .icon(Icon::new(IconName::Copy))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                            let _ = view.update(cx, |this, cx| {
+                                if let Screen::Main { status, .. } = &mut this.screen {
+                                    *status = Some("Текст скопирован".into());
+                                }
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            if can_edit {
+                let (view, row) = (view.clone(), row.clone());
+                menu = menu.item(
+                    PopupMenuItem::new("Изменить")
+                        .icon(Icon::new(Lucide::Pencil))
+                        .on_click(move |_, window, cx| {
+                            let _ = view.update(cx, |this, cx| this.start_edit(&row, window, cx));
+                        }),
+                );
+            }
+            if on_server {
+                let (view, id, out) = (view.clone(), row.id, row.out);
+                menu = menu.separator().item(
+                    PopupMenuItem::new("Удалить")
+                        .icon(Icon::new(Lucide::Trash))
+                        .on_click(move |_, window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.ask_delete(chat_id, id, out, window, cx)
+                            });
+                        }),
+                );
+            }
+            menu
+        }
+    }
+
+    /// Ask how to delete a message: for everyone or only for us (ours), or only for us
+    /// (someone else's).
+    fn ask_delete(
+        &mut self,
+        chat_id: i64,
+        id: i64,
+        out: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let delete = |for_me: bool| {
+                let view = view.clone();
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    let _ =
+                        view.update(cx, |this, cx| this.delete_message(chat_id, id, for_me, cx));
+                    window.close_dialog(cx);
+                }
+            };
+            dialog
+                .w(px(440.))
+                .title("Удалить сообщение?")
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if out {
+                            "Удалить его у всех участников чата или только у вас?"
+                        } else {
+                            "Сообщение пропадёт только у вас; у остальных оно останется."
+                        }),
+                )
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("delete-cancel")
+                                .ghost()
+                                .label("Отмена")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(if out {
+                            Button::new("delete-for-me")
+                                .outline()
+                                .label("У меня")
+                                .on_click(delete(true))
+                        } else {
+                            Button::new("delete-for-me")
+                                .danger()
+                                .label("Удалить")
+                                .on_click(delete(true))
+                        })
+                        .when(out, |this| {
+                            this.child(
+                                Button::new("delete-for-all")
+                                    .danger()
+                                    .label("У всех")
+                                    .on_click(delete(false)),
+                            )
+                        }),
+                )
         });
-        let delete = Button::new(("delete", key))
-            .small()
-            .ghost()
-            .label("Удалить")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.confirm_delete = Some(id);
-                cx.notify();
-            }));
-        Some(
-            h_flex()
-                .gap_0p5()
-                .child(reply)
-                .children(copy)
-                .children(edit)
-                .child(delete)
-                .into_any_element(),
-        )
     }
 
     fn render_chat(&self, chat: &ChatRow, cx: &mut Context<Self>) -> Div {

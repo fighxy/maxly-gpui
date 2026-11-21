@@ -83,8 +83,8 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 |---|---|---|---|---|
 | D1 | History load and scroll, day dividers, new-messages marker | O 49, 71; Q `HistoryListView`, `NewMessagesPanel` | v1 | first page (40, from now) with day dividers and scroll to the newest done; request values from PyMax, unverified on the real server; paging back (button at the top and scrolling up at the top, `from` = oldest shown) done; new-messages marker open |
 | D2 | Send text, formatting, links, mentions | O 64; Q `MessageTextInput`, `AddFormatLinkDialog`, `MentionContactList` | v1 | plain text with pending, sent and failed states done (cid = send time); formatting, links, mentions open |
-| D3 | Edit, delete (for me / for all), delete range | O 66, 67, 140, 142; K `delete-msg-fys-large-chat-disabled` | v1 | edits and deletes from the server shown ("изменено", removed from the history); editing our text (MSG_EDIT, `text` only) and deleting for everyone or for us (MSG_DELETE `forMe`, `failedMessageIds` honoured) done from the hover actions, with a delete choice; incoming messages delete for us only; unverified on the real server; delete range and admin deletes open |
-| D4 | Reply, forward, quote navigation | Q `Reply*`, `MessageForwardDialog`; K `reply-navigation-highlight` | v1 | reply done: `link` {type REPLY, messageId} on MSG_SEND, quote shown above the reply (hover action "Ответить", bar above the composer); forwarded messages shown with the original's text and attachments and "Переслано от …" (`link` FORWARD, `chatName` or the original sender); link types from `core.dll`; sending forwards and quote navigation open; unverified on the real server |
+| D3 | Edit, delete (for me / for all), delete range | O 66, 67, 140, 142; K `delete-msg-fys-large-chat-disabled` | v1 | edits and deletes from the server shown ("изменено", removed from the history); editing our text (MSG_EDIT, `text` only) and deleting for everyone or for us (MSG_DELETE `forMe`, `failedMessageIds` honoured) done from the right-click menu, deleting through a dialog (for us, or for everyone for ours); incoming messages delete for us only; unverified on the real server; delete range and admin deletes open |
+| D4 | Reply, forward, quote navigation | Q `Reply*`, `MessageForwardDialog`; K `reply-navigation-highlight` | v1 | reply done: `link` {type REPLY, messageId} on MSG_SEND, quote shown above the reply (right-click → «Ответить», bar above the composer); forwarded messages shown with the original's text and attachments and "Переслано от …" (`link` FORWARD, `chatName` or the original sender); link types from `core.dll`; sending forwards and quote navigation open; unverified on the real server |
 | D5 | Reactions: set, cancel, list, detailed | O 178-181, 155, 156; Q `ReactionPlate`; K `reactions-rank-config` | v1 | open |
 | D6 | Pinned messages and multipin | O 240-243, 86; K `multipin-*`; Q `PinBar`, `PinnedMessagesPage` | v2 | open |
 | D7 | Delayed (scheduled) messages | O 154; Q `DelayedMessages*` | v2 | open |
@@ -95,7 +95,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | D12 | Audio/video message transcription | O 202, 293; K `enable-*-transcription`, `retry-transcribe-*` | v2 | open |
 | D13 | Multiselect actions, copy restrictions | Q `DelayedMultiselectActionsPanel`, `MessagesActionPanel` | v1 | open |
 | D14 | Message search inside a chat | Q `MessagesSearchPanel` | v1 | open |
-| D15 | Text selection, clipboard (HTML) | K `message-text-selection`, `desktop-clipboard-html-enabled` | v1 | copy message text (hover action, plain text) done; selection and HTML clipboard open |
+| D15 | Text selection, clipboard (HTML) | K `message-text-selection`, `desktop-clipboard-html-enabled` | v1 | copy message text (right-click → «Копировать текст», plain text) done; selection and HTML clipboard open |
 | D16 | Spell check | K `spell-check-win`; S `spell_check` | v2 | open |
 
 ### E. Attachments and media
@@ -233,7 +233,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | `max-store` | encrypted local DB, token in OS keystore | 2 | done 2026-11-19: SQLCipher 4.20 (vendored OpenSSL), key and token in Credential Manager (DPAPI), profile with Identity and launch counter; 9 tests + 1 OS store test (run once, cleaned up); chat and message tables come with `max-core` |
 | `max-core` | session, auth flows, sync, event dispatch, server config | 2 | done 2026-11-19: Session (SESSION_INIT, QR, SMS, 2FA password, LOGIN), Supervisor (reconnect, re-login), 6 flow tests on a scripted server; typed push dispatch, sync markers, logout open |
 | `max-media` | uploads/downloads, image/video/audio decode, Lottie | 3 | open |
-| `app` | gpui-kit UI, desktop integration | 3 | started 2026-11-19: window, QR, phone and code, 2FA password, chat list from LOGIN (local times), `--demo` and `--demo-walk` without network; message history (first page) and sending text done 2026-11-20; attachments and paging done; 2026-11-21: navigation rail (chats, calls, contacts, settings), settings pages (account and devices, appearance, data, about), message hover actions (reply, copy, edit, delete) |
+| `app` | gpui-kit UI, desktop integration | 3 | started 2026-11-19: window, QR, phone and code, 2FA password, chat list from LOGIN (local times), `--demo` and `--demo-walk` without network; message history (first page) and sending text done 2026-11-20; attachments and paging done; 2026-11-21: navigation rail (chats, calls, contacts, settings), settings pages (account and devices, appearance, data, about), right-click message menu (reply, copy, edit, delete with a confirmation dialog) |
 
 ## Open questions
 

@@ -70,8 +70,12 @@ fn main() {
     drop(runtime);
 }
 
-// Lucide icons beyond the component set: the navigation rail and the settings pages.
-icon_assets!(ExtraIcons, [MessageCircle, Phone, Contact, Laptop]);
+// Lucide icons beyond the component set: the navigation rail, the settings pages and the
+// message menu.
+icon_assets!(
+    ExtraIcons,
+    [MessageCircle, Phone, Contact, Laptop, Reply, Pencil, Trash]
+);
 
 /// The component icons plus [`ExtraIcons`].
 struct AppAssets;

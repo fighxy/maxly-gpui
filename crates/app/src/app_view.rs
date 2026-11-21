@@ -260,10 +260,13 @@ fn upsert_chat(chats: &mut Vec<ChatRow>, new: ChatRow) {
         };
         let time = row.time.max(new.time);
         let peer_mark = row.peer_mark.max(new.peer_mark);
+        // A dialog's photo comes from the contact, which a NOTIF_CHAT may not carry.
+        let avatar = new.avatar.clone().or_else(|| row.avatar.take());
         *row = ChatRow {
             preview,
             time,
             peer_mark,
+            avatar,
             ..new
         };
     } else {
@@ -591,9 +594,12 @@ impl AppView {
             }
             UiEvent::ChatTitles(titles) => {
                 if let Screen::Main { chats, .. } = &mut self.screen {
-                    for (id, title) in titles {
-                        if let Some(row) = chats.iter_mut().find(|c| c.id == id) {
-                            row.title = title;
+                    for t in titles {
+                        if let Some(row) = chats.iter_mut().find(|c| c.id == t.chat_id) {
+                            row.title = t.title;
+                            if t.avatar.is_some() {
+                                row.avatar = t.avatar;
+                            }
                         }
                     }
                 }
@@ -623,6 +629,8 @@ impl AppView {
             }
             other => self.apply_screen(other),
         }
+        // New chats, contacts or photo addresses: fetch what is missing (known ones are skipped).
+        self.request_avatars();
         cx.notify();
     }
 
@@ -1440,15 +1448,10 @@ impl AppView {
         row: &ChatRow,
         selected: bool,
         typing: Option<String>,
+        avatar: AnyElement,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let id = row.id;
-        let initials: String = row
-            .title
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().collect())
-            .unwrap_or_default();
         h_flex()
             .id(("chat", u64::from_ne_bytes(id.to_ne_bytes())))
             .gap_3()
@@ -1458,18 +1461,7 @@ impl AppView {
             .when(selected, |this| this.bg(cx.theme().accent))
             .hover(|this| this.bg(cx.theme().secondary_hover))
             .on_click(cx.listener(move |this, _, _, cx| this.open_chat(id, cx)))
-            .child(
-                div()
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .justify_center()
-                    .size_10()
-                    .rounded_full()
-                    .bg(cx.theme().primary)
-                    .text_color(cx.theme().primary_foreground)
-                    .child(initials),
-            )
+            .child(avatar)
             .child(
                 v_flex()
                     .flex_1()
@@ -2043,7 +2035,8 @@ impl AppView {
                     .gap_1()
                     .children(chats.iter().map(|row| {
                         let typing = self.typing_label(row);
-                        Self::chat_row(row, selected == Some(row.id), typing, cx)
+                        let avatar = self.avatar(&row.title, row.avatar.as_ref(), 40., cx);
+                        Self::chat_row(row, selected == Some(row.id), typing, avatar, cx)
                     }))
                     .into_any_element(),
             ),
@@ -2366,13 +2359,22 @@ impl AppView {
                         this.contact_selected = Some(id);
                         cx.notify();
                     }))
-                    .child(Self::avatar(&c.name, 36., cx))
+                    .child(self.avatar(&c.name, c.avatar.as_ref(), 36., cx))
                     .child(div().truncate().child(c.name.clone()))
             }))
     }
 
-    /// A round avatar with the first letter of `name`.
-    fn avatar(name: &str, size: f32, cx: &App) -> Div {
+    /// A round avatar: the photo at `url` once it is loaded, the first letter of `name` until
+    /// then and when there is none.
+    fn avatar(&self, name: &str, url: Option<&String>, size: f32, cx: &App) -> AnyElement {
+        if let Some(ImageState::Ready(image)) = url.and_then(|u| self.images.get(u)) {
+            return img(image.clone())
+                .flex_shrink_0()
+                .size(px(size))
+                .rounded_full()
+                .object_fit(ObjectFit::Cover)
+                .into_any_element();
+        }
         let initial: String = name
             .chars()
             .next()
@@ -2387,7 +2389,22 @@ impl AppView {
             .rounded_full()
             .bg(cx.theme().primary)
             .text_color(cx.theme().primary_foreground)
+            .when(size >= 64., |this| this.text_3xl())
             .child(initial)
+            .into_any_element()
+    }
+
+    /// Ask for the photos of every chat and contact not asked for yet.
+    fn request_avatars(&mut self) {
+        let mut urls: Vec<String> = self
+            .contacts
+            .iter()
+            .filter_map(|c| c.avatar.clone())
+            .collect();
+        if let Screen::Main { chats, .. } = &self.screen {
+            urls.extend(chats.iter().filter_map(|c| c.avatar.clone()));
+        }
+        self.request_images(urls);
     }
 
     fn contact_card(&self, cx: &mut Context<Self>) -> Div {
@@ -2404,7 +2421,7 @@ impl AppView {
             .gap_3()
             .items_center()
             .justify_center()
-            .child(Self::avatar(&c.name, 96., cx).text_3xl())
+            .child(self.avatar(&c.name, c.avatar.as_ref(), 96., cx))
             .child(div().text_xl().font_semibold().child(c.name.clone()))
             .child(match chat_id {
                 Some(chat_id) => Button::new("contact-write")
@@ -2849,17 +2866,25 @@ mod chat_list_tests {
             unread: 0,
             time,
             peer_mark: 0,
+            avatar: None,
         }
     }
 
     #[test]
     fn changed_chat_keeps_its_preview_and_new_chat_goes_by_time() {
-        let mut chats = vec![chat(1, 300, "привет"), chat(2, 100, "пока")];
+        let mut first = chat(1, 300, "привет");
+        first.avatar = Some("https://i.oneme.ru/a".into());
+        let mut chats = vec![first, chat(2, 100, "пока")];
         let mut renamed = chat(1, 200, "");
         renamed.title = "Новое имя".into();
         upsert_chat(&mut chats, renamed);
         assert_eq!(chats[0].title, "Новое имя");
         assert_eq!((chats[0].preview.as_str(), chats[0].time), ("привет", 300));
+        assert_eq!(
+            chats[0].avatar.as_deref(),
+            Some("https://i.oneme.ru/a"),
+            "a change without a photo keeps the old one"
+        );
         upsert_chat(&mut chats, chat(3, 150, ""));
         let ids: Vec<i64> = chats.iter().map(|c| c.id).collect();
         assert_eq!(ids, [1, 3, 2]);

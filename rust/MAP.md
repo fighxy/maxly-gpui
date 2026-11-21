@@ -66,7 +66,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
-| C1 | Chat list with previews, counters, presence | O 53, 35, 132; Q `ChatListView`, `ChatDelegate`, `PresenceMarker` | v1 | list, last message, unread counter, live reordering on new messages done; presence open |
+| C1 | Chat list with previews, counters, presence | O 53, 35, 132; Q `ChatListView`, `ChatDelegate`, `PresenceMarker` | v1 | list, last message, unread counter, live reordering on new messages done; avatars (chat `baseIconUrl`, a dialog peer's contact `baseUrl`, loaded as is, initials until then) in the chat list and contacts; presence open |
 | C2 | Mark read / unread | O 50, 130; K `readmark-validation-disabled` | v1 | mark read (CHAT_MARK READ_MESSAGE up to the newest incoming message) on open and on new messages; reads on other devices (own NOTIF_MARK) update the unread counter; the other participants' marks (chat `participants`, NOTIF_MARK) show ✓/✓✓ on our messages. Mark unread open |
 | C3 | Typing indicators (send and show) | O 65, 129; K `typing-send-enabled`; Q `TypingControl` | v1 | done: TYPING_SEND `{chatId, type: "TEXT"}` (type names from `Core::Typing::Interactor::doSend`) at most every 5 s while the composer changes; NOTIF_TYPING shown in the chat header and list for 6 s (both intervals chosen here, not read from the client); not tried on the real server |
 | C4 | Search: chats, messages, public, by phone | O 60, 68, 73, 46; Q `SearchPanel`, `SearchByPhoneDialog` | v1 | open |

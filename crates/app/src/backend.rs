@@ -71,7 +71,7 @@ pub enum UiEvent {
     /// A short note for the status line ("saved to ...").
     Notice(String),
     /// Dialog titles learned after the chat list was shown: (chat id, title).
-    ChatTitles(Vec<(i64, String)>),
+    ChatTitles(Vec<ChatTitle>),
     /// The account's active sessions.
     Sessions(Vec<SessionRow>),
     /// The sessions could not be loaded or closed.
@@ -275,6 +275,19 @@ pub struct ContactRow {
     pub name: String,
     /// Our dialog with them, if one is in the chat list.
     pub chat_id: Option<i64>,
+    /// Profile photo address.
+    pub avatar: Option<String>,
+}
+
+/// A dialog's title and photo, learned after the chat list was shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatTitle {
+    /// The dialog.
+    pub chat_id: i64,
+    /// The other person's name.
+    pub title: String,
+    /// Their profile photo address.
+    pub avatar: Option<String>,
 }
 
 /// One row of the chat list.
@@ -292,6 +305,8 @@ pub struct ChatRow {
     pub time: i64,
     /// The latest read mark of the other participants, Unix ms: our messages up to it are read.
     pub peer_mark: i64,
+    /// Chat icon, or the other person's photo for a dialog.
+    pub avatar: Option<String>,
 }
 
 /// Handles to a running backend.
@@ -472,6 +487,8 @@ async fn demo_flow(
             unread: *unread,
             time: t - minutes_ago * 60_000,
             peer_mark: t - 3 * 60_000,
+            // Drawn locally: the first two chats show a photo, the rest initials.
+            avatar: (i < 2).then(|| format!("demo://avatar/{i}")),
         })
         .collect();
     let _ = ui.send(UiEvent::LoggedIn {
@@ -492,6 +509,7 @@ async fn demo_flow(
                 id: 100 + i as i64,
                 name: (*name).into(),
                 chat_id: *chat_id,
+                avatar: (i == 0).then(|| "demo://avatar/0".to_string()),
             })
             .collect(),
     ));
@@ -588,6 +606,8 @@ async fn demo_flow(
             UiCommand::FetchImage(url) => {
                 let bytes = if url == "demo://photo" {
                     Some(demo_photo_svg())
+                } else if let Some(n) = url.strip_prefix("demo://avatar/") {
+                    Some(demo_avatar_svg(n))
                 } else {
                     // A photo the user picked in the demo: read it locally, nothing leaves.
                     tokio::fs::read(url.trim_start_matches("demo-file://"))
@@ -697,6 +717,23 @@ fn demo_row(id: i64, out: bool, text: &str, time: i64, delivery: Delivery) -> Me
         delivery,
         ..MessageRow::default()
     }
+}
+
+/// A made-up profile photo for the demo: a head and shoulders on a coloured square.
+fn demo_avatar_svg(n: &str) -> bytes::Bytes {
+    let (top, bottom) = if n == "0" {
+        ("#f6a5c0", "#c2185b")
+    } else {
+        ("#9fd3ff", "#1565c0")
+    };
+    bytes::Bytes::from(format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160">
+<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{top}"/><stop offset="1" stop-color="{bottom}"/></linearGradient></defs>
+<rect width="160" height="160" fill="url(#g)"/>
+<circle cx="80" cy="64" r="30" fill="#ffffff" fill-opacity="0.9"/>
+<path d="M24 160 C30 112 130 112 136 160 Z" fill="#ffffff" fill-opacity="0.9"/>
+</svg>"##
+    ))
 }
 
 /// A made-up photo for the demo: an SVG drawn in memory, no network.
@@ -1204,6 +1241,8 @@ fn save_download(name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf
 pub struct Names {
     me: i64,
     contacts: BTreeMap<i64, String>,
+    /// Profile photo addresses (`baseUrl`) of the people above that have one.
+    avatars: BTreeMap<i64, String>,
 }
 
 impl Names {
@@ -1218,9 +1257,16 @@ impl Names {
             login.profile.contact.id,
             contact_name(&login.profile.contact),
         );
+        let avatars = login
+            .contacts
+            .iter()
+            .chain(std::iter::once(&login.profile.contact))
+            .filter_map(|c| contact_avatar(c).map(|url| (c.id, url)))
+            .collect();
         Names {
             me: login.profile.contact.id,
             contacts,
+            avatars,
         }
     }
 
@@ -1239,6 +1285,9 @@ impl Names {
     pub fn add(&mut self, contacts: &[Contact]) {
         for c in contacts {
             self.contacts.insert(c.id, contact_name(c));
+            if let Some(url) = contact_avatar(c) {
+                self.avatars.insert(c.id, url);
+            }
         }
     }
 
@@ -1253,17 +1302,24 @@ impl Names {
                 id: *id,
                 name: name.clone(),
                 chat_id: peers.iter().find(|(_, p)| p == id).map(|(c, _)| *c),
+                avatar: self.avatars.get(id).cloned(),
             })
             .collect();
         rows.sort_by_key(|r| r.name.to_lowercase());
         rows
     }
 
-    /// Known titles for dialogs given as (chat id, peer id).
-    pub fn titles(&self, peers: &[(i64, i64)]) -> Vec<(i64, String)> {
+    /// Known titles and photos for dialogs given as (chat id, peer id).
+    pub fn titles(&self, peers: &[(i64, i64)]) -> Vec<ChatTitle> {
         peers
             .iter()
-            .filter_map(|(chat, peer)| self.contacts.get(peer).map(|n| (*chat, n.clone())))
+            .filter_map(|(chat, peer)| {
+                self.contacts.get(peer).map(|n| ChatTitle {
+                    chat_id: *chat,
+                    title: n.clone(),
+                    avatar: self.avatars.get(peer).cloned(),
+                })
+            })
             .collect()
     }
 
@@ -1312,8 +1368,13 @@ impl Names {
 
     /// A chat list row, with names known so far.
     pub fn chat_row(&self, chat: &Chat) -> ChatRow {
-        let title = |id: i64| self.contacts.get(&id).cloned();
-        chat_row_with(chat, self.me, title)
+        let peer = |id: i64| {
+            (
+                self.contacts.get(&id).cloned(),
+                self.avatars.get(&id).cloned(),
+            )
+        };
+        chat_row_with(chat, self.me, peer)
     }
 
     /// A history row for a message. Channel posts have no sender: not ours, no name. A
@@ -1708,30 +1769,51 @@ pub fn rows_from_login(login: &LoginResponse) -> (String, Vec<ChatRow>) {
     let mut rows: Vec<ChatRow> = login
         .chats
         .iter()
-        .map(|c| chat_row_with(c, me_id, |id| contacts.get(&id).map(|c| contact_name(c))))
+        .map(|c| {
+            chat_row_with(c, me_id, |id| {
+                let contact = contacts.get(&id);
+                (
+                    contact.map(|c| contact_name(c)),
+                    contact.and_then(|c| contact_avatar(c)),
+                )
+            })
+        })
         .collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.time));
     (contact_name(&login.profile.contact), rows)
 }
 
-fn chat_row_with(chat: &Chat, me_id: i64, name_of: impl Fn(i64) -> Option<String>) -> ChatRow {
-    let title = chat
-        .title
+/// A chat list row; `peer` gives the name and photo of a dialog's other participant.
+fn chat_row_with(
+    chat: &Chat,
+    me_id: i64,
+    peer: impl Fn(i64) -> (Option<String>, Option<String>),
+) -> ChatRow {
+    let titled = chat.title.clone().filter(|t| !t.is_empty());
+    let other = chat
+        .participants
+        .keys()
+        .find(|id| **id != me_id)
+        .copied()
+        .unwrap_or(me_id);
+    // Groups and channels have their own icon; a dialog shows the other person's photo.
+    let (name, peer_avatar) = if titled.is_none() && other != me_id {
+        peer(other)
+    } else {
+        (None, None)
+    };
+    let avatar = chat
+        .base_icon_url
         .clone()
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| {
-            let other = chat
-                .participants
-                .keys()
-                .find(|id| **id != me_id)
-                .copied()
-                .unwrap_or(me_id);
-            if other == me_id {
-                "Избранное".to_string()
-            } else {
-                name_of(other).unwrap_or_else(|| format!("id {other}"))
-            }
-        });
+        .filter(|u| !u.is_empty())
+        .or(peer_avatar);
+    let title = titled.unwrap_or_else(|| {
+        if other == me_id {
+            "Избранное".to_string()
+        } else {
+            name.unwrap_or_else(|| format!("id {other}"))
+        }
+    });
     let preview = chat
         .last_message
         .as_ref()
@@ -1744,7 +1826,13 @@ fn chat_row_with(chat: &Chat, me_id: i64, name_of: impl Fn(i64) -> Option<String
         unread: chat.new_messages.unwrap_or(0),
         time: chat.last_event_time,
         peer_mark: peer_mark(chat, me_id),
+        avatar,
     }
+}
+
+/// A contact's profile photo address, if it has one.
+fn contact_avatar(c: &Contact) -> Option<String> {
+    c.base_url.clone().filter(|u| !u.is_empty())
 }
 
 /// The newest read mark among the other participants (`participants` maps id to read time).
@@ -1813,6 +1901,70 @@ mod tests {
         let titles: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(titles, ["Группа", "Анна", "Избранное"]);
         assert_eq!((rows[1].preview.as_str(), rows[1].unread), ("привет", 3));
+    }
+
+    #[test]
+    fn avatars_are_the_chat_icon_or_the_peer_photo() {
+        let with_photo = |id, first, url: &str| Contact {
+            base_url: Some(url.into()),
+            ..contact(id, first)
+        };
+        let dialog = Chat {
+            id: 10,
+            participants: [(1, 0), (2, 0)].into_iter().collect(),
+            ..Chat::default()
+        };
+        let channel = Chat {
+            id: 11,
+            title: Some("Канал".into()),
+            base_icon_url: Some("https://i.oneme.ru/c".into()),
+            participants: [(1, 0), (2, 0)].into_iter().collect(),
+            ..Chat::default()
+        };
+        let saved = Chat {
+            id: 12,
+            participants: [(1, 0)].into_iter().collect(),
+            ..Chat::default()
+        };
+        let login = LoginResponse {
+            profile: ProfileT {
+                contact: with_photo(1, "Я", "https://i.oneme.ru/me"),
+                ..ProfileT::default()
+            },
+            contacts: vec![with_photo(2, "Анна", "https://i.oneme.ru/a")],
+            chats: vec![dialog.clone(), channel, saved],
+            ..LoginResponse::default()
+        };
+        let (_, rows) = rows_from_login(&login);
+        let avatar = |id| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.avatar.as_deref())
+        };
+        assert_eq!(avatar(10), Some("https://i.oneme.ru/a"));
+        assert_eq!(
+            avatar(11),
+            Some("https://i.oneme.ru/c"),
+            "not the member's photo"
+        );
+        assert_eq!(avatar(12), None, "Saved messages has no photo");
+
+        // A peer learned later through CONTACT_INFO brings the photo with the title.
+        let mut names = Names::from_login(&login_with(vec![]));
+        assert_eq!(names.chat_row(&dialog).avatar, None);
+        names.add(&[with_photo(2, "Анна", "https://i.oneme.ru/a")]);
+        assert_eq!(
+            names.titles(&[(10, 2)]),
+            [ChatTitle {
+                chat_id: 10,
+                title: "Анна".into(),
+                avatar: Some("https://i.oneme.ru/a".into())
+            }]
+        );
+        assert_eq!(
+            names.contact_rows(&[(10, 2)])[0].avatar.as_deref(),
+            Some("https://i.oneme.ru/a")
+        );
     }
 
     #[test]
@@ -1939,7 +2091,12 @@ mod tests {
         assert_eq!(names.missing([7, 1, 7, 0]), [7]);
         assert!(names.titles(&peers).is_empty());
         names.add(&[contact(7, "Борис")]);
-        assert_eq!(names.titles(&peers), [(10, "Борис".to_string())]);
+        let titles: Vec<(i64, String)> = names
+            .titles(&peers)
+            .into_iter()
+            .map(|t| (t.chat_id, t.title))
+            .collect();
+        assert_eq!(titles, [(10, "Борис".to_string())]);
         assert!(names.missing([7]).is_empty());
     }
 

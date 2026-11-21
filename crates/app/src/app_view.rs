@@ -342,6 +342,8 @@ pub struct AppView {
     typing_sent: Option<(i64, std::time::Instant)>,
     /// Reply or edit in the open chat's composer.
     compose: Option<Compose>,
+    /// The message row whose right-click menu is open (its element key), kept tinted.
+    menu_row: Option<u64>,
     /// The section picked on the navigation rail.
     section: Section,
     /// The open settings page.
@@ -414,6 +416,7 @@ impl AppView {
             typing: HashMap::new(),
             typing_sent: None,
             compose: None,
+            menu_row: None,
             section: Section::Chats,
             settings_page: SettingsPage::Account,
             ui,
@@ -1180,6 +1183,7 @@ impl AppView {
             self.composer
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
+        self.menu_row = None;
         self.compose = Some(Compose::Reply {
             quote: quote_of(m, chat_title),
         });
@@ -1192,6 +1196,7 @@ impl AppView {
         let text = m.text.clone();
         self.composer
             .update(cx, |input, cx| input.set_value(text.clone(), window, cx));
+        self.menu_row = None;
         self.compose = Some(Compose::Edit {
             message_id: m.id,
             original: text,
@@ -1694,7 +1699,7 @@ impl AppView {
         chat_title: &str,
         peer_mark: i64,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> AnyElement {
         // Photos and videos go into one grid; files and stickers follow it one by one.
         let media: Vec<&Attachment> = m
             .attachments
@@ -1799,14 +1804,27 @@ impl AppView {
             )));
         let key =
             u64::from_ne_bytes(if m.id != 0 { m.id } else { m.cid.unwrap_or(0) }.to_ne_bytes());
-        let bubble = bubble
-            .id(("bubble", key))
-            .context_menu(self.message_menu(chat_id, m, chat_title, cx));
+        // The row under the mouse, and the row whose menu is open, are tinted across the width.
+        let highlight = cx.theme().foreground.opacity(0.06);
+        let menu_open = self.menu_row == Some(key);
         h_flex()
             .id(("msg", key))
             .w_full()
+            .px_4()
+            .py_1()
             .when(m.out, |this| this.justify_end())
+            .when(menu_open, |this| this.bg(highlight))
+            .hover(move |this| this.bg(highlight))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.menu_row = Some(key);
+                    cx.notify();
+                }),
+            )
             .child(bubble)
+            .context_menu(self.message_menu(chat_id, m, chat_title, cx))
+            .into_any_element()
     }
 
     /// The right-click menu of a message: reply, copy text, edit our own, delete. A message
@@ -1844,6 +1862,7 @@ impl AppView {
                         .on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                             let _ = view.update(cx, |this, cx| {
+                                this.menu_row = None;
                                 if let Screen::Main { status, .. } = &mut this.screen {
                                     *status = Some("Текст скопирован".into());
                                 }
@@ -1888,6 +1907,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.menu_row = None;
         let view = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
             let delete = |for_me: bool| {
@@ -2004,9 +2024,18 @@ impl AppView {
                             this.load_older(chat_id, cx);
                         }
                     }))
-                    .px_4()
+                    // Rows span the full width so a highlighted row reads as one line.
                     .py_3()
-                    .gap_2()
+                    .gap_0p5()
+                    // A left click anywhere closes a right-click menu; drop its row's highlight.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            if this.menu_row.take().is_some() {
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .when(older_state.is_some(), |this| {
                         let loading = older_state == Some(true);
                         this.child(

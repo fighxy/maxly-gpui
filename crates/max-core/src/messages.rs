@@ -1,4 +1,4 @@
-//! Chat history, sending text, and new-message pushes.
+//! Chat history, sending, editing and deleting text, replies, and new-message pushes.
 //!
 //! Layouts from `core.dll` ([`max_proto::schema`]). The history request values (`from` = now,
 //! `backward` = 40, `forward` = 0, both window times 0) match PyMax and the shape of
@@ -10,8 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use max_proto::Opcode;
 use max_proto::schema::packets::chat::chat_history;
 use max_proto::schema::packets::events::notification_message_data;
-use max_proto::schema::packets::messaging::send;
+use max_proto::schema::packets::messaging::{delete, edit, send};
 use max_proto::schema::types::OutgoingMessage;
+use max_proto::schema::types::outgoing_message::OutgoingMessageLink;
 use max_transport::{Response, Transport};
 
 use crate::Result;
@@ -57,13 +58,20 @@ pub async fn history(
     Ok(messages)
 }
 
+/// `MessageLink` type of a reply (a `core.dll` string; PyMax sends it with `messageId` only).
+pub const LINK_REPLY: &str = "REPLY";
+/// `MessageLink` type of a forwarded message (a `core.dll` string).
+pub const LINK_FORWARD: &str = "FORWARD";
+
 /// Send a text message. `cid` is the client's id for the message, echoed back so the pending
-/// copy can be matched; the current time in ms is a unique enough choice.
+/// copy can be matched; the current time in ms is a unique enough choice. `reply_to` is the id
+/// of the message in the same chat this one answers (`link` of type `REPLY`).
 pub async fn send_text(
     transport: &Transport,
     chat_id: i64,
     text: &str,
     cid: i64,
+    reply_to: Option<i64>,
 ) -> Result<SendResponse> {
     let params = send::Parameters {
         chat_id: Some(chat_id),
@@ -71,11 +79,60 @@ pub async fn send_text(
         message: OutgoingMessage {
             cid: Some(cid),
             text: Some(text.to_string()),
+            link: reply_to.map(|message_id| OutgoingMessageLink {
+                type_: LINK_REPLY.to_string(),
+                message_id,
+                ..OutgoingMessageLink::default()
+            }),
             ..OutgoingMessage::default()
         },
         ..send::Parameters::default()
     };
     Ok(transport.call(Opcode::MessagingSend, &params).await?)
+}
+
+/// Replace the text of our message (`MSG_EDIT`); the answer is the stored message. Only `text`
+/// is sent: leaving out `elements` and `attachments` is meant to keep them as they are
+/// (unverified on the real server).
+pub async fn edit_text(
+    transport: &Transport,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) -> Result<Message> {
+    let params = edit::Parameters {
+        chat_id,
+        message_id,
+        text: Some(text.to_string()),
+        ..edit::Parameters::default()
+    };
+    let r: edit::Response = transport.call(Opcode::MessagingEdit, &params).await?;
+    Ok(r.message)
+}
+
+/// Delete messages of a chat (`MSG_DELETE`): for everyone, or only for us with `for_me`.
+/// Returns the ids the server deleted; the ones it lists as failed are left out.
+pub async fn delete(
+    transport: &Transport,
+    chat_id: i64,
+    message_ids: &[i64],
+    for_me: bool,
+) -> Result<Vec<i64>> {
+    let params = delete::Parameters {
+        chat_id,
+        message_ids: message_ids.to_vec(),
+        for_me: Some(for_me),
+        ..delete::Parameters::default()
+    };
+    let r: delete::Response = transport.call(Opcode::MessagingDelete, &params).await?;
+    let failed = r.failed_message_ids.unwrap_or_default();
+    // An answer without ids is taken as "done as asked".
+    let done = if r.message_ids.is_empty() {
+        message_ids.to_vec()
+    } else {
+        r.message_ids
+    };
+    Ok(done.into_iter().filter(|id| !failed.contains(id)).collect())
 }
 
 /// The new message in a push, if it is a `NOTIF_MESSAGE`.

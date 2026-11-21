@@ -92,6 +92,8 @@ pub enum UiEvent {
     PeerRead { chat_id: i64, mark: i64 },
     /// A chat changed or was added.
     ChatChanged(ChatRow),
+    /// The people we know, for the contacts section.
+    Contacts(Vec<ContactRow>),
     /// Something failed; shown with a way to start over.
     Error(String),
 }
@@ -113,11 +115,25 @@ pub enum UiCommand {
     Password(String),
     /// Load the history of a chat.
     OpenChat(i64),
-    /// Send text to a chat; `cid` identifies the pending copy the UI already shows.
+    /// Send text to a chat; `cid` identifies the pending copy the UI already shows, `reply_to`
+    /// the message it answers.
     SendText {
         chat_id: i64,
         text: String,
         cid: i64,
+        reply_to: Option<i64>,
+    },
+    /// Replace the text of our message.
+    EditText {
+        chat_id: i64,
+        message_id: i64,
+        text: String,
+    },
+    /// Delete messages, for everyone or only for us.
+    Delete {
+        chat_id: i64,
+        ids: Vec<i64>,
+        for_me: bool,
     },
     /// Load an image for display.
     FetchImage(String),
@@ -183,9 +199,10 @@ fn session_rows(list: &[max_core::account::SessionInfo]) -> Vec<SessionRow> {
 }
 
 /// Delivery state of a message in the history view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Delivery {
     /// On the server.
+    #[default]
     Sent,
     /// Sent by us, no answer yet.
     Pending,
@@ -193,8 +210,19 @@ pub enum Delivery {
     Failed,
 }
 
+/// The message a reply answers, as shown above the reply's text.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Quote {
+    /// Server id of the quoted message.
+    pub id: i64,
+    /// Its sender's name (empty for channel posts).
+    pub sender: String,
+    /// Its text on one line, or what is attached.
+    pub text: String,
+}
+
 /// One message as the history view shows it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct MessageRow {
     /// Server id (0 while pending).
     pub id: i64,
@@ -214,6 +242,10 @@ pub struct MessageRow {
     pub attachments: Vec<Attachment>,
     /// Edited after sending.
     pub edited: bool,
+    /// The message this one answers.
+    pub reply: Option<Quote>,
+    /// Forwarded: the original author or channel; text and attachments are the original's.
+    pub forwarded: Option<String>,
 }
 
 impl MessageRow {
@@ -232,6 +264,17 @@ impl MessageRow {
             })
             .unwrap_or_default()
     }
+}
+
+/// One person in the contacts section.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContactRow {
+    /// User id.
+    pub id: i64,
+    /// Display name.
+    pub name: String,
+    /// Our dialog with them, if one is in the chat list.
+    pub chat_id: Option<i64>,
 }
 
 /// One row of the chat list.
@@ -397,6 +440,7 @@ async fn demo_flow(
             }
             UiCommand::Code(_) | UiCommand::Password(_) => break,
             UiCommand::OpenChat(_) | UiCommand::SendText { .. } => {}
+            UiCommand::EditText { .. } | UiCommand::Delete { .. } => {}
             UiCommand::LoadOlder { .. } | UiCommand::MarkRead { .. } => {}
             UiCommand::LoadSessions | UiCommand::CloseOtherSessions | UiCommand::Logout => {}
             UiCommand::Typing { .. } => {}
@@ -434,6 +478,23 @@ async fn demo_flow(
         me: "Демо-режим".into(),
         chats,
     });
+    let contacts = [
+        ("Анна Смирнова", Some(1)),
+        ("Иван Петров", None),
+        ("Мария Ковалёва", None),
+        ("Пётр", Some(5)),
+    ];
+    let _ = ui.send(UiEvent::Contacts(
+        contacts
+            .iter()
+            .enumerate()
+            .map(|(i, (name, chat_id))| ContactRow {
+                id: 100 + i as i64,
+                name: (*name).into(),
+                chat_id: *chat_id,
+            })
+            .collect(),
+    ));
     if walk {
         tokio::time::sleep(Duration::from_millis(800)).await;
         let _ = ui.send(UiEvent::History {
@@ -474,7 +535,29 @@ async fn demo_flow(
                     has_more,
                 });
             }
-            UiCommand::SendText { chat_id, text, cid } => {
+            UiCommand::EditText {
+                chat_id,
+                message_id,
+                text,
+            } => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let mut row = demo_row(message_id, true, &text, now_ms(), Delivery::Sent);
+                row.cid = None;
+                row.edited = true;
+                // The demo does not keep times: the UI keeps the original one.
+                row.time = 0;
+                let _ = ui.send(UiEvent::MessageEdited {
+                    chat_id,
+                    message: row,
+                });
+            }
+            UiCommand::Delete { chat_id, ids, .. } => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ = ui.send(UiEvent::MessagesDeleted { chat_id, ids });
+            }
+            UiCommand::SendText {
+                chat_id, text, cid, ..
+            } => {
                 let ui = ui.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -612,8 +695,7 @@ fn demo_row(id: i64, out: bool, text: &str, time: i64, delivery: Delivery) -> Me
         text: text.into(),
         time,
         delivery,
-        edited: false,
-        attachments: Vec::new(),
+        ..MessageRow::default()
     }
 }
 
@@ -666,6 +748,7 @@ fn demo_history(chat_id: i64, now: i64) -> Vec<MessageRow> {
         (false, "Давай с утра, часов в 10", 60),
         (true, "Договорились", 58),
         (false, "Вот место, где встретимся", 20),
+        (false, "Электрички в субботу: 9:12, 9:47, 10:20", 12),
         (false, "До завтра! 👋", 5),
     ];
     lines
@@ -680,6 +763,16 @@ fn demo_history(chat_id: i64, now: i64) -> Vec<MessageRow> {
                 Delivery::Sent,
             );
             row.cid = None;
+            if i == 2 {
+                row.reply = Some(Quote {
+                    id: chat_id * 100 + 1,
+                    sender: "Вы".into(),
+                    text: "Привет, да. Во сколько удобно?".into(),
+                });
+            }
+            if i == 5 {
+                row.forwarded = Some("Пригородные поезда".into());
+            }
             if i == 4 {
                 row.attachments = vec![Attachment::Photo {
                     photo_id: None,
@@ -764,10 +857,14 @@ async fn run_logged_in(
                         tokio::spawn(async move {
                             if let Ok(t) = handle.transport() {
                                 resolve_names(&t, &names, peers.iter().map(|p| p.1)).await;
-                                let titles = names.read().unwrap_or_else(PoisonError::into_inner).titles(&peers);
+                                let (titles, contacts) = {
+                                    let names = names.read().unwrap_or_else(PoisonError::into_inner);
+                                    (names.titles(&peers), names.contact_rows(&peers))
+                                };
                                 if !titles.is_empty() {
                                     let _ = ui.send(UiEvent::ChatTitles(titles));
                                 }
+                                let _ = ui.send(UiEvent::Contacts(contacts));
                             }
                         });
                         UiEvent::LoggedIn { me, chats }
@@ -856,7 +953,7 @@ async fn run_logged_in(
                             let result = async {
                                 let t = handle.transport()?;
                                 let list = messages::history(&t, chat_id, now_ms(), messages::HISTORY_PAGE).await?;
-                                resolve_names(&t, &names, list.iter().filter_map(|m| m.sender)).await;
+                                resolve_names(&t, &names, list.iter().flat_map(sender_ids)).await;
                                 Ok::<_, CoreError>(list)
                             }
                             .await;
@@ -875,7 +972,7 @@ async fn run_logged_in(
                             let result = async {
                                 let t = handle.transport()?;
                                 let list = messages::history(&t, chat_id, before, messages::HISTORY_PAGE).await?;
-                                resolve_names(&t, &names, list.iter().filter_map(|m| m.sender)).await;
+                                resolve_names(&t, &names, list.iter().flat_map(sender_ids)).await;
                                 Ok::<_, CoreError>(list)
                             }
                             .await;
@@ -899,10 +996,10 @@ async fn run_logged_in(
                             }
                         });
                     }
-                    UiCommand::SendText { chat_id, text, cid } => {
+                    UiCommand::SendText { chat_id, text, cid, reply_to } => {
                         tokio::spawn(async move {
                             let result = match handle.transport() {
-                                Ok(t) => messages::send_text(&t, chat_id, &text, cid).await,
+                                Ok(t) => messages::send_text(&t, chat_id, &text, cid, reply_to).await,
                                 Err(e) => Err(e),
                             };
                             let _ = ui.send(match result {
@@ -914,6 +1011,43 @@ async fn run_logged_in(
                                 }
                                 Err(e) => UiEvent::SendFailed { chat_id, cid, error: message(&e) },
                             });
+                        });
+                    }
+                    UiCommand::EditText { chat_id, message_id, text } => {
+                        tokio::spawn(async move {
+                            let result = match handle.transport() {
+                                Ok(t) => messages::edit_text(&t, chat_id, message_id, &text).await,
+                                Err(e) => Err(e),
+                            };
+                            let _ = ui.send(match result {
+                                Ok(stored) => {
+                                    let names = names.read().unwrap_or_else(PoisonError::into_inner);
+                                    let mut row = names.row(&stored);
+                                    // The answer may leave out the status of a fresh edit.
+                                    row.edited = true;
+                                    UiEvent::MessageEdited { chat_id, message: row }
+                                }
+                                Err(e) => UiEvent::Notice(format!("Не удалось изменить сообщение: {}", message(&e))),
+                            });
+                        });
+                    }
+                    UiCommand::Delete { chat_id, ids, for_me } => {
+                        tokio::spawn(async move {
+                            let result = match handle.transport() {
+                                Ok(t) => messages::delete(&t, chat_id, &ids, for_me).await,
+                                Err(e) => Err(e),
+                            };
+                            match result {
+                                Ok(done) => {
+                                    if done.len() < ids.len() {
+                                        let _ = ui.send(UiEvent::Notice("Не все сообщения удалось удалить".into()));
+                                    }
+                                    let _ = ui.send(UiEvent::MessagesDeleted { chat_id, ids: done });
+                                }
+                                Err(e) => {
+                                    let _ = ui.send(UiEvent::Notice(format!("Не удалось удалить: {}", message(&e))));
+                                }
+                            }
                         });
                     }
                     UiCommand::LoadSessions => {
@@ -1108,6 +1242,23 @@ impl Names {
         }
     }
 
+    /// Everyone we know a name for except ourselves, by name; `peers` (chat id, peer id) gives
+    /// the dialog to open for a contact.
+    pub fn contact_rows(&self, peers: &[(i64, i64)]) -> Vec<ContactRow> {
+        let mut rows: Vec<ContactRow> = self
+            .contacts
+            .iter()
+            .filter(|(id, _)| **id != self.me)
+            .map(|(id, name)| ContactRow {
+                id: *id,
+                name: name.clone(),
+                chat_id: peers.iter().find(|(_, p)| p == id).map(|(c, _)| *c),
+            })
+            .collect();
+        rows.sort_by_key(|r| r.name.to_lowercase());
+        rows
+    }
+
     /// Known titles for dialogs given as (chat id, peer id).
     pub fn titles(&self, peers: &[(i64, i64)]) -> Vec<(i64, String)> {
         peers
@@ -1165,25 +1316,67 @@ impl Names {
         chat_row_with(chat, self.me, title)
     }
 
-    /// A history row for a message. Channel posts have no sender: not ours, no name.
+    /// A history row for a message. Channel posts have no sender: not ours, no name. A
+    /// forwarded message shows the original's text and attachments; a reply quotes the message
+    /// it answers.
     pub fn row(&self, m: &messages::Message) -> MessageRow {
+        let link = m.link.as_deref();
+        let forward = link.filter(|l| l.type_ == messages::LINK_FORWARD);
+        let reply = link.filter(|l| l.type_ == messages::LINK_REPLY);
+        let (text, attachments) = match forward {
+            Some(l) => {
+                let texts = [bubble_text(m), bubble_text(&l.message)];
+                let text = texts
+                    .into_iter()
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let mut attachments = media::attachments(m);
+                attachments.extend(media::attachments(&l.message));
+                (text, attachments)
+            }
+            None => (bubble_text(m), media::attachments(m)),
+        };
         MessageRow {
             id: m.id,
             cid: m.cid,
             out: m.sender == Some(self.me),
-            sender: m.sender.map_or_else(String::new, |id| {
-                self.contacts
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("id {id}"))
-            }),
-            text: bubble_text(m),
+            sender: self.name(m.sender),
+            text,
             time: m.time,
             delivery: Delivery::Sent,
-            attachments: media::attachments(m),
+            attachments,
             edited: m.status.as_deref() == Some(max_core::events::EDITED),
+            reply: reply.map(|l| Quote {
+                id: l.message.id,
+                sender: self.name(l.message.sender),
+                text: one_line(&message_text(&l.message)),
+            }),
+            forwarded: forward.map(|l| {
+                l.chat_name
+                    .clone()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| self.name(l.message.sender))
+            }),
         }
     }
+
+    /// A sender's name: empty for none (channel posts), the id while it is unknown.
+    fn name(&self, id: Option<i64>) -> String {
+        id.map_or_else(String::new, |id| {
+            self.contacts
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("id {id}"))
+        })
+    }
+}
+
+/// Everyone a message row names: the sender and the author of a quoted or forwarded message.
+pub fn sender_ids(m: &messages::Message) -> impl Iterator<Item = i64> + '_ {
+    m.sender
+        .into_iter()
+        .chain(m.link.as_ref().and_then(|l| l.message.sender))
 }
 
 /// What an attachment kind is called in the chat list and history.
@@ -1220,9 +1413,17 @@ pub fn bubble_text(m: &messages::Message) -> String {
     }
 }
 
-/// The text of a message, or what its attachments are.
+/// The text of a message, or what its attachments are; a forwarded message without its own
+/// text gives the original's.
 pub fn message_text(m: &messages::Message) -> String {
     let text = m.text.clone().unwrap_or_default();
+    if text.is_empty()
+        && m.attaches.as_ref().is_none_or(Vec::is_empty)
+        && let Some(l) = m.link.as_deref()
+        && l.type_ == messages::LINK_FORWARD
+    {
+        return message_text(&l.message);
+    }
     let attaches: Vec<&'static str> = m
         .attaches
         .iter()
@@ -1633,6 +1834,72 @@ mod tests {
             chats,
             ..LoginResponse::default()
         }
+    }
+
+    #[test]
+    fn replies_quote_and_forwards_show_the_original() {
+        use max_proto::schema::types::MessageLink;
+        let mut names = Names::from_login(&login_with(vec![]));
+        names.add(&[contact(7, "Анна")]);
+        let inner = |sender: Option<i64>, text: &str| Message {
+            id: 5,
+            sender,
+            text: Some(text.into()),
+            ..Message::default()
+        };
+        let linked = |kind: &str, link_msg: Message, chat_name: Option<&str>| Message {
+            id: 6,
+            sender: Some(1),
+            text: Some(if kind == "REPLY" {
+                "ответ".into()
+            } else {
+                String::new()
+            }),
+            link: Some(Box::new(MessageLink {
+                type_: kind.into(),
+                chat_name: chat_name.map(Into::into),
+                message: Box::new(link_msg),
+                ..MessageLink::default()
+            })),
+            ..Message::default()
+        };
+        let reply = names.row(&linked(
+            "REPLY",
+            inner(Some(7), "вопрос\nв две строки"),
+            None,
+        ));
+        assert_eq!(reply.text, "ответ");
+        assert_eq!(
+            reply.reply,
+            Some(Quote {
+                id: 5,
+                sender: "Анна".into(),
+                text: "вопрос в две строки".into()
+            })
+        );
+        assert!(reply.forwarded.is_none());
+
+        let fwd = linked("FORWARD", inner(Some(7), "новость"), None);
+        let row = names.row(&fwd);
+        assert_eq!(
+            (row.text.as_str(), row.forwarded.as_deref()),
+            ("новость", Some("Анна"))
+        );
+        assert_eq!(message_text(&fwd), "новость", "chat list preview");
+        let from_channel = names.row(&linked("FORWARD", inner(None, "пост"), Some("Канал")));
+        assert_eq!(from_channel.forwarded.as_deref(), Some("Канал"));
+        let ids: Vec<i64> = sender_ids(&fwd).collect();
+        assert_eq!(ids, [1, 7]);
+    }
+
+    #[test]
+    fn contacts_are_sorted_and_find_their_dialog() {
+        let mut names = Names::from_login(&login_with(vec![]));
+        names.add(&[contact(7, "борис"), contact(8, "Анна")]);
+        let rows = names.contact_rows(&[(40, 7)]);
+        let got: Vec<(&str, Option<i64>)> =
+            rows.iter().map(|r| (r.name.as_str(), r.chat_id)).collect();
+        assert_eq!(got, [("Анна", None), ("борис", Some(40))], "us left out");
     }
 
     #[test]

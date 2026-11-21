@@ -13,8 +13,12 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use max_core::media::Attachment;
 
-use crate::backend::{ChatRow, Delivery, MessageRow, SessionRow, UiCommand, UiEvent};
+use crate::backend::{
+    ChatRow, ContactRow, Delivery, MessageRow, Quote, SessionRow, UiCommand, UiEvent, one_line,
+};
 use crate::qr;
+use crate::settings::{FONT_SIZES, ThemeChoice, UiSettings};
+use gpui_kit::assets::IconName as Lucide;
 
 enum Screen {
     Status(String),
@@ -67,6 +71,75 @@ enum AccountAction {
     Logout,
 }
 
+/// A section of the navigation rail.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Chats,
+    Calls,
+    Contacts,
+    Settings,
+}
+
+/// A page of the settings section.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    /// Who we are, sessions, logout.
+    Account,
+    /// Theme and font size.
+    Appearance,
+    /// Where files and the profile are kept.
+    Data,
+    /// Version and what the client does not send.
+    About,
+}
+
+impl SettingsPage {
+    const ALL: [SettingsPage; 4] = [
+        SettingsPage::Account,
+        SettingsPage::Appearance,
+        SettingsPage::Data,
+        SettingsPage::About,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            SettingsPage::Account => "Аккаунт и устройства",
+            SettingsPage::Appearance => "Оформление",
+            SettingsPage::Data => "Данные и память",
+            SettingsPage::About => "О программе",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            SettingsPage::Account => Icon::new(Lucide::Laptop),
+            SettingsPage::Appearance => Icon::new(IconName::Palette),
+            SettingsPage::Data => Icon::new(IconName::HardDrive),
+            SettingsPage::About => Icon::new(IconName::Info),
+        }
+    }
+}
+
+/// Apply the theme and font size to the app.
+fn apply_ui(ui: &UiSettings, window: &mut Window, cx: &mut App) {
+    match ui.theme {
+        ThemeChoice::System => Theme::sync_system_appearance(Some(window), cx),
+        ThemeChoice::Light => Theme::change(ThemeMode::Light, Some(window), cx),
+        ThemeChoice::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
+    }
+    Theme::global_mut(cx).font_size = px(f32::from(ui.font_size));
+    window.refresh();
+}
+
+/// What the composer does besides writing a new message.
+#[derive(Clone)]
+enum Compose {
+    /// The next message answers `quote`.
+    Reply { quote: Quote },
+    /// The composer holds the text of our message `message_id`.
+    Edit { message_id: i64, original: String },
+}
+
 /// The messages of one chat as far as they are loaded.
 #[derive(Default)]
 struct History {
@@ -104,14 +177,18 @@ impl History {
         (newest != self.marked).then_some(newest)
     }
 
-    /// Add a message, or replace our pending copy with the same `cid`; skip known ids.
-    fn add(&mut self, message: MessageRow) {
+    /// Add a message, or replace our pending copy with the same `cid`; skip known ids. A
+    /// confirmed reply keeps the pending copy's quote if the server's copy has none.
+    fn add(&mut self, mut message: MessageRow) {
         if let Some(cid) = message.cid
             && let Some(pending) = self
                 .messages
                 .iter_mut()
                 .find(|m| m.out && m.cid == Some(cid))
         {
+            if message.reply.is_none() {
+                message.reply = pending.reply.take();
+            }
             *pending = message;
             return;
         }
@@ -119,6 +196,57 @@ impl History {
             return;
         }
         self.messages.push(message);
+    }
+
+    /// Put an edited copy in place of a known message. What the copy leaves out (time, quote,
+    /// forward, attachments, cid) is kept from the shown one: our edits change text only.
+    fn edit(&mut self, mut new: MessageRow) {
+        let Some(old) = self.messages.iter_mut().find(|m| m.id == new.id) else {
+            return;
+        };
+        if new.time == 0 {
+            new.time = old.time;
+        }
+        if new.reply.is_none() {
+            new.reply = old.reply.take();
+        }
+        if new.forwarded.is_none() {
+            new.forwarded = old.forwarded.take();
+        }
+        if new.attachments.is_empty() {
+            new.attachments = std::mem::take(&mut old.attachments);
+        }
+        new.cid = new.cid.or(old.cid);
+        *old = new;
+    }
+}
+
+/// Our message whose text can be edited: sent, not forwarded, with text and no attachment that
+/// adds a label to it.
+fn editable(m: &MessageRow) -> bool {
+    m.out
+        && m.id != 0
+        && m.delivery == Delivery::Sent
+        && m.forwarded.is_none()
+        && !m.text.is_empty()
+        && m.attachments
+            .iter()
+            .all(|a| matches!(a, Attachment::Photo { .. } | Attachment::File { .. }))
+}
+
+/// A quote of `m` for a reply; `chat_title` names the sender of dialogs and channel posts.
+fn quote_of(m: &MessageRow, chat_title: &str) -> Quote {
+    let sender = if m.out {
+        "Вы".to_string()
+    } else if m.sender.is_empty() {
+        chat_title.to_string()
+    } else {
+        m.sender.clone()
+    };
+    Quote {
+        id: m.id,
+        sender,
+        text: m.preview(),
     }
 }
 
@@ -206,6 +334,22 @@ pub struct AppView {
     typing: HashMap<i64, (String, std::time::Instant)>,
     /// The last typing notice we sent: chat and time.
     typing_sent: Option<(i64, std::time::Instant)>,
+    /// Reply or edit in the open chat's composer.
+    compose: Option<Compose>,
+    /// The message under the mouse, whose actions are shown.
+    hovered: Option<i64>,
+    /// The message whose delete choice is shown.
+    confirm_delete: Option<i64>,
+    /// The section picked on the navigation rail.
+    section: Section,
+    /// The open settings page.
+    settings_page: SettingsPage,
+    /// Theme and font size.
+    ui: UiSettings,
+    /// People for the contacts section.
+    contacts: Vec<ContactRow>,
+    /// The contact whose card is shown.
+    contact_selected: Option<i64>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -225,15 +369,25 @@ impl AppView {
                 .placeholder("Пароль")
         });
         let composer = cx.new(|cx| InputState::new(window, cx).placeholder("Сообщение"));
-        let subscriptions = vec![cx.subscribe_in(
-            &composer,
-            window,
-            |this, _, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { .. } => this.send_message(window, cx),
-                InputEvent::Change => this.composer_changed(cx),
-                _ => {}
-            },
-        )];
+        let subscriptions = vec![
+            cx.subscribe_in(
+                &composer,
+                window,
+                |this, _, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::PressEnter { .. } => this.send_message(window, cx),
+                    InputEvent::Change => this.composer_changed(cx),
+                    _ => {}
+                },
+            ),
+            // "Как в системе" follows Windows switching between light and dark.
+            cx.observe_window_appearance(window, |this, window, cx| {
+                if this.ui.theme == ThemeChoice::System {
+                    apply_ui(&this.ui, window, cx);
+                }
+            }),
+        ];
+        let ui = UiSettings::load();
+        apply_ui(&ui, window, cx);
         cx.spawn(async move |this, cx| {
             while let Some(event) = events.recv().await {
                 if this.update(cx, |view, cx| view.apply(event, cx)).is_err() {
@@ -255,6 +409,14 @@ impl AppView {
             account: None,
             typing: HashMap::new(),
             typing_sent: None,
+            compose: None,
+            hovered: None,
+            confirm_delete: None,
+            section: Section::Chats,
+            settings_page: SettingsPage::Account,
+            ui,
+            contacts: Vec::new(),
+            contact_selected: None,
             _subscriptions: subscriptions,
         }
     }
@@ -347,21 +509,36 @@ impl AppView {
             }
             UiEvent::LoggedOut => {
                 self.account = None;
+                self.section = Section::Chats;
+                self.settings_page = SettingsPage::Account;
+                self.contacts.clear();
+                self.contact_selected = None;
+                self.compose = None;
                 self.histories.clear();
                 self.images.clear();
                 self.screen = Screen::Status("Вы вышли из аккаунта".into());
             }
             UiEvent::MessageEdited { chat_id, message } => {
-                if let Some(h) = self.histories.get_mut(&chat_id)
-                    && let Some(m) = h.messages.iter_mut().find(|m| m.id == message.id)
-                {
-                    *m = message;
+                if let Some(h) = self.histories.get_mut(&chat_id) {
+                    h.edit(message);
                 }
                 self.refresh_preview(chat_id);
             }
             UiEvent::MessagesDeleted { chat_id, ids } => {
                 if let Some(h) = self.histories.get_mut(&chat_id) {
                     h.messages.retain(|m| m.id == 0 || !ids.contains(&m.id));
+                }
+                let gone = |id: i64| ids.contains(&id);
+                if self.confirm_delete.is_some_and(gone) {
+                    self.confirm_delete = None;
+                }
+                if self.hovered.is_some_and(gone) {
+                    self.hovered = None;
+                }
+                if let Some(Compose::Reply { quote }) = &self.compose
+                    && gone(quote.id)
+                {
+                    self.compose = None;
                 }
                 self.refresh_preview(chat_id);
             }
@@ -408,6 +585,9 @@ impl AppView {
                 if let Screen::Main { chats, .. } = &mut self.screen {
                     upsert_chat(chats, new);
                 }
+            }
+            UiEvent::Contacts(rows) => {
+                self.contacts = rows;
             }
             UiEvent::ChatTitles(titles) => {
                 if let Screen::Main { chats, .. } = &mut self.screen {
@@ -518,8 +698,7 @@ impl AppView {
             text: format!("Отправка: {name}"),
             time: cid,
             delivery: Delivery::Pending,
-            edited: false,
-            attachments: Vec::new(),
+            ..MessageRow::default()
         };
         if self
             .commands
@@ -609,8 +788,13 @@ impl AppView {
         else {
             return;
         };
+        if *selected != Some(chat_id) {
+            self.compose = None;
+            self.hovered = None;
+            self.confirm_delete = None;
+        }
         *selected = Some(chat_id);
-        self.account = None;
+        self.section = Section::Chats;
         if let Some(row) = chats.iter_mut().find(|c| c.id == chat_id) {
             row.unread = 0;
         }
@@ -679,6 +863,36 @@ impl AppView {
             self.account = Some(AccountPanel::default());
             cx.notify();
         }
+    }
+
+    /// Switch the rail section; the account page loads the sessions each time it is shown.
+    fn switch_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        self.section = section;
+        self.hovered = None;
+        if section == Section::Settings && self.settings_page == SettingsPage::Account {
+            self.open_account(cx);
+        }
+        cx.notify();
+    }
+
+    fn open_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        self.settings_page = page;
+        if page == SettingsPage::Account {
+            self.open_account(cx);
+        }
+        cx.notify();
+    }
+
+    /// Change and save the interface settings.
+    fn set_ui(&mut self, ui: UiSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.ui = ui;
+        apply_ui(&self.ui, window, cx);
+        if let Err(e) = self.ui.save()
+            && let Screen::Main { status, .. } = &mut self.screen
+        {
+            *status = Some(format!("Настройки не сохранились: {e}"));
+        }
+        cx.notify();
     }
 
     /// First click asks for confirmation, the second one acts.
@@ -776,7 +990,7 @@ impl AppView {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .font_semibold()
-                    .child("Аккаунт"),
+                    .child("Аккаунт и устройства"),
             )
             .child(
                 v_flex()
@@ -902,26 +1116,118 @@ impl AppView {
         if text.is_empty() {
             return;
         }
+        if let Some(Compose::Edit {
+            message_id,
+            original,
+        }) = &self.compose
+        {
+            let (message_id, unchanged) = (*message_id, *original == text);
+            if unchanged
+                || self
+                    .commands
+                    .send(UiCommand::EditText {
+                        chat_id,
+                        message_id,
+                        text,
+                    })
+                    .is_ok()
+            {
+                self.cancel_compose(window, cx);
+            }
+            return;
+        }
+        let quote = match &self.compose {
+            Some(Compose::Reply { quote }) => Some(quote.clone()),
+            _ => None,
+        };
         let cid = jiff::Timestamp::now().as_millisecond();
         let pending = MessageRow {
-            id: 0,
             cid: Some(cid),
             out: true,
-            sender: String::new(),
             text: text.clone(),
             time: cid,
             delivery: Delivery::Pending,
-            edited: false,
-            attachments: Vec::new(),
+            reply: quote.clone(),
+            ..MessageRow::default()
         };
         if self
             .commands
-            .send(UiCommand::SendText { chat_id, text, cid })
+            .send(UiCommand::SendText {
+                chat_id,
+                text,
+                cid,
+                reply_to: quote.map(|q| q.id),
+            })
             .is_ok()
         {
+            self.compose = None;
             self.message_added(chat_id, pending);
             self.composer
                 .update(cx, |input, cx| input.set_value("", window, cx));
+            cx.notify();
+        }
+    }
+
+    /// Answer `m` with the next message.
+    fn start_reply(
+        &mut self,
+        m: &MessageRow,
+        chat_title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.compose, Some(Compose::Edit { .. })) {
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.compose = Some(Compose::Reply {
+            quote: quote_of(m, chat_title),
+        });
+        self.confirm_delete = None;
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    /// Put our message's text into the composer for editing.
+    fn start_edit(&mut self, m: &MessageRow, window: &mut Window, cx: &mut Context<Self>) {
+        let text = m.text.clone();
+        self.composer
+            .update(cx, |input, cx| input.set_value(text.clone(), window, cx));
+        self.compose = Some(Compose::Edit {
+            message_id: m.id,
+            original: text,
+        });
+        self.confirm_delete = None;
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    /// Drop the reply or edit; an edit also takes its text out of the composer.
+    fn cancel_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.compose.take(), Some(Compose::Edit { .. })) {
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.composer.read(cx).focus_handle(cx);
+        handle.focus(window, cx);
+    }
+
+    /// Delete a message after the choice under it.
+    fn delete_message(&mut self, chat_id: i64, id: i64, for_me: bool, cx: &mut Context<Self>) {
+        if self
+            .commands
+            .send(UiCommand::Delete {
+                chat_id,
+                ids: vec![id],
+                for_me,
+            })
+            .is_ok()
+        {
+            self.confirm_delete = None;
             cx.notify();
         }
     }
@@ -1302,7 +1608,7 @@ impl AppView {
         chat_title: &str,
         peer_mark: i64,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> Stateful<Div> {
         let attachments: Vec<AnyElement> = m
             .attachments
             .iter()
@@ -1331,40 +1637,194 @@ impl AppView {
             )
         };
         let show_sender = !m.out && !m.sender.is_empty() && m.sender != chat_title;
-        h_flex()
+        let accent = if m.out { fg } else { cx.theme().primary };
+        let bubble = v_flex()
+            .max_w(px(520.))
+            .px_3()
+            .py_2()
+            .gap_1()
+            .rounded(px(12.))
+            .bg(bg)
+            .text_color(fg)
+            .when(m.delivery == Delivery::Failed, |this| {
+                this.border_1().border_color(cx.theme().danger)
+            })
+            .when(show_sender, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(cx.theme().primary)
+                        .child(m.sender.clone()),
+                )
+            })
+            .when_some(m.forwarded.clone(), |this, from| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .italic()
+                        .text_color(muted)
+                        .child(format!("Переслано от {from}")),
+                )
+            })
+            .when_some(m.reply.clone(), |this, q| {
+                this.child(
+                    v_flex()
+                        .pl_2()
+                        .border_l_2()
+                        .border_color(accent)
+                        .max_w(px(496.))
+                        .child(div().text_xs().font_semibold().text_color(accent).child(
+                            if q.sender.is_empty() {
+                                "Сообщение".to_string()
+                            } else {
+                                q.sender
+                            },
+                        ))
+                        .child(div().text_xs().text_color(muted).truncate().child(q.text)),
+                )
+            })
+            .children(attachments)
+            .when(!m.text.is_empty(), |this| {
+                this.child(div().child(m.text.clone()))
+            })
+            .child(div().text_xs().text_color(muted).child(format!(
+                "{}{}{state}",
+                if m.edited { "изменено · " } else { "" },
+                clock(m.time)
+            )));
+        let actions = self.message_actions(chat_id, m, chat_title, cx);
+        let key = if m.id != 0 { m.id } else { m.cid.unwrap_or(0) };
+        let id = m.id;
+        let row = h_flex()
+            .id(("msg", u64::from_ne_bytes(key.to_ne_bytes())))
             .w_full()
+            .gap_2()
+            .items_center()
             .when(m.out, |this| this.justify_end())
-            .child(
-                v_flex()
-                    .max_w(px(520.))
-                    .px_3()
-                    .py_2()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.hovered = Some(id);
+                } else if this.hovered == Some(id) {
+                    this.hovered = None;
+                }
+                cx.notify();
+            }));
+        if m.out {
+            row.children(actions).child(bubble)
+        } else {
+            row.child(bubble).children(actions)
+        }
+    }
+
+    /// Buttons beside a message: reply, copy, edit and delete while the mouse is over it, or
+    /// the delete choice once asked.
+    fn message_actions(
+        &self,
+        chat_id: i64,
+        m: &MessageRow,
+        chat_title: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if m.id == 0 || m.delivery != Delivery::Sent {
+            return None;
+        }
+        let key = u64::from_ne_bytes(m.id.to_ne_bytes());
+        let id = m.id;
+        if self.confirm_delete == Some(id) {
+            return Some(
+                h_flex()
                     .gap_1()
-                    .rounded(px(12.))
-                    .bg(bg)
-                    .text_color(fg)
-                    .when(m.delivery == Delivery::Failed, |this| {
-                        this.border_1().border_color(cx.theme().danger)
-                    })
-                    .when(show_sender, |this| {
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Удалить?"),
+                    )
+                    .when(m.out, |this| {
                         this.child(
-                            div()
-                                .text_xs()
-                                .font_semibold()
-                                .text_color(cx.theme().primary)
-                                .child(m.sender.clone()),
+                            Button::new(("del-all", key))
+                                .small()
+                                .danger()
+                                .label("У всех")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.delete_message(chat_id, id, false, cx)
+                                })),
                         )
                     })
-                    .children(attachments)
-                    .when(!m.text.is_empty(), |this| {
-                        this.child(div().child(m.text.clone()))
-                    })
-                    .child(div().text_xs().text_color(muted).child(format!(
-                        "{}{}{state}",
-                        if m.edited { "изменено · " } else { "" },
-                        clock(m.time)
-                    ))),
-            )
+                    .child(
+                        Button::new(("del-me", key))
+                            .small()
+                            .warning()
+                            .label("У меня")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.delete_message(chat_id, id, true, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(("del-cancel", key))
+                            .small()
+                            .ghost()
+                            .label("Отмена")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_delete = None;
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if self.hovered != Some(id) {
+            return None;
+        }
+        let (row, title) = (m.clone(), chat_title.to_string());
+        let reply = Button::new(("reply", key))
+            .small()
+            .ghost()
+            .label("Ответить")
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.start_reply(&row, &title, window, cx)),
+            );
+        let text = m.text.clone();
+        let copy = (!text.is_empty()).then(|| {
+            Button::new(("copy", key))
+                .small()
+                .ghost()
+                .label("Копировать")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    if let Screen::Main { status, .. } = &mut this.screen {
+                        *status = Some("Текст скопирован".into());
+                    }
+                    cx.notify();
+                }))
+        });
+        let row = m.clone();
+        let edit = editable(m).then(|| {
+            Button::new(("edit", key))
+                .small()
+                .ghost()
+                .label("Изменить")
+                .on_click(cx.listener(move |this, _, window, cx| this.start_edit(&row, window, cx)))
+        });
+        let delete = Button::new(("delete", key))
+            .small()
+            .ghost()
+            .label("Удалить")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.confirm_delete = Some(id);
+                cx.notify();
+            }));
+        Some(
+            h_flex()
+                .gap_0p5()
+                .child(reply)
+                .children(copy)
+                .children(edit)
+                .child(delete)
+                .into_any_element(),
+        )
     }
 
     fn render_chat(&self, chat: &ChatRow, cx: &mut Context<Self>) -> Div {
@@ -1471,23 +1931,96 @@ impl AppView {
                     .children(items),
             )
             .child(
-                h_flex()
-                    .gap_2()
-                    .px_4()
-                    .py_3()
+                v_flex()
                     .border_t_1()
                     .border_color(cx.theme().border)
+                    .children(self.compose_bar(cx))
                     .child(
-                        Button::new("attach")
-                            .ghost()
-                            .label("📎")
-                            .on_click(cx.listener(|this, _, _, cx| this.pick_file(cx))),
-                    )
-                    .child(div().flex_1().child(Input::new(&self.composer)))
-                    .child(Button::new("send").primary().label("Отправить").on_click(
-                        cx.listener(|this, _, window, cx| this.send_message(window, cx)),
-                    )),
+                        h_flex()
+                            .gap_2()
+                            .px_4()
+                            .py_3()
+                            .child(
+                                Button::new("attach")
+                                    .ghost()
+                                    .label("📎")
+                                    .disabled(matches!(self.compose, Some(Compose::Edit { .. })))
+                                    .on_click(cx.listener(|this, _, _, cx| this.pick_file(cx))),
+                            )
+                            .child(div().flex_1().child(Input::new(&self.composer)))
+                            .child(
+                                Button::new("send")
+                                    .primary()
+                                    .label(if matches!(self.compose, Some(Compose::Edit { .. })) {
+                                        "Сохранить"
+                                    } else {
+                                        "Отправить"
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.send_message(window, cx)
+                                    })),
+                            ),
+                    ),
             )
+    }
+
+    /// The line above the composer while replying or editing, with a button to drop it.
+    fn compose_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let (title, body) = match self.compose.as_ref()? {
+            Compose::Reply { quote } => (
+                if quote.sender.is_empty() {
+                    "Ответ".to_string()
+                } else {
+                    format!("Ответ: {}", quote.sender)
+                },
+                quote.text.clone(),
+            ),
+            Compose::Edit { original, .. } => {
+                ("Изменение сообщения".to_string(), one_line(original))
+            }
+        };
+        Some(
+            h_flex()
+                .gap_3()
+                .px_4()
+                .pt_2()
+                .items_center()
+                .child(
+                    div()
+                        .w(px(3.))
+                        .h(px(32.))
+                        .rounded(px(2.))
+                        .bg(cx.theme().primary),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(cx.theme().primary)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .truncate()
+                                .child(body),
+                        ),
+                )
+                .child(
+                    Button::new("compose-cancel")
+                        .ghost()
+                        .small()
+                        .label("✕")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.cancel_compose(window, cx)),
+                        ),
+                ),
+        )
     }
 
     fn render_main(
@@ -1498,18 +2031,36 @@ impl AppView {
         status: &Option<String>,
         cx: &mut Context<Self>,
     ) -> Div {
-        let list = v_flex()
-            .id("chat-list")
-            .flex_1()
-            .overflow_y_scroll()
-            .p_2()
-            .gap_1()
-            .children(chats.iter().map(|row| {
-                let typing = self.typing_label(row);
-                Self::chat_row(row, selected == Some(row.id), typing, cx)
-            }));
+        let unread: i32 = chats.iter().map(|c| c.unread.max(0)).sum();
+        let (title, list): (&str, AnyElement) = match self.section {
+            Section::Chats => (
+                "Чаты",
+                v_flex()
+                    .id("chat-list")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .p_2()
+                    .gap_1()
+                    .children(chats.iter().map(|row| {
+                        let typing = self.typing_label(row);
+                        Self::chat_row(row, selected == Some(row.id), typing, cx)
+                    }))
+                    .into_any_element(),
+            ),
+            Section::Contacts => ("Контакты", self.contact_list(cx).into_any_element()),
+            Section::Calls => (
+                "Звонки",
+                div()
+                    .p_4()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Здесь будет история звонков.")
+                    .into_any_element(),
+            ),
+            Section::Settings => ("Настройки", self.settings_list(cx).into_any_element()),
+        };
         let sidebar = v_flex()
-            .w(px(340.))
+            .w(px(320.))
             .h_full()
             .flex_shrink_0()
             .border_r_1()
@@ -1522,18 +2073,7 @@ impl AppView {
                     .gap_1()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .child(div().font_semibold().child("Чаты"))
-                            .child(
-                                Button::new("account-open")
-                                    .ghost()
-                                    .small()
-                                    .label("Аккаунт")
-                                    .on_click(cx.listener(|this, _, _, cx| this.open_account(cx))),
-                            ),
-                    )
+                    .child(div().text_lg().font_semibold().child(title))
                     .child(
                         div()
                             .text_xs()
@@ -1545,23 +2085,499 @@ impl AppView {
                     }),
             )
             .child(list);
-        let open = selected.and_then(|id| chats.iter().find(|c| c.id == id));
-        let content = match (&self.account, open) {
-            (Some(panel), _) => self.render_account(me, panel, cx),
-            (None, Some(chat)) => self.render_chat(chat, cx),
-            (None, None) => v_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .text_color(cx.theme().muted_foreground)
-                .child("Выберите чат"),
+        let content = match self.section {
+            Section::Chats => match selected.and_then(|id| chats.iter().find(|c| c.id == id)) {
+                Some(chat) => self.render_chat(chat, cx),
+                None => Self::placeholder("Выберите чат", None, cx),
+            },
+            Section::Contacts => self.contact_card(cx),
+            Section::Calls => Self::placeholder(
+                "Звонки пока не поддерживаются",
+                Some(
+                    "Аудио- и видеозвонки, их история и ссылки на звонки появятся в следующих версиях.",
+                ),
+                cx,
+            ),
+            Section::Settings => match self.settings_page {
+                SettingsPage::Account => match &self.account {
+                    Some(panel) => self.render_account(me, panel, cx),
+                    None => Self::placeholder("Загрузка…", None, cx),
+                },
+                SettingsPage::Appearance => self.render_appearance(cx),
+                SettingsPage::Data => self.render_data(cx),
+                SettingsPage::About => self.render_about(cx),
+            },
         };
         h_flex()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .child(self.rail(unread, cx))
             .child(sidebar)
             .child(content)
+    }
+
+    /// The navigation rail: chats, calls, contacts, and settings at the bottom.
+    fn rail(&self, unread: i32, cx: &mut Context<Self>) -> Div {
+        v_flex()
+            .w(px(76.))
+            .h_full()
+            .flex_shrink_0()
+            .py_3()
+            .gap_1()
+            .items_center()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
+            .child(self.rail_button(
+                Section::Chats,
+                Icon::new(Lucide::MessageCircle),
+                "Чаты",
+                unread,
+                cx,
+            ))
+            .child(self.rail_button(Section::Calls, Icon::new(Lucide::Phone), "Звонки", 0, cx))
+            .child(self.rail_button(
+                Section::Contacts,
+                Icon::new(Lucide::Contact),
+                "Контакты",
+                0,
+                cx,
+            ))
+            .child(div().flex_1())
+            .child(self.rail_button(
+                Section::Settings,
+                Icon::new(IconName::Settings),
+                "Настройки",
+                0,
+                cx,
+            ))
+    }
+
+    fn rail_button(
+        &self,
+        section: Section,
+        icon: Icon,
+        label: &'static str,
+        badge: i32,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let active = self.section == section;
+        let color = if active {
+            cx.theme().primary
+        } else {
+            cx.theme().muted_foreground
+        };
+        v_flex()
+            .id(label)
+            .w(px(68.))
+            .py_2()
+            .gap_1()
+            .items_center()
+            .rounded(cx.theme().radius)
+            .cursor_pointer()
+            .when(active, |this| this.bg(cx.theme().accent))
+            .hover(|this| this.bg(cx.theme().secondary_hover))
+            .text_color(color)
+            .on_click(cx.listener(move |this, _, _, cx| this.switch_section(section, cx)))
+            .child(
+                div()
+                    .relative()
+                    .child(icon.text_color(color).size_5())
+                    .when(badge > 0, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top(px(-9.))
+                                .left(px(10.))
+                                .h(px(20.))
+                                .min_w(px(20.))
+                                .px(px(6.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .whitespace_nowrap()
+                                .rounded_full()
+                                .text_size(px(11.))
+                                .line_height(px(14.))
+                                .font_semibold()
+                                .bg(cx.theme().danger)
+                                // The theme's danger foreground is red text for light
+                                // backgrounds; on the red pill it vanishes.
+                                .text_color(gpui_kit::white())
+                                .child(if badge > 99 {
+                                    "99+".to_string()
+                                } else {
+                                    badge.to_string()
+                                }),
+                        )
+                    }),
+            )
+            .child(div().text_xs().child(label))
+    }
+
+    /// A centered message filling the content area.
+    fn placeholder(title: &str, hint: Option<&str>, cx: &App) -> Div {
+        v_flex()
+            .flex_1()
+            .h_full()
+            .gap_2()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(title.to_string()),
+            )
+            .when_some(hint, |this, h| {
+                this.child(
+                    div()
+                        .max_w(px(420.))
+                        .text_sm()
+                        .text_center()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(h.to_string()),
+                )
+            })
+    }
+
+    /// A content page with a title bar and a scrolling body.
+    fn page(id: &'static str, title: &str, body: Vec<AnyElement>, cx: &App) -> Div {
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(
+                div()
+                    .px_6()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .font_semibold()
+                    .child(title.to_string()),
+            )
+            .child(
+                v_flex()
+                    .id(id)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_6()
+                    .py_4()
+                    .gap_4()
+                    .max_w(px(680.))
+                    .children(body),
+            )
+    }
+
+    /// A titled group of settings.
+    fn group(title: &str, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
+        v_flex()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(title.to_string()),
+            )
+            .child(
+                v_flex()
+                    .p_4()
+                    .gap_3()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// One labelled line with a muted value under the label.
+    fn info_row(label: &str, value: String, cx: &App) -> AnyElement {
+        v_flex()
+            .gap_0p5()
+            .child(div().child(label.to_string()))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(value),
+            )
+            .into_any_element()
+    }
+
+    fn settings_list(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        v_flex()
+            .id("settings-list")
+            .flex_1()
+            .overflow_y_scroll()
+            .p_2()
+            .gap_1()
+            .children(SettingsPage::ALL.into_iter().map(|page| {
+                let active = self.settings_page == page;
+                h_flex()
+                    .id(page.title())
+                    .gap_3()
+                    .px_3()
+                    .py_2p5()
+                    .items_center()
+                    .rounded(cx.theme().radius)
+                    .cursor_pointer()
+                    .when(active, |this| this.bg(cx.theme().accent))
+                    .hover(|this| this.bg(cx.theme().secondary_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_settings_page(page, cx)))
+                    .child(page.icon().size_4().text_color(cx.theme().muted_foreground))
+                    .child(div().child(page.title()))
+            }))
+    }
+
+    fn contact_list(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let muted = cx.theme().muted_foreground;
+        v_flex()
+            .id("contact-list")
+            .flex_1()
+            .overflow_y_scroll()
+            .p_2()
+            .gap_1()
+            .when(self.contacts.is_empty(), |this| {
+                this.child(
+                    div()
+                        .p_2()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("Контактов пока нет"),
+                )
+            })
+            .children(self.contacts.iter().map(|c| {
+                let id = c.id;
+                let selected = self.contact_selected == Some(id);
+                h_flex()
+                    .id(("contact", u64::from_ne_bytes(id.to_ne_bytes())))
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .items_center()
+                    .rounded(cx.theme().radius)
+                    .cursor_pointer()
+                    .when(selected, |this| this.bg(cx.theme().accent))
+                    .hover(|this| this.bg(cx.theme().secondary_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.contact_selected = Some(id);
+                        cx.notify();
+                    }))
+                    .child(Self::avatar(&c.name, 36., cx))
+                    .child(div().truncate().child(c.name.clone()))
+            }))
+    }
+
+    /// A round avatar with the first letter of `name`.
+    fn avatar(name: &str, size: f32, cx: &App) -> Div {
+        let initial: String = name
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().collect())
+            .unwrap_or_default();
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .size(px(size))
+            .rounded_full()
+            .bg(cx.theme().primary)
+            .text_color(cx.theme().primary_foreground)
+            .child(initial)
+    }
+
+    fn contact_card(&self, cx: &mut Context<Self>) -> Div {
+        let Some(c) = self
+            .contact_selected
+            .and_then(|id| self.contacts.iter().find(|c| c.id == id))
+        else {
+            return Self::placeholder("Выберите контакт", None, cx);
+        };
+        let chat_id = c.chat_id;
+        v_flex()
+            .flex_1()
+            .h_full()
+            .gap_3()
+            .items_center()
+            .justify_center()
+            .child(Self::avatar(&c.name, 96., cx).text_3xl())
+            .child(div().text_xl().font_semibold().child(c.name.clone()))
+            .child(match chat_id {
+                Some(chat_id) => Button::new("contact-write")
+                    .primary()
+                    .label("Написать")
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_chat(chat_id, cx)))
+                    .into_any_element(),
+                None => div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Переписки с этим контактом в списке чатов нет")
+                    .into_any_element(),
+            })
+    }
+
+    fn render_appearance(&self, cx: &mut Context<Self>) -> Div {
+        let ui = self.ui;
+        let themes = [
+            (ThemeChoice::System, "Как в системе"),
+            (ThemeChoice::Light, "Светлая"),
+            (ThemeChoice::Dark, "Тёмная"),
+        ];
+        let theme_buttons = h_flex()
+            .gap_2()
+            .children(themes.into_iter().map(|(t, label)| {
+                let b = Button::new(label).label(label).on_click(cx.listener(
+                    move |this, _, window, cx| {
+                        let ui = UiSettings {
+                            theme: t,
+                            ..this.ui
+                        };
+                        this.set_ui(ui, window, cx)
+                    },
+                ));
+                if ui.theme == t {
+                    b.primary()
+                } else {
+                    b.outline()
+                }
+            }));
+        let size_buttons = h_flex().gap_2().children(FONT_SIZES.into_iter().map(|n| {
+            let b = Button::new(("font", u64::from(n)))
+                .label(format!("{n}"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let ui = UiSettings {
+                        font_size: n,
+                        ..this.ui
+                    };
+                    this.set_ui(ui, window, cx)
+                }));
+            if ui.font_size == n {
+                b.primary()
+            } else {
+                b.outline()
+            }
+        }));
+        let sample = h_flex().child(
+            v_flex()
+                .px_3()
+                .py_2()
+                .gap_1()
+                .rounded(px(12.))
+                .bg(cx.theme().secondary)
+                .text_color(cx.theme().secondary_foreground)
+                .child(div().child("Так выглядит текст сообщений"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("12:00"),
+                ),
+        );
+        Self::page(
+            "appearance",
+            SettingsPage::Appearance.title(),
+            vec![
+                Self::group("Тема", vec![theme_buttons.into_any_element()], cx),
+                Self::group(
+                    "Размер шрифта",
+                    vec![size_buttons.into_any_element(), sample.into_any_element()],
+                    cx,
+                ),
+            ],
+            cx,
+        )
+    }
+
+    fn render_data(&self, cx: &mut Context<Self>) -> Div {
+        let downloads = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
+        let profiles = max_store::default_profiles_dir();
+        let open = downloads.clone();
+        let files = vec![
+            Self::info_row("Папка загрузок", downloads.display().to_string(), cx),
+            h_flex()
+                .child(
+                    Button::new("open-downloads")
+                        .outline()
+                        .small()
+                        .label("Открыть папку")
+                        .on_click(move |_, _, cx| cx.open_with_system(&open)),
+                )
+                .into_any_element(),
+        ];
+        let mut local = vec![Self::info_row(
+            "Профиль",
+            profiles
+                .map(|p| p.join("default").display().to_string())
+                .unwrap_or_else(|| "не найден".into()),
+            cx,
+        )];
+        local.push(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    "Переписка хранится в базе SQLCipher; её ключ и токен входа лежат в \
+                     защищённом хранилище Windows и без вашей учётной записи не читаются.",
+                )
+                .into_any_element(),
+        );
+        if let Some(p) = UiSettings::path() {
+            local.push(Self::info_row(
+                "Настройки интерфейса",
+                p.display().to_string(),
+                cx,
+            ));
+        }
+        Self::page(
+            "data",
+            SettingsPage::Data.title(),
+            vec![
+                Self::group("Файлы", files, cx),
+                Self::group("Данные на этом компьютере", local, cx),
+            ],
+            cx,
+        )
+    }
+
+    fn render_about(&self, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let line = |text: &str| {
+            div()
+                .text_sm()
+                .text_color(muted)
+                .child(text.to_string())
+                .into_any_element()
+        };
+        Self::page(
+            "about",
+            SettingsPage::About.title(),
+            vec![
+                Self::group(
+                    "maxrs",
+                    vec![
+                        Self::info_row("Версия", env!("CARGO_PKG_VERSION").to_string(), cx),
+                        line("Клиент мессенджера MAX для Windows без телеметрии."),
+                    ],
+                    cx,
+                ),
+                Self::group(
+                    "Что не отправляется",
+                    vec![
+                        line("Статистика и события использования"),
+                        line("Отчёты о сбоях и трассировка"),
+                        line("Журналы и отладочные отчёты"),
+                        line("Проверка обновлений и A/B-эксперименты"),
+                        line("Данные об оборудовании: идентификатор устройства случайный"),
+                    ],
+                    cx,
+                ),
+            ],
+            cx,
+        )
     }
 }
 
@@ -1771,8 +2787,7 @@ mod tests {
             text: format!("m{id}"),
             time: id,
             delivery,
-            edited: false,
-            attachments: Vec::new(),
+            ..MessageRow::default()
         }
     }
 
@@ -1864,8 +2879,7 @@ mod paging_tests {
             text: String::new(),
             time: id * 10,
             delivery,
-            edited: false,
-            attachments: Vec::new(),
+            ..MessageRow::default()
         }
     }
 
@@ -1904,5 +2918,106 @@ mod paging_tests {
         mine.out = true;
         h.messages.push(mine);
         assert_eq!(h.unread_mark(), None, "our own message needs no read mark");
+    }
+}
+
+#[cfg(test)]
+mod compose_tests {
+    use max_core::media::Attachment;
+
+    use super::{Delivery, History, MessageRow, Quote, editable, quote_of};
+
+    fn ours(id: i64, text: &str) -> MessageRow {
+        MessageRow {
+            id,
+            out: true,
+            text: text.into(),
+            time: 1_000,
+            ..MessageRow::default()
+        }
+    }
+
+    #[test]
+    fn confirmed_reply_keeps_the_pending_quote() {
+        let quote = Quote {
+            id: 5,
+            sender: "Анна".into(),
+            text: "вопрос".into(),
+        };
+        let mut h = History::default();
+        h.add(MessageRow {
+            cid: Some(9),
+            delivery: Delivery::Pending,
+            reply: Some(quote.clone()),
+            ..ours(0, "ответ")
+        });
+        h.add(MessageRow {
+            cid: Some(9),
+            ..ours(6, "ответ")
+        });
+        assert_eq!(h.messages.len(), 1);
+        assert_eq!(
+            (h.messages[0].id, h.messages[0].reply.clone()),
+            (6, Some(quote))
+        );
+    }
+
+    #[test]
+    fn an_edit_changes_text_and_keeps_what_it_leaves_out() {
+        let mut h = History::default();
+        h.add(MessageRow {
+            attachments: vec![Attachment::File {
+                file_id: 1,
+                name: "a.pdf".into(),
+                size: 1,
+            }],
+            reply: Some(Quote::default()),
+            ..ours(6, "старый")
+        });
+        h.edit(MessageRow {
+            edited: true,
+            time: 0,
+            ..ours(6, "новый")
+        });
+        let m = &h.messages[0];
+        assert_eq!((m.text.as_str(), m.time, m.edited), ("новый", 1_000, true));
+        assert_eq!(m.attachments.len(), 1);
+        assert!(m.reply.is_some());
+        h.edit(ours(99, "чужой id"));
+        assert_eq!(h.messages[0].text, "новый", "unknown ids change nothing");
+    }
+
+    #[test]
+    fn only_our_sent_plain_messages_are_editable() {
+        assert!(editable(&ours(1, "текст")));
+        assert!(!editable(&ours(0, "отправка")), "pending");
+        assert!(!editable(&MessageRow {
+            out: false,
+            ..ours(1, "текст")
+        }));
+        assert!(!editable(&MessageRow {
+            forwarded: Some("Канал".into()),
+            ..ours(1, "текст")
+        }));
+        assert!(!editable(&MessageRow {
+            attachments: vec![Attachment::Other {
+                kind: "VIDEO".into()
+            }],
+            ..ours(1, "[Видео] текст")
+        }));
+    }
+
+    #[test]
+    fn quotes_name_the_sender() {
+        assert_eq!(quote_of(&ours(1, "да"), "Анна").sender, "Вы");
+        let post = MessageRow {
+            out: false,
+            ..ours(2, "новость")
+        };
+        assert_eq!(
+            quote_of(&post, "Канал").sender,
+            "Канал",
+            "channel posts have no sender"
+        );
     }
 }

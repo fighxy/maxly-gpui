@@ -56,8 +56,8 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | B3 | Two-factor password: login check, restore, hint | O 101, 104, 113, 115; Q `PasswordEnterPage`, `AuthForgotPasswordPage` | v1 | login check done (`check_password`); restore and hint open |
 | B4 | Registration: name, avatar presets | O 25; Q `NameEnterPage`, `AvatarPreset*` | v1 | detected (`AuthStep::RegistrationRequired`); flow open |
 | B5 | 2FA setup and management (email, hint, password) | O 109-112; Q `SFACreate*`, `SFAConfig*` | v2 | open |
-| B6 | Active sessions list and close | O 96, 97; Q `DevicesSettings*` | v1 | list (SESSIONS_INFO) and close all others (SESSIONS_CLOSE, new token kept) done in core and the account panel, with confirmation; not tried on the real server |
-| B7 | Logout | O 20 | v1 | done: LOGOUT, token forgotten even offline, back to the login screens (account panel, with confirmation); not tried on the real server |
+| B6 | Active sessions list and close | O 96, 97; Q `DevicesSettings*` | v1 | list (SESSIONS_INFO) and close all others (SESSIONS_CLOSE, new token kept) done in core and Settings → "Аккаунт и устройства", with confirmation; not tried on the real server |
+| B7 | Logout | O 20 | v1 | done: LOGOUT, token forgotten even offline, back to the login screens (Settings → "Аккаунт и устройства", with confirmation); not tried on the real server |
 | B8 | Profile delete and cancel | O 116, 199, 200; Q `RemoveProfileDialog`, `CancelProfileDeletePopup` | v2 | open |
 | B9 | Multiaccount | K `multiaccount`; Q `AccountsStackView`, `MultiaccountSectionButton` | v3 | open |
 | B10 | Callout login (call-based code) | O 294; Q `CalloutPage` | v2 | open |
@@ -83,8 +83,8 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 |---|---|---|---|---|
 | D1 | History load and scroll, day dividers, new-messages marker | O 49, 71; Q `HistoryListView`, `NewMessagesPanel` | v1 | first page (40, from now) with day dividers and scroll to the newest done; request values from PyMax, unverified on the real server; paging back (button at the top and scrolling up at the top, `from` = oldest shown) done; new-messages marker open |
 | D2 | Send text, formatting, links, mentions | O 64; Q `MessageTextInput`, `AddFormatLinkDialog`, `MentionContactList` | v1 | plain text with pending, sent and failed states done (cid = send time); formatting, links, mentions open |
-| D3 | Edit, delete (for me / for all), delete range | O 66, 67, 140, 142; K `delete-msg-fys-large-chat-disabled` | v1 | edits and deletes from the server shown ("изменено", removed from the history); editing and deleting our own messages open |
-| D4 | Reply, forward, quote navigation | Q `Reply*`, `MessageForwardDialog`; K `reply-navigation-highlight` | v1 | open |
+| D3 | Edit, delete (for me / for all), delete range | O 66, 67, 140, 142; K `delete-msg-fys-large-chat-disabled` | v1 | edits and deletes from the server shown ("изменено", removed from the history); editing our text (MSG_EDIT, `text` only) and deleting for everyone or for us (MSG_DELETE `forMe`, `failedMessageIds` honoured) done from the hover actions, with a delete choice; incoming messages delete for us only; unverified on the real server; delete range and admin deletes open |
+| D4 | Reply, forward, quote navigation | Q `Reply*`, `MessageForwardDialog`; K `reply-navigation-highlight` | v1 | reply done: `link` {type REPLY, messageId} on MSG_SEND, quote shown above the reply (hover action "Ответить", bar above the composer); forwarded messages shown with the original's text and attachments and "Переслано от …" (`link` FORWARD, `chatName` or the original sender); link types from `core.dll`; sending forwards and quote navigation open; unverified on the real server |
 | D5 | Reactions: set, cancel, list, detailed | O 178-181, 155, 156; Q `ReactionPlate`; K `reactions-rank-config` | v1 | open |
 | D6 | Pinned messages and multipin | O 240-243, 86; K `multipin-*`; Q `PinBar`, `PinnedMessagesPage` | v2 | open |
 | D7 | Delayed (scheduled) messages | O 154; Q `DelayedMessages*` | v2 | open |
@@ -95,7 +95,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | D12 | Audio/video message transcription | O 202, 293; K `enable-*-transcription`, `retry-transcribe-*` | v2 | open |
 | D13 | Multiselect actions, copy restrictions | Q `DelayedMultiselectActionsPanel`, `MessagesActionPanel` | v1 | open |
 | D14 | Message search inside a chat | Q `MessagesSearchPanel` | v1 | open |
-| D15 | Text selection, clipboard (HTML) | K `message-text-selection`, `desktop-clipboard-html-enabled` | v1 | open |
+| D15 | Text selection, clipboard (HTML) | K `message-text-selection`, `desktop-clipboard-html-enabled` | v1 | copy message text (hover action, plain text) done; selection and HTML clipboard open |
 | D16 | Spell check | K `spell-check-win`; S `spell_check` | v2 | open |
 
 ### E. Attachments and media
@@ -139,7 +139,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
-| G1 | Contact list, info, presence | O 32, 35, 36; Q `ContactListView` | v1 | open |
+| G1 | Contact list, info, presence | O 32, 35, 36; Q `ContactListView` | v1 | contacts section on the navigation rail: everyone the client knows a name for, card with "Написать" when a dialog is in the chat list; full contact list sync and presence open |
 | G2 | Add (create), update, rename | O 34, 41; Q `CreateContactDialog`; K `contact-add-bottom-sheet` | v1 | open |
 | G3 | Contact photos | O 39, 43 | v2 | open |
 | G4 | Block / unblock, blocked list | Q `SettingsPrivacyBlockedContactsList`, `BlockedPlaceholder` | v1 | open |
@@ -153,12 +153,12 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | H2 | Avatar creator | Q `AvatarCreatorComponent_*` | v3 | open |
 | H3 | Privacy settings | Q `SettingsPrivacy*`, `PrivacySettingsPage` | v1 | open |
 | H4 | Notification settings | K `notification-settings`, `notification-in-call-setting` | v1 | open |
-| H5 | Appearance: theme, fonts, font size | K `font-size-slider`, `glass-enabled`; Q `SettingsAppearance`, `SettingsFonts` | v1 | open |
-| H6 | Data and memory (cache, download path) | Q `DataAndMemorySettings`, `SettingsDownloadPathButton` | v1 | open |
+| H5 | Appearance: theme, fonts, font size | K `font-size-slider`, `glass-enabled`; Q `SettingsAppearance`, `SettingsFonts` | v1 | theme (system, light, dark; system follows Windows) and font size (14–18) in Settings → "Оформление", kept locally in `ui.txt`; fonts open |
+| H6 | Data and memory (cache, download path) | Q `DataAndMemorySettings`, `SettingsDownloadPathButton` | v1 | Settings → "Данные и память" shows the download folder (open button), the profile folder and the settings file; choosing the download path and cache management open |
 | H7 | Keyboard shortcuts | Q `SettingsShortcuts`; S `shortcuts` | v2 | open |
 | H8 | Language | Q `LanguageMenuButton`; S `app_locale` | v1 | open |
 | H9 | Mini-app permissions | Q `SettingsPrivacyMiniApp*` | v2 | open |
-| H10 | About, FAQ, support bot | Q `SettingsAbout`, `SettingsFaq` | v1 | open |
+| H10 | About, FAQ, support bot | Q `SettingsAbout`, `SettingsFaq` | v1 | Settings → "О программе": version and what the client does not send; FAQ and support bot open |
 | H11 | ESIA (Gosuslugi) verification cell | Q `EsiaVerifySettingsCell` | v3 | open (needs RE) |
 
 ### I. Bots and mini-apps
@@ -233,7 +233,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | `max-store` | encrypted local DB, token in OS keystore | 2 | done 2026-11-19: SQLCipher 4.20 (vendored OpenSSL), key and token in Credential Manager (DPAPI), profile with Identity and launch counter; 9 tests + 1 OS store test (run once, cleaned up); chat and message tables come with `max-core` |
 | `max-core` | session, auth flows, sync, event dispatch, server config | 2 | done 2026-11-19: Session (SESSION_INIT, QR, SMS, 2FA password, LOGIN), Supervisor (reconnect, re-login), 6 flow tests on a scripted server; typed push dispatch, sync markers, logout open |
 | `max-media` | uploads/downloads, image/video/audio decode, Lottie | 3 | open |
-| `app` | gpui-kit UI, desktop integration | 3 | started 2026-11-19: window, QR, phone and code, 2FA password, chat list from LOGIN (local times), `--demo` and `--demo-walk` without network; message history (first page) and sending text done 2026-11-20; attachments, paging, settings open |
+| `app` | gpui-kit UI, desktop integration | 3 | started 2026-11-19: window, QR, phone and code, 2FA password, chat list from LOGIN (local times), `--demo` and `--demo-walk` without network; message history (first page) and sending text done 2026-11-20; attachments and paging done; 2026-11-21: navigation rail (chats, calls, contacts, settings), settings pages (account and devices, appearance, data, about), message hover actions (reply, copy, edit, delete) |
 
 ## Open questions
 

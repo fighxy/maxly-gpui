@@ -35,6 +35,11 @@ fn get<'a>(v: &'a Value, key: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no key {key} in {v}"))
 }
 
+fn has(v: &Value, key: &str) -> bool {
+    v.as_map()
+        .is_some_and(|m| m.iter().any(|(k, _)| k.as_str() == Some(key)))
+}
+
 struct Server {
     io: DuplexStream,
     buf: BytesMut,
@@ -486,6 +491,7 @@ async fn history_send_and_new_message_push() {
         let m = get(&body, "message");
         assert_eq!(get(m, "text").as_str(), Some("привет"));
         assert_eq!(get(m, "cid").as_i64(), Some(77));
+        assert!(!has(m, "link"), "no link without a reply");
         let stored = map(&[
             ("id", 3i64.into()),
             ("time", 1_100i64.into()),
@@ -524,7 +530,7 @@ async fn history_send_and_new_message_push() {
     let messages = history(session.transport(), 42, 1_000, 40).await.unwrap();
     let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
     assert_eq!(ids, [1, 2], "oldest first");
-    let sent = send_text(session.transport(), 42, "привет", 77)
+    let sent = send_text(session.transport(), 42, "привет", 77, None)
         .await
         .unwrap();
     assert_eq!(
@@ -715,6 +721,106 @@ async fn photo_and_file_upload_then_send() {
         other => panic!("expected a push, got {other:?}"),
     };
     assert_eq!(attach_ready(&push), Some((900, None)));
+    let _keep = srv.await.unwrap();
+}
+
+#[tokio::test]
+async fn reply_edit_and_delete() {
+    use max_core::messages::{delete, edit_text, send_text};
+
+    let root = tempfile::tempdir().unwrap();
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::new());
+    let mut p = profile(&root, &secrets);
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(async move {
+        let mut s = Server::new(server);
+        s.session_init().await;
+        // A reply carries `link` {type REPLY, messageId}.
+        let (seq, body) = s.expect(Opcode::MessagingSend).await;
+        let link = get(get(&body, "message"), "link");
+        assert_eq!(get(link, "type").as_str(), Some("REPLY"));
+        assert_eq!(get(link, "messageId").as_i64(), Some(5));
+        assert!(!has(link, "chatId"));
+        let quoted = map(&[
+            ("id", 5i64.into()),
+            ("time", 500i64.into()),
+            ("type", "USER".into()),
+            ("text", "вопрос".into()),
+        ]);
+        let stored = map(&[
+            ("id", 6i64.into()),
+            ("time", 600i64.into()),
+            ("type", "USER".into()),
+            ("cid", 9i64.into()),
+            ("text", "ответ".into()),
+            (
+                "link",
+                map(&[("type", "REPLY".into()), ("message", quoted)]),
+            ),
+        ]);
+        s.reply(
+            Opcode::MessagingSend,
+            seq,
+            &map(&[("chatId", 42i64.into()), ("message", stored)]),
+        )
+        .await;
+        // Edit: chat, message and the new text only.
+        let (seq, body) = s.expect(Opcode::MessagingEdit).await;
+        assert_eq!(get(&body, "chatId").as_i64(), Some(42));
+        assert_eq!(get(&body, "messageId").as_i64(), Some(6));
+        assert_eq!(get(&body, "text").as_str(), Some("ответ!"));
+        assert!(!has(&body, "attachments") && !has(&body, "elements"));
+        let edited = map(&[
+            ("id", 6i64.into()),
+            ("time", 600i64.into()),
+            ("type", "USER".into()),
+            ("status", "EDITED".into()),
+            ("text", "ответ!".into()),
+        ]);
+        s.reply(Opcode::MessagingEdit, seq, &map(&[("message", edited)]))
+            .await;
+        // Delete for everyone: one id refused.
+        let (seq, body) = s.expect(Opcode::MessagingDelete).await;
+        assert_eq!(get(&body, "forMe").as_bool(), Some(false));
+        let ids: Vec<i64> = get(&body, "messageIds")
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_i64)
+            .collect();
+        assert_eq!(ids, [6, 7]);
+        s.reply(
+            Opcode::MessagingDelete,
+            seq,
+            &map(&[
+                ("chatId", 42i64.into()),
+                ("messageIds", Value::Array(vec![6i64.into(), 7i64.into()])),
+                ("failedMessageIds", Value::Array(vec![7i64.into()])),
+            ]),
+        )
+        .await;
+        // Delete for me: an answer without ids.
+        let (seq, body) = s.expect(Opcode::MessagingDelete).await;
+        assert_eq!(get(&body, "forMe").as_bool(), Some(true));
+        s.reply(
+            Opcode::MessagingDelete,
+            seq,
+            &map(&[("chatId", 42i64.into())]),
+        )
+        .await;
+        s
+    });
+    let session = Session::start(client, &config(), &mut p, &env())
+        .await
+        .unwrap();
+    let t = session.transport();
+    let sent = send_text(t, 42, "ответ", 9, Some(5)).await.unwrap();
+    let link = sent.message.link.expect("the stored reply has its link");
+    assert_eq!((link.type_.as_str(), link.message.id), ("REPLY", 5));
+    let edited = edit_text(t, 42, 6, "ответ!").await.unwrap();
+    assert_eq!(edited.text.as_deref(), Some("ответ!"));
+    assert_eq!(delete(t, 42, &[6, 7], false).await.unwrap(), [6]);
+    assert_eq!(delete(t, 42, &[8], true).await.unwrap(), [8]);
     let _keep = srv.await.unwrap();
 }
 

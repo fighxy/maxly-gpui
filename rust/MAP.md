@@ -67,13 +67,13 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
 | C1 | Chat list with previews, counters, presence | O 53, 35, 132; Q `ChatListView`, `ChatDelegate`, `PresenceMarker` | v1 | list, last message, unread counter, live reordering on new messages done; avatars (chat `baseIconUrl`, a dialog peer's contact `baseUrl`, loaded as is, initials until then) in the chat list and contacts; presence open |
-| C2 | Mark read / unread | O 50, 130; K `readmark-validation-disabled` | v1 | mark read (CHAT_MARK READ_MESSAGE up to the newest incoming message) on open and on new messages; reads on other devices (own NOTIF_MARK) update the unread counter; the other participants' marks (chat `participants`, NOTIF_MARK) show ✓/✓✓ on our messages. Mark unread open |
+| C2 | Mark read / unread | O 50, 130; K `readmark-validation-disabled` | v1 | mark read (CHAT_MARK READ_MESSAGE up to the newest incoming message) on open and on new messages; reads on other devices (own NOTIF_MARK) update the unread counter; the other participants' marks (chat `participants`, NOTIF_MARK) show ✓/✓✓ on our messages. Mark unread (right-click the chat → «Пометить непрочитанным», CHAT_MARK `SET_AS_UNREAD`) done; the type string is the other value beside `READ_MESSAGE` (PyMax `ReadAction`), unverified on the real server |
 | C3 | Typing indicators (send and show) | O 65, 129; K `typing-send-enabled`; Q `TypingControl` | v1 | done: TYPING_SEND `{chatId, type: "TEXT"}` (type names from `Core::Typing::Interactor::doSend`) at most every 5 s while the composer changes; NOTIF_TYPING shown in the chat header and list for 6 s (both intervals chosen here, not read from the client); not tried on the real server |
 | C4 | Search: chats, messages, public, by phone | O 60, 68, 73, 46; Q `SearchPanel`, `SearchByPhoneDialog` | v1 | open |
 | C5 | Local search | K `local-search-ranker`, `recent-search-enabled` | v2 | open |
 | C6 | Folders: list, edit, reorder, delete, filters | O 272-277; K `folder-*`, `choose-default-folder`; Q `SettingsFolders*` | v2 | open |
 | C7 | Archive | K `folder-archive`; Q `ArchiveListView`, `LeadingArchiveBar` | v2 | open |
-| C8 | Chat personal config (mute, pin chat) | O 61 | v1 | open |
+| C8 | Chat personal config (mute, pin chat) | O 61 | v1 | pin and mute from the account `CONFIG` (`ChatSettings.favIndex`, `dontDisturbUntil`; 0 / a time, 0 / -1 or a future time), shown on the row («закреп», «тихо») and changed from the chat's right-click menu; a pinned chat stays above newer ones; a muted chat does not raise a toast. Opcode 61 (`hideNonContactBar`) is still open. Unverified on the real server |
 | C9 | Separate chat windows | K `chat-windows`; Q `ChatWindow`, `ChatWindowsManager` | v2 | open |
 | C10 | Chat suggestions | O 300; Q `ChatSuggestHeader` | no (recommendations) | open |
 
@@ -125,7 +125,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | F3 | Admins and permissions | Q `AdminPermissionsPage`, `ChatPermissionsPage`, `ChannelPermissionsPage` | v2 | open |
 | F4 | Invite links: list, create, delete; join by link | O 221-223, 56, 57; Q `SidebarInviteByLinkPage` | v2 | open |
 | F5 | Join requests | Q `JoinRequestsPage`, `PinnedChannelJoinRequest` | v2 | open |
-| F6 | Leave, delete, clear chat | O 52, 58 | v1 | open |
+| F6 | Leave, delete, clear chat | O 52, 58 | v1 | leave a group or channel (`CHAT_LEAVE`) and delete a dialog for us (`CHAT_DELETE` `forAll` false) from the chat's right-click menu, with confirmation; the row leaves the list. Clear history open. Unverified on the real server |
 | F7 | Chat/channel info and settings sidebar | O 48, 55; Q `Sidebar*` | v1 (view), v2 (edit) | view started: the chat header shows the photo and, under the title, subscribers of a channel or members of a group (`participantsCount`; a group falls back to its `participants`; types DIALOG, CHAT, CHANNEL from `core.dll`); a click opens a panel with photo, title, count, description and link (copy); members list, admins and editing open |
 | F8 | Reactions settings per chat | O 257, 258; Q `ReactionsSettings*` | v2 | open |
 | F9 | Chat themes | Q `ChatThemeButton`; S `chat_theme` | v3 | open |
@@ -195,7 +195,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 
 | # | Feature | Evidence | Release | State |
 |---|---|---|---|---|
-| M1 | System notifications, unread badge | S `notifications`; Q `NotificationsModule_*` | v1 | Windows toasts through GPUI (`set_app_identity` "maxly-gpui.desktop", which registers the AUMID under HKCU on the first toast) for incoming messages unless that chat is open in the focused, visible window; one toast per chat (tag `chat:<id>`), a click shows the window and opens the chat; silent (GPUI sets `audio silent`). Unread total in the window title "(N) maxly-gpui", the tray tooltip and a red dot on the tray icon; taskbar overlay badge and muted chats open |
+| M1 | System notifications, unread badge | S `notifications`; Q `NotificationsModule_*` | v1 | Windows toasts through GPUI (`set_app_identity` "maxly-gpui.desktop", which registers the AUMID under HKCU on the first toast) for incoming messages unless that chat is open in the focused, visible window; one toast per chat (tag `chat:<id>`), a click shows the window and opens the chat; silent (GPUI sets `audio silent`). Unread total in the window title "(N) maxly-gpui", the tray tooltip and a red dot on the tray icon; taskbar overlay badge open; a muted chat (C8) does not raise a toast, and its unread count still adds to the badge |
 | M2 | Tray icon | Q `TrayIcon` | v1 | done: `tray-icon` icon drawn in code (blue disc, white bubble, red dot when unread), left click shows the window, menu «Открыть maxly-gpui» / «Выйти»; closing the window hides it to the tray (setting, on by default) through `winsafe` (GPUI cannot hide a window on Windows), no unsafe code of ours |
 | M3 | Single instance, `max://` deep links, local pipe | config `single_instance_id`, `internal_url_scheme`, `local_server_pipe_name` | v1 | single instance done: named pipe `\\.\pipe\maxly-gpui-<user>-<fnv hash>` (first instance only; tokio refuses remote clients); a second start, before it connects to the server, asks the first to show its window and exits; the demo skips it; `max://` links open |
 | M4 | Drag and drop, paste files | Q `HistoryDropArea` | v1 | open |

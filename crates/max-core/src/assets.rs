@@ -297,7 +297,10 @@ impl Ask {
                     format!("{type_} nosync")
                 }
             }
-            Ask::Asset { asset_type, section } => format!("asset {asset_type}/{section}"),
+            Ask::Asset {
+                asset_type,
+                section,
+            } => format!("asset {asset_type}/{section}"),
             Ask::Page { section, from } => format!("page {section}@{from}"),
         }
     }
@@ -354,7 +357,10 @@ fn note_err(found: &mut Found, label: &str, err: &crate::CoreError) {
 async fn ask(transport: &Transport, query: &Ask) -> Result<(Value, usize)> {
     let payload = match query {
         Ask::Update { type_, sync } => to_msgpack(&update_value(type_, *sync))?,
-        Ask::Asset { asset_type, section } => asset_payload(Some(asset_type), section, 0)?,
+        Ask::Asset {
+            asset_type,
+            section,
+        } => asset_payload(Some(asset_type), section, 0)?,
         Ask::Page { section, from } => asset_payload(None, section, *from)?,
     };
     let response = transport.request(query.opcode().as_u16(), payload).await?;
@@ -458,7 +464,12 @@ fn empty_note(found: &Found) -> String {
         parts.push(found.sketch.join(" | "));
     }
     if !found.section_ids.is_empty() {
-        let shown: Vec<&str> = found.section_ids.iter().take(12).map(String::as_str).collect();
+        let shown: Vec<&str> = found
+            .section_ids
+            .iter()
+            .take(12)
+            .map(String::as_str)
+            .collect();
         parts.push(format!("секции {}", shown.join(", ")));
     }
     parts.join("; ")
@@ -503,7 +514,10 @@ fn take_section(section: &Value, found: &mut Found, sets: bool) {
     };
     let id = field_str(entries, "id").unwrap_or_default();
     let type_ = field_str(entries, "type").unwrap_or_default();
-    if !id.is_empty() && found.section_ids.len() < 24 && !found.section_ids.iter().any(|have| have == &id) {
+    if !id.is_empty()
+        && found.section_ids.len() < 24
+        && !found.section_ids.iter().any(|have| have == &id)
+    {
         found.section_ids.push(id.clone());
     }
     let animoji = type_.contains("ANIMOJI") || type_.is_empty();
@@ -613,9 +627,7 @@ fn take_emoji_list(value: &Value, found: &mut Found) {
     for item in items.iter().take(3) {
         let Value::Map(entries) = item else {
             if found.sketch.len() < 12 {
-                found
-                    .sketch
-                    .push(format!("emojiList {}", value_kind(item)));
+                found.sketch.push(format!("emojiList {}", value_kind(item)));
             }
             continue;
         };
@@ -645,9 +657,7 @@ fn take_emoji_list(value: &Value, found: &mut Found) {
                     lottie_url,
                 });
             }
-        } else if field_str(entries, "type")
-            .is_some_and(|type_| type_.contains("ANIMOJI"))
-        {
+        } else if field_str(entries, "type").is_some_and(|type_| type_.contains("ANIMOJI")) {
             if let Some(id) = field_i64(entries, "id") {
                 push_face(&mut found.face_ids, id, set_id);
             }
@@ -685,9 +695,7 @@ fn inspect_sticker_sets(value: &Value, found: &mut Found) {
     };
     let Some(Value::Array(sets)) = field(entries, "stickerSets") else {
         if found.sketch.len() < 12 {
-            found
-                .sketch
-                .push(format!("STICKER_SET {}", brief(entries)));
+            found.sketch.push(format!("STICKER_SET {}", brief(entries)));
         }
         return;
     };
@@ -697,9 +705,7 @@ fn inspect_sticker_sets(value: &Value, found: &mut Found) {
         };
         let name = field_str(fields, "name").unwrap_or_default();
         if found.sketch.len() < 12 {
-            found
-                .sketch
-                .push(format!("набор {name}:{}", brief(fields)));
+            found.sketch.push(format!("набор {name}:{}", brief(fields)));
         }
         let set_id = field_i64(fields, "id");
         if let Some(ids) = field(fields, "animojiIds").or_else(|| field(fields, "animojis")) {
@@ -813,7 +819,9 @@ fn field_i64(entries: &[(Value, Value)], name: &str) -> Option<i64> {
 }
 
 fn field_str(entries: &[(Value, Value)], name: &str) -> Option<String> {
-    field(entries, name).and_then(Value::as_str).map(str::to_string)
+    field(entries, name)
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn push_id(ids: &mut Vec<i64>, id: i64) {
@@ -973,5 +981,4 @@ mod tests {
         harvest(&back, &mut found, false);
         assert_eq!(found.set_ids, vec![3, 4]);
     }
-
 }

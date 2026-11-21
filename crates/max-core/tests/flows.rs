@@ -992,3 +992,79 @@ async fn sessions_close_others_and_logout() {
     assert!(handle.transport().is_err(), "stopped");
     let _keep = srv.await.unwrap();
 }
+
+fn map_i64(v: &Value, key: i64) -> &Value {
+    v.as_map()
+        .and_then(|entries| entries.iter().find(|(k, _)| k.as_i64() == Some(key)))
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| panic!("no key {key} in {v}"))
+}
+
+#[tokio::test]
+async fn pin_mute_unread_leave_and_delete() {
+    use max_core::chats::{delete_for_me, leave, set_muted, set_pinned};
+    use max_core::messages::mark_unread;
+
+    let root = tempfile::tempdir().unwrap();
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecrets::new());
+    let mut p = profile(&root, &secrets);
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let srv = tokio::spawn(async move {
+        let mut s = Server::new(server);
+        s.session_init().await;
+        let (seq, body) = s.expect(Opcode::Config).await;
+        let settings = get(&body, "settings");
+        assert_eq!(get(settings, "hash").as_str(), Some("h"));
+        let chat = map_i64(get(settings, "chats"), 7);
+        assert!(get(chat, "favIndex").as_i64().unwrap() > 0);
+        s.reply(
+            Opcode::Config,
+            seq,
+            &map(&[
+                ("hash", "h2".into()),
+                (
+                    "chats",
+                    Value::Map(vec![(7i64.into(), map(&[("favIndex", 9i64.into())]))]),
+                ),
+            ]),
+        )
+        .await;
+
+        let (seq, body) = s.expect(Opcode::Config).await;
+        let chat = map_i64(get(get(&body, "settings"), "chats"), 7);
+        assert_eq!(get(chat, "dontDisturbUntil").as_i64(), Some(-1));
+        s.reply(Opcode::Config, seq, &map(&[("hash", "h3".into())]))
+            .await;
+
+        let (seq, body) = s.expect(Opcode::ChatMark).await;
+        assert_eq!(get(&body, "type").as_str(), Some("SET_AS_UNREAD"));
+        assert_eq!(get(&body, "messageId").as_i64(), Some(3));
+        s.reply(Opcode::ChatMark, seq, &map(&[("unread", 1i64.into())]))
+            .await;
+
+        let (seq, body) = s.expect(Opcode::ChatLeave).await;
+        assert_eq!(get(&body, "chatId").as_i64(), Some(8));
+        s.reply(Opcode::ChatLeave, seq, &map(&[])).await;
+
+        let (seq, body) = s.expect(Opcode::ChatDelete).await;
+        assert_eq!(get(&body, "forAll").as_bool(), Some(false));
+        assert_eq!(get(&body, "chatId").as_i64(), Some(9));
+        s.reply(Opcode::ChatDelete, seq, &map(&[])).await;
+        s
+    });
+    let session = Session::start(client, &config(), &mut p, &env())
+        .await
+        .unwrap();
+    let t = session.transport();
+    let (index, hash) = set_pinned(t, "h", 7, true).await.unwrap();
+    assert_eq!((index, hash.as_deref()), (9, Some("h2")));
+    let (muted, hash) = set_muted(t, hash.as_deref().unwrap_or("h"), 7, true)
+        .await
+        .unwrap();
+    assert!(muted);
+    assert_eq!(hash.as_deref(), Some("h3"));
+    assert_eq!(mark_unread(t, 7, Some(3)).await.unwrap().unread, Some(1));
+    leave(t, 8).await.unwrap();
+    delete_for_me(t, 9).await.unwrap();
+    let _keep = srv.await.unwrap();
+}

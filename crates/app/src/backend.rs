@@ -3,7 +3,7 @@
 //! same screens on made-up data without any network access.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use max_core::media::{self, Attachment, Http, OutgoingAttachment};
@@ -94,6 +94,16 @@ pub enum UiEvent {
     PeerRead { chat_id: i64, mark: i64 },
     /// A chat changed or was added.
     ChatChanged(ChatRow),
+    /// Pin index or mute of one chat changed. `None` leaves that field as it was.
+    ChatPref {
+        chat_id: i64,
+        pin_index: Option<i64>,
+        muted: Option<bool>,
+    },
+    /// The chat left this account's list.
+    ChatRemoved(i64),
+    /// The server's unread count after marking the chat unread.
+    MarkedUnread { chat_id: i64, unread: i32 },
     /// What a `max.ru` link points at. `None` when the server has no card for it.
     LinkCard {
         url: String,
@@ -209,6 +219,19 @@ pub enum UiCommand {
     FetchLottie(String),
     /// Load the account's animated emoji for the picker.
     LoadAnimoji,
+    /// Pin or unpin a chat in the account settings.
+    SetPinned { chat_id: i64, pinned: bool },
+    /// Mute or unmute a chat.
+    SetMuted { chat_id: i64, muted: bool },
+    /// Show the chat as unread.
+    MarkUnread {
+        chat_id: i64,
+        message_id: Option<i64>,
+    },
+    /// Leave a group or a channel.
+    LeaveChat(i64),
+    /// Delete a dialog for ourselves.
+    DeleteChat(i64),
 }
 
 /// One active session of the account, for the account panel.
@@ -470,6 +493,25 @@ pub struct ChatRow {
     pub description: String,
     /// The chat's public link (empty if none).
     pub link: String,
+    /// `favIndex` from the account config. `0` is not pinned; a larger value sorts first.
+    pub pin_index: i64,
+    /// Notifications for this chat are off.
+    pub muted: bool,
+}
+
+/// Put `row` where the list keeps pinned chats above the rest, each group newest-pin or
+/// newest-message first.
+pub fn place_row(chats: &mut Vec<ChatRow>, row: ChatRow) {
+    let at = chats
+        .iter()
+        .position(|c| (c.pin_index, c.time) < (row.pin_index, row.time))
+        .unwrap_or(chats.len());
+    chats.insert(at, row);
+}
+
+/// Sort the whole list the way [`place_row`] inserts one chat.
+pub fn order_chats(chats: &mut [ChatRow]) {
+    chats.sort_by_key(|row| std::cmp::Reverse((row.pin_index, row.time)));
 }
 
 /// Handles to a running backend.
@@ -507,6 +549,16 @@ impl Backend {
             events,
             commands,
         })
+    }
+}
+
+fn settings_hash_now(slot: &Mutex<String>) -> String {
+    slot.lock().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+fn remember_hash(slot: &Mutex<String>, hash: Option<String>) {
+    if let Some(hash) = hash.filter(|h| !h.is_empty()) {
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) = hash;
     }
 }
 
@@ -630,7 +682,12 @@ async fn demo_flow(
             | UiCommand::CancelReaction { .. }
             | UiCommand::ReactionDetails { .. }
             | UiCommand::FetchLottie(_)
-            | UiCommand::LoadAnimoji => {}
+            | UiCommand::LoadAnimoji
+            | UiCommand::SetPinned { .. }
+            | UiCommand::SetMuted { .. }
+            | UiCommand::MarkUnread { .. }
+            | UiCommand::LeaveChat(_)
+            | UiCommand::DeleteChat(_) => {}
         }
     }
     let t = now_ms();
@@ -646,7 +703,7 @@ async fn demo_flow(
         ),
         ("Пётр", "Ок", 0, 3000),
     ];
-    let chats = chats
+    let mut chats: Vec<ChatRow> = chats
         .iter()
         .enumerate()
         .map(|(i, (title, preview, unread, minutes_ago))| ChatRow {
@@ -679,8 +736,12 @@ async fn demo_flow(
             } else {
                 String::new()
             },
+            // The team chat is pinned; the channel is muted.
+            pin_index: if i == 1 { t } else { 0 },
+            muted: i == 3,
         })
         .collect();
+    order_chats(&mut chats);
     let _ = ui.send(UiEvent::LoggedIn {
         me: "Демо-режим".into(),
         chats,
@@ -856,6 +917,26 @@ async fn demo_flow(
             }
             UiCommand::LoadAnimoji => {
                 let _ = ui.send(UiEvent::AnimojiCatalog(demo_animoji()));
+            }
+            UiCommand::SetPinned { chat_id, pinned } => {
+                let _ = ui.send(UiEvent::ChatPref {
+                    chat_id,
+                    pin_index: Some(if pinned { now_ms() } else { 0 }),
+                    muted: None,
+                });
+            }
+            UiCommand::SetMuted { chat_id, muted } => {
+                let _ = ui.send(UiEvent::ChatPref {
+                    chat_id,
+                    pin_index: None,
+                    muted: Some(muted),
+                });
+            }
+            UiCommand::MarkUnread { chat_id, .. } => {
+                let _ = ui.send(UiEvent::MarkedUnread { chat_id, unread: 1 });
+            }
+            UiCommand::LeaveChat(chat_id) | UiCommand::DeleteChat(chat_id) => {
+                let _ = ui.send(UiEvent::ChatRemoved(chat_id));
             }
             UiCommand::DownloadFile { name, .. } => {
                 let _ = ui.send(UiEvent::Notice(format!("Демо: {name} не скачивается")));
@@ -1278,6 +1359,7 @@ async fn run_logged_in(
     let http =
         Http::new(&CoreConfig::default().version.http_user_agent()).map_err(|e| e.to_string())?;
     let waiters: Arc<std::sync::Mutex<FileWaiters>> = Arc::default();
+    let settings_hash = Arc::new(Mutex::new(String::new()));
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -1285,6 +1367,9 @@ async fn run_logged_in(
                 let msg = match event {
                     CoreEvent::Connected => UiEvent::Status("Вход…".into()),
                     CoreEvent::LoggedIn(login) => {
+                        *settings_hash
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = login.config.hash.clone();
                         *names.write().unwrap_or_else(PoisonError::into_inner) = Names::from_login(&login);
                         let (me, chats) = rows_from_login(&login);
                         let peers = dialog_peers(&login);
@@ -1555,6 +1640,127 @@ async fn run_logged_in(
                                 Err(e) => {
                                     crate::trace::note(&format!("lottie {url} failed: {e}"));
                                     UiEvent::LottieFailed { url }
+                                }
+                            });
+                        });
+                    }
+                    UiCommand::SetPinned { chat_id, pinned } => {
+                        let (handle, ui, slot) = (handle.clone(), ui.clone(), settings_hash.clone());
+                        tokio::spawn(async move {
+                            let hash = settings_hash_now(&slot);
+                            let sent = async {
+                                let t = handle.transport()?;
+                                max_core::chats::set_pinned(&t, &hash, chat_id, pinned).await
+                            }
+                            .await;
+                            let _ = ui.send(match sent {
+                                Ok((pin_index, next)) => {
+                                    remember_hash(&slot, next);
+                                    UiEvent::ChatPref {
+                                        chat_id,
+                                        pin_index: Some(pin_index),
+                                        muted: None,
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::trace::note(&format!("pin failed: {e}"));
+                                    UiEvent::Notice(format!(
+                                        "Не удалось {} чат: {}",
+                                        if pinned { "закрепить" } else { "открепить" },
+                                        message(&e)
+                                    ))
+                                }
+                            });
+                        });
+                    }
+                    UiCommand::SetMuted { chat_id, muted } => {
+                        let (handle, ui, slot) = (handle.clone(), ui.clone(), settings_hash.clone());
+                        tokio::spawn(async move {
+                            let hash = settings_hash_now(&slot);
+                            let sent = async {
+                                let t = handle.transport()?;
+                                max_core::chats::set_muted(&t, &hash, chat_id, muted).await
+                            }
+                            .await;
+                            let _ = ui.send(match sent {
+                                Ok((muted, next)) => {
+                                    remember_hash(&slot, next);
+                                    UiEvent::ChatPref {
+                                        chat_id,
+                                        pin_index: None,
+                                        muted: Some(muted),
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::trace::note(&format!("mute failed: {e}"));
+                                    UiEvent::Notice(format!(
+                                        "Не удалось {} уведомления: {}",
+                                        if muted { "выключить" } else { "включить" },
+                                        message(&e)
+                                    ))
+                                }
+                            });
+                        });
+                    }
+                    UiCommand::MarkUnread { chat_id, message_id } => {
+                        let (handle, ui) = (handle.clone(), ui.clone());
+                        tokio::spawn(async move {
+                            let sent = async {
+                                let t = handle.transport()?;
+                                messages::mark_unread(&t, chat_id, message_id).await
+                            }
+                            .await;
+                            let _ = ui.send(match sent {
+                                Ok(answer) => UiEvent::MarkedUnread {
+                                    chat_id,
+                                    unread: answer.unread.unwrap_or(1).max(1),
+                                },
+                                Err(e) => {
+                                    crate::trace::note(&format!("mark unread failed: {e}"));
+                                    UiEvent::Notice(format!(
+                                        "Не удалось пометить чат непрочитанным: {}",
+                                        message(&e)
+                                    ))
+                                }
+                            });
+                        });
+                    }
+                    UiCommand::LeaveChat(chat_id) => {
+                        let (handle, ui) = (handle.clone(), ui.clone());
+                        tokio::spawn(async move {
+                            let sent = async {
+                                let t = handle.transport()?;
+                                max_core::chats::leave(&t, chat_id).await
+                            }
+                            .await;
+                            let _ = ui.send(match sent {
+                                Ok(()) => UiEvent::ChatRemoved(chat_id),
+                                Err(e) => {
+                                    crate::trace::note(&format!("leave failed: {e}"));
+                                    UiEvent::Notice(format!(
+                                        "Не удалось выйти из чата: {}",
+                                        message(&e)
+                                    ))
+                                }
+                            });
+                        });
+                    }
+                    UiCommand::DeleteChat(chat_id) => {
+                        let (handle, ui) = (handle.clone(), ui.clone());
+                        tokio::spawn(async move {
+                            let sent = async {
+                                let t = handle.transport()?;
+                                max_core::chats::delete_for_me(&t, chat_id).await
+                            }
+                            .await;
+                            let _ = ui.send(match sent {
+                                Ok(()) => UiEvent::ChatRemoved(chat_id),
+                                Err(e) => {
+                                    crate::trace::note(&format!("delete chat failed: {e}"));
+                                    UiEvent::Notice(format!(
+                                        "Не удалось удалить чат: {}",
+                                        message(&e)
+                                    ))
                                 }
                             });
                         });
@@ -2548,7 +2754,16 @@ pub fn rows_from_login(login: &LoginResponse) -> (String, Vec<ChatRow>) {
             })
         })
         .collect();
-    rows.sort_by_key(|r| std::cmp::Reverse(r.time));
+    if let Some(settings) = login.config.chats.as_ref() {
+        let now = now_ms();
+        for row in &mut rows {
+            if let Some(chat) = settings.get(&row.id) {
+                row.pin_index = max_core::chats::pin_index(chat);
+                row.muted = max_core::chats::is_muted(chat.dont_disturb_until, now);
+            }
+        }
+    }
+    order_chats(&mut rows);
     (contact_name(&login.profile.contact), rows)
 }
 
@@ -2618,6 +2833,8 @@ fn chat_row_with(
         members,
         description: chat.description.clone().unwrap_or_default(),
         link: chat.link.clone().unwrap_or_default(),
+        pin_index: 0,
+        muted: false,
     }
 }
 
@@ -2692,6 +2909,81 @@ mod tests {
         let titles: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(titles, ["Группа", "Анна", "Избранное"]);
         assert_eq!((rows[1].preview.as_str(), rows[1].unread), ("привет", 3));
+    }
+
+    #[test]
+    fn a_pinned_chat_sorts_above_a_newer_one_and_mute_is_read() {
+        use max_proto::schema::types::ChatSettings;
+
+        let older = Chat {
+            id: 1,
+            title: Some("Закреплённый".into()),
+            last_event_time: 10,
+            ..Chat::default()
+        };
+        let newer = Chat {
+            id: 2,
+            title: Some("Свежий".into()),
+            last_event_time: 90,
+            ..Chat::default()
+        };
+        let login = LoginResponse {
+            profile: ProfileT {
+                contact: contact(1, "Я"),
+                ..ProfileT::default()
+            },
+            chats: vec![newer, older],
+            config: max_proto::schema::types::Configuration {
+                chats: Some(
+                    [
+                        (
+                            1,
+                            ChatSettings {
+                                fav_index: Some(5),
+                                dont_disturb_until: Some(-1),
+                                ..ChatSettings::default()
+                            },
+                        ),
+                        (
+                            2,
+                            ChatSettings {
+                                dont_disturb_until: Some(0),
+                                ..ChatSettings::default()
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..max_proto::schema::types::Configuration::default()
+            },
+            ..LoginResponse::default()
+        };
+        let (_, rows) = rows_from_login(&login);
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(rows[0].muted);
+        assert!(!rows[1].muted);
+        assert_eq!(rows[0].pin_index, 5);
+    }
+
+    #[test]
+    fn a_new_message_does_not_jump_ahead_of_a_pin() {
+        let pinned = ChatRow {
+            id: 1,
+            pin_index: 10,
+            time: 50,
+            ..ChatRow::default()
+        };
+        let mut chats = vec![pinned];
+        place_row(
+            &mut chats,
+            ChatRow {
+                id: 2,
+                time: 200,
+                ..ChatRow::default()
+            },
+        );
+        assert_eq!(chats.iter().map(|c| c.id).collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[test]

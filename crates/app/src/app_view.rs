@@ -21,7 +21,7 @@ use max_core::media::Attachment;
 use crate::album;
 use crate::backend::{
     ChatKind, ChatRow, ContactRow, Delivery, MessageRow, Quote, ReactionCount, SessionRow,
-    UiCommand, UiEvent, element_marks, one_line, reaction_counts,
+    UiCommand, UiEvent, element_marks, one_line, place_row, reaction_counts,
 };
 use crate::desktop::{self, DesktopEvent};
 use crate::instance::Instance;
@@ -311,19 +311,20 @@ fn upsert_chat(chats: &mut Vec<ChatRow>, new: ChatRow) {
         let peer_mark = row.peer_mark.max(new.peer_mark);
         // A dialog's photo comes from the contact, which a NOTIF_CHAT may not carry.
         let avatar = new.avatar.clone().or_else(|| row.avatar.take());
+        // A server chat update does not carry pin and mute; those stay until a settings answer.
+        let pin_index = row.pin_index;
+        let muted = row.muted;
         *row = ChatRow {
             preview,
             time,
             peer_mark,
             avatar,
+            pin_index,
+            muted,
             ..new
         };
     } else {
-        let at = chats
-            .iter()
-            .position(|c| c.time < new.time)
-            .unwrap_or(chats.len());
-        chats.insert(at, new);
+        place_row(chats, new);
     }
 }
 
@@ -841,6 +842,44 @@ impl AppView {
                     upsert_chat(chats, new);
                 }
             }
+            UiEvent::ChatPref {
+                chat_id,
+                pin_index,
+                muted,
+            } => {
+                if let Screen::Main { chats, .. } = &mut self.screen
+                    && let Some(pos) = chats.iter().position(|c| c.id == chat_id)
+                {
+                    let mut row = chats.remove(pos);
+                    if let Some(pin_index) = pin_index {
+                        row.pin_index = pin_index;
+                    }
+                    if let Some(muted) = muted {
+                        row.muted = muted;
+                    }
+                    place_row(chats, row);
+                }
+            }
+            UiEvent::ChatRemoved(chat_id) => {
+                if let Screen::Main {
+                    chats, selected, ..
+                } = &mut self.screen
+                {
+                    chats.retain(|c| c.id != chat_id);
+                    if *selected == Some(chat_id) {
+                        *selected = None;
+                        self.profile_open = false;
+                    }
+                }
+                self.histories.remove(&chat_id);
+            }
+            UiEvent::MarkedUnread { chat_id, unread } => {
+                if let Screen::Main { chats, .. } = &mut self.screen
+                    && let Some(row) = chats.iter_mut().find(|c| c.id == chat_id)
+                {
+                    row.unread = unread.max(1);
+                }
+            }
             UiEvent::Contacts(rows) => {
                 self.contacts = rows;
             }
@@ -901,7 +940,7 @@ impl AppView {
             if !open && !message.out && message.delivery == Delivery::Sent {
                 row.unread += 1;
             }
-            chats.insert(0, row);
+            place_row(chats, row);
         }
         if let Some(h) = self.histories.get_mut(&chat_id) {
             h.add(message);
@@ -950,9 +989,9 @@ impl AppView {
         };
         let mut cache = Vec::with_capacity(rendered.len());
         for rgba in rendered {
-            let Some(buffer) =
-                image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(LOTTIE_PX, LOTTIE_PX, rgba)
-            else {
+            let Some(buffer) = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(
+                LOTTIE_PX, LOTTIE_PX, rgba,
+            ) else {
                 self.lotties.insert(url, LottieState::Failed);
                 return;
             };
@@ -1899,10 +1938,28 @@ impl AppView {
                             .gap_2()
                             .child(div().font_medium().truncate().child(row.title.clone()))
                             .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(short_time(row.time)),
+                                v_flex()
+                                    .items_end()
+                                    .flex_shrink_0()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(short_time(row.time)),
+                                    )
+                                    .when(row.pin_index > 0 || row.muted, |this| {
+                                        let mark = match (row.pin_index > 0, row.muted) {
+                                            (true, true) => "закреп · тихо",
+                                            (true, false) => "закреп",
+                                            _ => "тихо",
+                                        };
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(mark),
+                                        )
+                                    }),
                             ),
                     )
                     .child(
@@ -1933,6 +1990,169 @@ impl AppView {
                             }),
                     ),
             )
+    }
+
+    /// The right-click menu of a chat: pin, mute, mark unread, leave or delete.
+    fn chat_menu(
+        &self,
+        row: &ChatRow,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let view = cx.entity().downgrade();
+        let chat_id = row.id;
+        let pinned = row.pin_index > 0;
+        let muted = row.muted;
+        let unread = row.unread;
+        let kind = row.kind;
+        let message_id = self.histories.get(&chat_id).and_then(|h| {
+            h.messages
+                .iter()
+                .rev()
+                .find(|m| m.id != 0 && m.delivery == Delivery::Sent)
+                .map(|m| m.id)
+        });
+        move |menu, _, _| {
+            let view_pin = view.clone();
+            let view_mute = view.clone();
+            let mut menu = menu
+                .item(
+                    PopupMenuItem::new(if pinned {
+                        "Открепить"
+                    } else {
+                        "Закрепить"
+                    })
+                    .on_click(move |_, _, cx| {
+                        let _ = view_pin.update(cx, |this, cx| {
+                            this.send(
+                                UiCommand::SetPinned {
+                                    chat_id,
+                                    pinned: !pinned,
+                                },
+                                cx,
+                            );
+                        });
+                    }),
+                )
+                .item(
+                    PopupMenuItem::new(if muted {
+                        "Включить звук"
+                    } else {
+                        "Выключить звук"
+                    })
+                    .on_click(move |_, _, cx| {
+                        let _ = view_mute.update(cx, |this, cx| {
+                            this.send(
+                                UiCommand::SetMuted {
+                                    chat_id,
+                                    muted: !muted,
+                                },
+                                cx,
+                            );
+                        });
+                    }),
+                );
+            if unread == 0 {
+                let view_unread = view.clone();
+                menu = menu.item(PopupMenuItem::new("Пометить непрочитанным").on_click(
+                    move |_, _, cx| {
+                        let _ = view_unread.update(cx, |this, cx| {
+                            this.send(
+                                UiCommand::MarkUnread {
+                                    chat_id,
+                                    message_id,
+                                },
+                                cx,
+                            );
+                        });
+                    },
+                ));
+            }
+            if !matches!(kind, ChatKind::Saved) {
+                let view_remove = view.clone();
+                let leave = matches!(kind, ChatKind::Group | ChatKind::Channel);
+                menu = menu.separator().item(
+                    PopupMenuItem::new(if leave {
+                        "Выйти"
+                    } else {
+                        "Удалить чат"
+                    })
+                    .on_click(move |_, window, cx| {
+                        let _ = view_remove.update(cx, |this, cx| {
+                            this.ask_remove(chat_id, leave, window, cx);
+                        });
+                    }),
+                );
+            }
+            menu
+        }
+    }
+
+    /// Confirm leaving a group or channel, or deleting a dialog for ourselves.
+    fn ask_remove(
+        &mut self,
+        chat_id: i64,
+        leave: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let confirm = {
+                let view = view.clone();
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    let _ = view.update(cx, |this, cx| {
+                        this.send(
+                            if leave {
+                                UiCommand::LeaveChat(chat_id)
+                            } else {
+                                UiCommand::DeleteChat(chat_id)
+                            },
+                            cx,
+                        );
+                    });
+                    window.close_dialog(cx);
+                }
+            };
+            dialog
+                .w(px(440.))
+                .title(if leave {
+                    "Выйти из чата?"
+                } else {
+                    "Удалить чат?"
+                })
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if leave {
+                            "Чат пропадёт из списка. У остальных участников он останется."
+                        } else {
+                            "Чат пропадёт только у вас."
+                        }),
+                )
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("chat-remove-cancel")
+                                .ghost()
+                                .label("Отмена")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("chat-remove-confirm")
+                                .danger()
+                                .label(if leave {
+                                    "Выйти"
+                                } else {
+                                    "Удалить"
+                                })
+                                .on_click(confirm),
+                        ),
+                )
+        });
     }
 
     /// Link cards under the text: `SHARE` attachments, then a cached `LINK_INFO` card for a
@@ -2553,6 +2773,9 @@ impl AppView {
         let Some(chat) = chats.iter().find(|c| c.id == chat_id) else {
             return;
         };
+        if chat.muted {
+            return;
+        }
         let (title, body) = notification_text(chat, message, self.ui.preview);
         cx.show_system_notification(SystemNotification {
             tag: format!("{NOTIFY_TAG}{chat_id}").into(),
@@ -3862,7 +4085,9 @@ impl AppView {
                     .children(chats.iter().map(|row| {
                         let typing = self.typing_label(row);
                         let avatar = self.avatar(&row.title, row.avatar.as_ref(), 40., cx);
+                        let menu = self.chat_menu(row, cx);
                         Self::chat_row(row, selected == Some(row.id), typing, avatar, cx)
+                            .context_menu(menu)
                     }))
                     .into_any_element(),
             ),

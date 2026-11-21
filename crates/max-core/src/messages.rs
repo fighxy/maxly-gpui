@@ -160,6 +160,9 @@ pub fn new_message(push: &Response) -> Option<NewMessage> {
 /// `CHAT_MARK` type for "read up to this message" (`core.dll` converter `FUN_18122eb60`; the
 /// value set matches PyMax `ReadAction.READ_MESSAGE`).
 pub const READ_MESSAGE: &str = "READ_MESSAGE";
+/// `CHAT_MARK` type for "show this chat as unread". The other value beside [`READ_MESSAGE`]
+/// in that converter (PyMax `ReadAction`). Unverified on the live server.
+pub const SET_AS_UNREAD: &str = "SET_AS_UNREAD";
 
 /// The server's answer to [`mark_read`]: the new read mark and unread count.
 pub type MarkResponse = max_proto::schema::packets::chat::chat_mark::Response;
@@ -290,6 +293,22 @@ pub async fn mark_read(
         mark: Some(now_ms()),
         message_id: Some(message_id),
         type_: Some(READ_MESSAGE.to_string()),
+    };
+    Ok(transport.call(Opcode::ChatMark, &params).await?)
+}
+
+/// Mark `chat_id` unread (`CHAT_MARK`, `type` [`SET_AS_UNREAD`]). `message_id` is the newest
+/// message we know, when the history is loaded.
+pub async fn mark_unread(
+    transport: &Transport,
+    chat_id: i64,
+    message_id: Option<i64>,
+) -> Result<MarkResponse> {
+    let params = max_proto::schema::packets::chat::chat_mark::Parameters {
+        chat_id,
+        mark: Some(now_ms()),
+        message_id,
+        type_: Some(SET_AS_UNREAD.to_string()),
     };
     Ok(transport.call(Opcode::ChatMark, &params).await?)
 }

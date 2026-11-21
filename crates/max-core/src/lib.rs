@@ -14,6 +14,7 @@
 pub mod account;
 pub mod assets;
 mod auth;
+pub mod chats;
 mod config;
 pub mod contacts;
 mod error;

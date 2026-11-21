@@ -1,8 +1,8 @@
-//! maxrs: a telemetry-free MAX desktop client (ADR-007: gpui + gpui-kit).
+//! maxly-gpui: a telemetry-free MAX desktop client (ADR-007: gpui + gpui-kit).
 //!
-//! `maxrs --demo` shows the screens on made-up data without any network access;
-//! `maxrs --demo-walk` steps through every screen on a timer (for screenshots);
-//! `maxrs --trace` writes a local protocol trace without personal data (`trace.rs`).
+//! `maxly-gpui --demo` shows the screens on made-up data without any network access;
+//! `maxly-gpui --demo-walk` steps through every screen on a timer (for screenshots);
+//! `maxly-gpui --trace` writes a local protocol trace without personal data (`trace.rs`).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -65,8 +65,8 @@ fn main() {
             gpui_kit::init(cx);
             // The AppUserModelID Windows shows notifications under (registered for this user on
             // the first notification, as GPUI does for unpackaged apps).
-            cx.set_app_identity("maxrs.desktop", "maxrs");
-            let title: SharedString = if demo { "maxrs — демо" } else { "maxrs" }.into();
+            cx.set_app_identity("maxly-gpui.desktop", "maxly-gpui");
+            let title: SharedString = if demo { "maxly-gpui — демо" } else { "maxly-gpui" }.into();
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1100.), px(720.)), cx)),
                 titlebar: Some(TitlebarOptions {

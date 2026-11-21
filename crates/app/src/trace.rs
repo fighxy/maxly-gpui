@@ -1,4 +1,4 @@
-//! Local protocol trace (`maxrs --trace`): one line per frame and per notable step, with
+//! Local protocol trace (`maxly-gpui --trace`): one line per frame and per notable step, with
 //! personal data removed (`max_proto::redact`). Written only to the local data folder; nothing
 //! is sent anywhere.
 
@@ -20,9 +20,9 @@ struct TraceLog {
 
 static LOG: OnceLock<TraceLog> = OnceLock::new();
 
-/// Where traces go: `%LOCALAPPDATA%\maxrs\traces`.
+/// Where traces go: `%LOCALAPPDATA%\maxly-gpui\traces`.
 fn traces_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("maxrs").join("traces"))
+    max_store::local_data_dir().map(|d| d.join("traces"))
 }
 
 /// Start tracing into a new file; returns its path.

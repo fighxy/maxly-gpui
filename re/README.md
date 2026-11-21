@@ -40,7 +40,7 @@ eats `| ^ & < >` on the command line.
 Packet schemas end to end:
 
 ```sh
-bash re/scripts/gh.sh core.dll ExtractSchemas.java 'C:\dev\maxrs\re\out\schemas.tsv'
+bash re/scripts/gh.sh core.dll ExtractSchemas.java 'C:\dev\maxly-gpui\re\out\schemas.tsv'
 cp re/out/schemas.tsv rust/research/packet-schemas.tsv
 node re/scripts/schemas_md.mjs rust/research/packet-schemas.tsv rust/research/packet-schemas.md
 node re/scripts/gen_schema_rs.mjs rust/research/packet-schemas.tsv crates/max-proto/src/schema.rs
@@ -50,7 +50,7 @@ cargo fmt --all
 Import another binary:
 
 ```sh
-cmd //c "%GHIDRA_INSTALL_DIR%\support\analyzeHeadless.bat" 'C:\dev\maxrs\re\ghidra' max -import 'C:\MAX\<file>.dll' -max-cpu 16
+cmd //c "%GHIDRA_INSTALL_DIR%\support\analyzeHeadless.bat" 'C:\dev\maxly-gpui\re\ghidra' max -import 'C:\MAX\<file>.dll' -max-cpu 16
 ```
 
 String-only extractors (no Ghidra): `re/scripts/opcodes.sh` (opcode table from

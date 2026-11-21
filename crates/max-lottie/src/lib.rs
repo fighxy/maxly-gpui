@@ -26,9 +26,16 @@ pub fn frame_count(json: &[u8]) -> Option<u32> {
     })
 }
 
-/// Frame `index` of `json` as tightly packed RGBA, `size` pixels square. `None` when it cannot
-/// be drawn.
+/// Frame `index` of `json` as tightly packed BGRA, `size` pixels square. `None` when it cannot
+/// be drawn. The bytes are straight (not premultiplied) BGRA, which is what the window atlas
+/// stores.
 pub fn render_frame(json: &[u8], index: u32, size: u32) -> Option<Vec<u8>> {
+    let mut frames = render_frames(json, size, Some(index))?;
+    frames.pop()
+}
+
+/// Every frame of `json`, loaded once. `only` draws that single frame instead.
+pub fn render_frames(json: &[u8], size: u32, only: Option<u32>) -> Option<Vec<Vec<u8>>> {
     if size == 0 || json.is_empty() {
         return None;
     }
@@ -39,7 +46,7 @@ pub fn render_frame(json: &[u8], index: u32, size: u32) -> Option<Vec<u8>> {
         // The canvas writes `buffer` during draw and sync. It is dropped before the pixels are read.
         let drawn = unsafe {
             canvas
-                .set_target(&mut buffer, size, size, size, ColorSpace::ABGR8888)
+                .set_target(&mut buffer, size, size, size, ColorSpace::ABGR8888S)
                 .is_ok()
         };
         if !drawn {
@@ -51,16 +58,36 @@ pub fn render_frame(json: &[u8], index: u32, size: u32) -> Option<Vec<u8>> {
             .ok()?;
         anim.picture_mut().set_size(size as f32, size as f32).ok()?;
         let total = anim.total_frame().unwrap_or(1.0).max(1.0);
-        let frame = (index as f32).min(total - 1.0).max(0.0);
-        let _ = anim.set_frame(frame);
-        let copy = anim.picture().duplicate()?;
-        canvas.add(copy).ok()?;
-        canvas.draw(true).ok()?;
-        canvas.sync().ok()?;
+        let count = total.floor().max(1.0) as u32;
+        let start = only.unwrap_or(0).min(count - 1);
+        let end = only.map_or(count, |_| start + 1);
+        let mut frames = Vec::with_capacity((end - start) as usize);
+        for index in start..end {
+            canvas.clear().ok()?;
+            let _ = anim.set_frame((index as f32).min(total - 1.0));
+            let copy = anim.picture().duplicate()?;
+            canvas.add(copy).ok()?;
+            // `true` clears the pixel buffer before this frame is drawn.
+            canvas.draw(true).ok()?;
+            canvas.sync().ok()?;
+            frames.push(straight_bgra(&buffer));
+        }
         drop(canvas);
-        // ABGR8888 stores R in the low byte, so little-endian bytes are already R, G, B, A.
-        Some(buffer.into_iter().flat_map(u32::to_le_bytes).collect())
+        Some(frames)
     })
+}
+
+/// ABGR8888S keeps R in the low byte. The window atlas is BGRA, so red and blue trade places.
+fn straight_bgra(buffer: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buffer.len() * 4);
+    for &pixel in buffer {
+        let r = (pixel & 0xFF) as u8;
+        let g = ((pixel >> 8) & 0xFF) as u8;
+        let b = ((pixel >> 16) & 0xFF) as u8;
+        let a = ((pixel >> 24) & 0xFF) as u8;
+        out.extend_from_slice(&[b, g, r, a]);
+    }
+    out
 }
 
 fn with_engine<T>(body: impl FnOnce(&Thorvg) -> Option<T>) -> Option<T> {
@@ -89,6 +116,21 @@ mod tests {
         assert!(
             frame.chunks(4).any(|px| px[3] > 0),
             "a frame has a visible pixel"
+        );
+    }
+
+    #[test]
+    fn a_blue_dot_is_stored_with_blue_first() {
+        // The pulse fill is blue. The atlas reads the first byte as blue.
+        let frame = render_frame(PULSE.as_bytes(), 0, 32).expect("pixels");
+        let pixel = frame
+            .chunks(4)
+            .filter(|px| px[3] > 200)
+            .max_by_key(|px| u16::from(px[0]) + u16::from(px[1]) + u16::from(px[2]))
+            .expect("an opaque pixel");
+        assert!(
+            pixel[0] > pixel[2],
+            "blue is the first byte, red the third, got {pixel:?}"
         );
     }
 }

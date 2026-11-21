@@ -1,5 +1,5 @@
 # Post a left click to a window at client coordinates, without moving the real cursor.
-# Usage: powershell -File tools/window-click.ps1 -ProcessName maxrs -X 289 -Y 25
+# Usage: powershell -File tools/window-click.ps1 -ProcessName maxly-gpui -X 289 -Y 25
 param(
     [Parameter(Mandatory = $true)][string]$ProcessName,
     [Parameter(Mandatory = $true)][int]$X,

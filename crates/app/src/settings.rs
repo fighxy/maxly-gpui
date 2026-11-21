@@ -1,4 +1,4 @@
-//! Local interface settings (theme, font size), kept in `%LOCALAPPDATA%\maxrs\ui.txt` as
+//! Local interface settings (theme, font size), kept in `%LOCALAPPDATA%\maxly-gpui\ui.txt` as
 //! `key=value` lines. Nothing here leaves the machine or holds account data.
 
 use std::path::PathBuf;
@@ -122,7 +122,7 @@ impl UiSettings {
 
     /// The settings file, next to the profiles folder.
     pub fn path() -> Option<PathBuf> {
-        dirs::data_local_dir().map(|d| d.join("maxrs").join("ui.txt"))
+        max_store::local_data_dir().map(|d| d.join("ui.txt"))
     }
 
     /// Load from disk; a missing or unreadable file gives the defaults.

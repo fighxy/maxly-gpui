@@ -21,7 +21,7 @@ use max_core::media::Attachment;
 use crate::album;
 use crate::backend::{
     ChatKind, ChatRow, ContactRow, Delivery, MessageRow, Quote, ReactionCount, SessionRow,
-    UiCommand, UiEvent, one_line, reaction_counts,
+    UiCommand, UiEvent, element_marks, one_line, reaction_counts,
 };
 use crate::desktop::{self, DesktopEvent};
 use crate::instance::Instance;
@@ -341,13 +341,15 @@ enum LottieState {
     Failed,
 }
 
-/// One animated emoji. Drawn frames stay, so a frame is rasterized only the first time it shows.
+/// One animated emoji. Every frame is rasterized off the UI thread before it is shown.
 struct LottieClip {
     frames: u32,
     index: u32,
-    cache: Vec<Option<Arc<RenderImage>>>,
-    json: Vec<u8>,
+    cache: Vec<Arc<RenderImage>>,
 }
+
+/// Raster size of an animated emoji. Shown at 28px; 48 keeps it sharp on a 2× screen.
+const LOTTIE_PX: u32 = 48;
 
 /// The image format of downloaded bytes, by their signature.
 fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
@@ -401,6 +403,16 @@ pub struct AppView {
     reaction_picker: Option<(i64, i64)>,
     /// Who reacted to a message, while that list is open.
     reaction_people: Option<(i64, Vec<(String, String)>)>,
+    /// The emoji picker is open above the composer.
+    emoji_open: bool,
+    /// Animated emoji already loaded. `None` until the first request finishes.
+    animoji: Option<Vec<max_core::assets::AnimojiFace>>,
+    /// A catalog request is in flight.
+    animoji_loading: bool,
+    /// Why the animated catalog is missing, when the request failed.
+    animoji_note: Option<String>,
+    /// Animated emoji inserted into the composer and not yet deleted.
+    animoji_picks: Vec<max_core::assets::AnimojiFace>,
     screen: Screen,
     histories: HashMap<i64, History>,
     phone: Entity<InputState>,
@@ -564,6 +576,11 @@ impl AppView {
             reaction_choices: HashMap::new(),
             reaction_picker: None,
             reaction_people: None,
+            emoji_open: false,
+            animoji: None,
+            animoji_loading: false,
+            animoji_note: None,
+            animoji_picks: Vec::new(),
             commands,
             account: None,
             typing: HashMap::new(),
@@ -694,25 +711,34 @@ impl AppView {
             }
             UiEvent::Lottie { url, bytes } => {
                 let json = bytes.to_vec();
-                let frames = max_lottie::frame_count(&json).unwrap_or(0);
-                if frames == 0 {
-                    self.lotties.insert(url, LottieState::Failed);
-                } else {
-                    self.lotties.insert(
-                        url.clone(),
-                        LottieState::Ready(LottieClip {
-                            frames,
-                            index: 0,
-                            cache: vec![None; frames as usize],
-                            json,
-                        }),
-                    );
-                    self.paint_lottie(&url);
-                    self.ensure_lottie_clock(cx);
-                }
+                let url_done = url.clone();
+                cx.spawn(async move |this, cx| {
+                    let rendered = cx
+                        .background_executor()
+                        .spawn(async move { max_lottie::render_frames(&json, LOTTIE_PX, None) })
+                        .await;
+                    let _ = this.update(cx, |view, cx| {
+                        view.store_lottie(url_done, rendered);
+                        view.ensure_lottie_clock(cx);
+                        cx.notify();
+                    });
+                })
+                .detach();
             }
             UiEvent::LottieFailed { url } => {
                 self.lotties.insert(url, LottieState::Failed);
+            }
+            UiEvent::AnimojiCatalog(faces) => {
+                let urls = faces.iter().map(|face| face.lottie_url.clone());
+                self.request_lotties(urls);
+                self.animoji = Some(faces);
+                self.animoji_loading = false;
+                self.animoji_note = None;
+            }
+            UiEvent::AnimojiFailed(note) => {
+                self.animoji = Some(Vec::new());
+                self.animoji_loading = false;
+                self.animoji_note = Some(note);
             }
             UiEvent::Sessions(rows) => {
                 if let Some(panel) = &mut self.account {
@@ -745,6 +771,8 @@ impl AppView {
                 self.reaction_choices.clear();
                 self.reaction_picker = None;
                 self.reaction_people = None;
+                self.emoji_open = false;
+                self.animoji_picks.clear();
                 self.screen = Screen::Status("Вы вышли из аккаунта".into());
             }
             UiEvent::MessageEdited { chat_id, message } => {
@@ -914,36 +942,31 @@ impl AppView {
         }
     }
 
-    /// Draw the current frame of a Lottie emoji, once, and keep it.
-    fn paint_lottie(&mut self, url: &str) {
-        let Some(LottieState::Ready(clip)) = self.lotties.get(url) else {
+    /// Keep a fully rasterized emoji. A file ThorVG cannot draw stays the plain character.
+    fn store_lottie(&mut self, url: String, rendered: Option<Vec<Vec<u8>>>) {
+        let Some(rendered) = rendered.filter(|frames| !frames.is_empty()) else {
+            self.lotties.insert(url, LottieState::Failed);
             return;
         };
-        let index = clip.index;
-        if clip
-            .cache
-            .get(index as usize)
-            .and_then(|frame| frame.as_ref())
-            .is_some()
-        {
-            return;
+        let mut cache = Vec::with_capacity(rendered.len());
+        for rgba in rendered {
+            let Some(buffer) =
+                image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(LOTTIE_PX, LOTTIE_PX, rgba)
+            else {
+                self.lotties.insert(url, LottieState::Failed);
+                return;
+            };
+            cache.push(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])));
         }
-        let json = clip.json.clone();
-        let Some(rgba) = max_lottie::render_frame(&json, index, 48) else {
-            return;
-        };
-        let Some(buffer) = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(48, 48, rgba)
-        else {
-            return;
-        };
-        let frame = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
-        let Some(LottieState::Ready(clip)) = self.lotties.get_mut(url) else {
-            return;
-        };
-        if clip.cache.len() <= index as usize {
-            clip.cache.resize(index as usize + 1, None);
-        }
-        clip.cache[index as usize] = Some(frame);
+        let frames = u32::try_from(cache.len()).unwrap_or(u32::MAX);
+        self.lotties.insert(
+            url,
+            LottieState::Ready(LottieClip {
+                frames,
+                index: 0,
+                cache,
+            }),
+        );
     }
 
     fn ensure_lottie_clock(&mut self, cx: &mut Context<Self>) {
@@ -964,22 +987,19 @@ impl AppView {
                     .timer(std::time::Duration::from_millis(50))
                     .await;
                 let keep = this.update(cx, |view, cx| {
-                    let mut urls = Vec::new();
-                    for (url, state) in &mut view.lotties {
+                    let mut playing = false;
+                    for state in view.lotties.values_mut() {
                         if let LottieState::Ready(clip) = state
                             && clip.frames > 1
                         {
                             clip.index = (clip.index + 1) % clip.frames;
-                            urls.push(url.clone());
+                            playing = true;
                         }
                     }
-                    for url in &urls {
-                        view.paint_lottie(url);
-                    }
-                    if !urls.is_empty() {
+                    if playing {
                         cx.notify();
                     }
-                    !urls.is_empty()
+                    playing
                 });
                 if !keep.unwrap_or(false) {
                     break;
@@ -1202,6 +1222,7 @@ impl AppView {
         };
         if *selected != Some(chat_id) {
             self.compose = None;
+            self.emoji_open = false;
         }
         *selected = Some(chat_id);
         self.section = Section::Chats;
@@ -1245,7 +1266,9 @@ impl AppView {
         else {
             return;
         };
-        if self.composer.read(cx).value().trim().is_empty() {
+        let text = self.composer.read(cx).value().to_string();
+        self.animoji_picks = max_core::assets::claim_animoji(&text, &self.animoji_picks);
+        if text.trim().is_empty() {
             return;
         }
         let now = std::time::Instant::now();
@@ -1525,6 +1548,7 @@ impl AppView {
         if text.is_empty() {
             return;
         }
+        let elements = max_core::assets::animoji_elements(&text, &self.animoji_picks);
         if let Some(Compose::Edit {
             message_id,
             original,
@@ -1557,7 +1581,7 @@ impl AppView {
             time: cid,
             delivery: Delivery::Pending,
             reply: quote.clone(),
-            marks: rich::autolinks(&text, &[]),
+            marks: rich::autolinks(&text, &element_marks(&text, &elements)),
             ..MessageRow::default()
         };
         if self
@@ -1567,10 +1591,12 @@ impl AppView {
                 text,
                 cid,
                 reply_to: quote.map(|q| q.id),
+                elements,
             })
             .is_ok()
         {
             self.compose = None;
+            self.animoji_picks.clear();
             self.message_added(chat_id, pending);
             self.composer
                 .update(cx, |input, cx| input.set_value("", window, cx));
@@ -2176,6 +2202,7 @@ impl AppView {
         chat_id: i64,
         m: &MessageRow,
         key: u64,
+        who: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.reaction_picker == Some((chat_id, m.id));
@@ -2186,59 +2213,58 @@ impl AppView {
             .map(|(_, lines)| lines.clone());
         let message_id = m.id;
         v_flex()
+            .w_full()
             .gap_1()
             .when(open, |this| {
                 let palette = self.reaction_palette(chat_id);
-                this.child(
-                    h_flex()
-                        .gap_1()
-                        .children(palette.into_iter().enumerate().map(|(i, emoji)| {
-                            let chosen = emoji.clone();
-                            Button::new(("plate", key.wrapping_add(i as u64)))
-                                .xsmall()
-                                .ghost()
-                                .label(emoji)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.toggle_reaction(chat_id, message_id, &chosen);
-                                    cx.notify();
-                                }))
-                        })),
-                )
+                this.child(h_flex().w_full().flex_wrap().gap_1().children(
+                    palette.into_iter().enumerate().map(|(i, emoji)| {
+                        let chosen = emoji.clone();
+                        Button::new(("plate", key.wrapping_add(i as u64)))
+                            .xsmall()
+                            .ghost()
+                            .label(emoji)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_reaction(chat_id, message_id, &chosen);
+                                cx.notify();
+                            }))
+                    }),
+                ))
             })
             .child(
                 h_flex()
+                    .w_full()
+                    .flex_wrap()
                     .gap_1()
                     .items_center()
                     .children(m.reactions.iter().enumerate().map(|(i, chip)| {
                         let emoji = chip.emoji.clone();
                         let label = format!("{} {}", chip.emoji, chip.count);
                         let mine = chip.mine;
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new(("chip", key.wrapping_add(20 + i as u64)))
-                                    .xsmall()
-                                    .when(mine, |this| this.selected(true))
-                                    .ghost()
-                                    .label(label)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_reaction(chat_id, message_id, &emoji);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new(("who", key.wrapping_add(40 + i as u64)))
-                                    .xsmall()
-                                    .ghost()
-                                    .label("кто")
-                                    .on_click(cx.listener(move |this, _, _, _| {
-                                        let _ = this.commands.send(UiCommand::ReactionDetails {
-                                            chat_id,
-                                            message_id,
-                                        });
-                                    })),
-                            )
+                        Button::new(("chip", key.wrapping_add(20 + i as u64)))
+                            .xsmall()
+                            .when(mine, |this| this.selected(true))
+                            .ghost()
+                            .label(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_reaction(chat_id, message_id, &emoji);
+                                cx.notify();
+                            }))
                     }))
+                    .when(who && !m.reactions.is_empty(), |this| {
+                        this.child(
+                            Button::new(("who", key))
+                                .xsmall()
+                                .ghost()
+                                .label("кто")
+                                .on_click(cx.listener(move |this, _, _, _| {
+                                    let _ = this.commands.send(UiCommand::ReactionDetails {
+                                        chat_id,
+                                        message_id,
+                                    });
+                                })),
+                        )
+                    })
                     .child(
                         Button::new(("add-react", key))
                             .xsmall()
@@ -2303,7 +2329,7 @@ impl AppView {
 
     fn animoji_view(&self, url: &str, fallback: &str) -> AnyElement {
         let frame = self.lotties.get(url).and_then(|state| match state {
-            LottieState::Ready(clip) => clip.cache.get(clip.index as usize).and_then(|f| f.clone()),
+            LottieState::Ready(clip) => clip.cache.get(clip.index as usize).cloned(),
             _ => None,
         });
         match frame {
@@ -3065,6 +3091,7 @@ impl AppView {
         m: &MessageRow,
         chat_title: &str,
         peer_mark: i64,
+        who: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // Photos and videos go into one grid; files and stickers follow it one by one.
@@ -3179,7 +3206,7 @@ impl AppView {
                 clock(m.time)
             )))
             .when(m.id != 0 && m.delivery == Delivery::Sent, |this| {
-                this.child(self.reaction_row(chat_id, m, message_key, cx))
+                this.child(self.reaction_row(chat_id, m, message_key, who, cx))
             });
         let key =
             u64::from_ne_bytes(if m.id != 0 { m.id } else { m.cid.unwrap_or(0) }.to_ne_bytes());
@@ -3367,8 +3394,15 @@ impl AppView {
                 last_day = day;
             }
             items.push(
-                self.bubble(chat.id, m, &chat.title, chat.peer_mark, cx)
-                    .into_any_element(),
+                self.bubble(
+                    chat.id,
+                    m,
+                    &chat.title,
+                    chat.peer_mark,
+                    chat.kind != ChatKind::Channel,
+                    cx,
+                )
+                .into_any_element(),
             );
         }
         let chat_id = chat.id;
@@ -3451,6 +3485,9 @@ impl AppView {
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .children(self.compose_bar(cx))
+                    .when(self.emoji_open && chat.kind != ChatKind::Channel, |this| {
+                        this.child(self.emoji_panel(cx))
+                    })
                     .child(
                         h_flex()
                             .gap_2()
@@ -3463,6 +3500,29 @@ impl AppView {
                                     .disabled(matches!(self.compose, Some(Compose::Edit { .. })))
                                     .on_click(cx.listener(|this, _, _, cx| this.pick_file(cx))),
                             )
+                            .when(chat.kind != ChatKind::Channel, |this| {
+                                let open = self.emoji_open;
+                                this.child(
+                                    Button::new("emoji")
+                                        .ghost()
+                                        .selected(open)
+                                        .label("😊")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.emoji_open = !this.emoji_open;
+                                            if this.emoji_open
+                                                && this.animoji.is_none()
+                                                && !this.animoji_loading
+                                                && this
+                                                    .commands
+                                                    .send(UiCommand::LoadAnimoji)
+                                                    .is_ok()
+                                            {
+                                                this.animoji_loading = true;
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .child(div().flex_1().child(Input::new(&self.composer)))
                             .child(
                                 Button::new("send")
@@ -3614,6 +3674,112 @@ impl AppView {
                         this.child(Self::info_row("Тип", kind.to_string(), cx))
                     }),
             )
+    }
+
+    /// Plain emoji the picker offers. Animated ones come from the server.
+    const EMOJI: &'static [&'static str] = &[
+        "😀", "😁", "😂", "🤣", "😊", "😍", "😘", "😎", "🤔", "😴", "😢", "😭", "😡", "🤯", "👍",
+        "👎", "👏", "🙏", "🔥", "❤️", "🎉", "✅", "❌", "⭐", "💯", "🤝", "👀", "💪", "🎂", "🚀",
+    ];
+
+    /// The plate above the composer: plain emoji, then the animated ones that play.
+    fn emoji_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let faces = self.animoji.clone().unwrap_or_default();
+        v_flex()
+            .id("emoji-panel")
+            .w_full()
+            .max_h(px(240.))
+            .overflow_y_scroll()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Смайлики"),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(Self::EMOJI.iter().enumerate().map(|(i, emoji)| {
+                        let chosen = (*emoji).to_string();
+                        Button::new(("moji", i as u64))
+                            .xsmall()
+                            .ghost()
+                            .label(*emoji)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.insert_emoji(&chosen, None, window, cx);
+                            }))
+                    })),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Анимированные"),
+            )
+            .child(if self.animoji_loading {
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Загрузка…")
+                    .into_any_element()
+            } else if faces.is_empty() {
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        self.animoji_note
+                            .clone()
+                            .unwrap_or_else(|| "Анимированных смайликов нет".to_string()),
+                    )
+                    .into_any_element()
+            } else {
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(faces.into_iter().enumerate().map(|(i, face)| {
+                        let chosen = face.clone();
+                        div()
+                            .id(("face", i as u64))
+                            .w(px(36.))
+                            .h(px(36.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .rounded(px(6.))
+                            .hover(|this| this.bg(cx.theme().secondary_hover))
+                            .child(self.animoji_view(&face.lottie_url, &face.emoji))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.insert_emoji(&chosen.emoji, Some(chosen.clone()), window, cx);
+                            }))
+                            .into_any_element()
+                    }))
+                    .into_any_element()
+            })
+    }
+
+    /// Put `emoji` at the cursor. An animated one is remembered until the text loses it.
+    fn insert_emoji(
+        &mut self,
+        emoji: &str,
+        face: Option<max_core::assets::AnimojiFace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editing = matches!(self.compose, Some(Compose::Edit { .. }));
+        if let Some(face) = face.filter(|_| !editing) {
+            self.animoji_picks.push(face);
+        }
+        let emoji = emoji.to_string();
+        self.composer
+            .update(cx, |input, cx| input.insert(emoji, window, cx));
+        self.focus_composer(window, cx);
     }
 
     /// The line above the composer while replying or editing, with a button to drop it.
@@ -4324,7 +4490,7 @@ impl AppView {
             SettingsPage::About.title(),
             vec![
                 Self::group(
-                    "maxrs",
+                    "maxly-gpui",
                     vec![
                         Self::info_row("Версия", env!("CARGO_PKG_VERSION").to_string(), cx),
                         line("Клиент мессенджера MAX для Windows без телеметрии."),
@@ -4476,7 +4642,7 @@ impl Render for AppView {
                 v_flex()
                     .items_center()
                     .gap_2()
-                    .child(div().text_2xl().font_semibold().child("maxrs"))
+                    .child(div().text_2xl().font_semibold().child("maxly-gpui"))
                     .child(
                         div()
                             .text_color(cx.theme().muted_foreground)

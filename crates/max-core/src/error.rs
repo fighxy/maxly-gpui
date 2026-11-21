@@ -15,6 +15,9 @@ pub enum CoreError {
     /// The server's answer to a login step has none of the expected outcomes.
     #[error("unexpected login answer: {0}")]
     UnexpectedAuthAnswer(String),
+    /// An assets response did not contain the animated emoji set.
+    #[error("{0}")]
+    Assets(String),
     /// An HTTP request (media download, upload) failed.
     #[error("http: {0}")]
     Http(String),

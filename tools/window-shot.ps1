@@ -1,5 +1,5 @@
 # Capture one window of a running process to a PNG (only that window, not the screen).
-# Usage: powershell -File tools/window-shot.ps1 -ProcessName maxrs -Out shot.png
+# Usage: powershell -File tools/window-shot.ps1 -ProcessName maxly-gpui -Out shot.png
 param(
     [Parameter(Mandatory = $true)][string]$ProcessName,
     [Parameter(Mandatory = $true)][string]$Out

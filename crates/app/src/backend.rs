@@ -117,6 +117,10 @@ pub enum UiEvent {
     Lottie { url: String, bytes: bytes::Bytes },
     /// A Lottie file did not load.
     LottieFailed { url: String },
+    /// Animated emoji for the picker.
+    AnimojiCatalog(Vec<max_core::assets::AnimojiFace>),
+    /// The animated catalog did not load. The plain emoji stay available.
+    AnimojiFailed(String),
     /// The people we know, for the contacts section.
     Contacts(Vec<ContactRow>),
     /// Something failed; shown with a way to start over.
@@ -147,6 +151,8 @@ pub enum UiCommand {
         text: String,
         cid: i64,
         reply_to: Option<i64>,
+        /// `ANIMOJI` elements for animated emoji in `text`.
+        elements: Vec<max_proto::schema::types::MessageElement>,
     },
     /// Replace the text of our message.
     EditText {
@@ -201,6 +207,8 @@ pub enum UiCommand {
     ReactionDetails { chat_id: i64, message_id: i64 },
     /// Load a Lottie emoji.
     FetchLottie(String),
+    /// Load the account's animated emoji for the picker.
+    LoadAnimoji,
 }
 
 /// One active session of the account, for the account panel.
@@ -480,7 +488,7 @@ impl Backend {
     pub fn start(demo: bool, walk: bool) -> std::io::Result<Backend> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("maxrs-core")
+            .thread_name("maxly-gpui-core")
             .enable_all()
             .build()?;
         let (ui_tx, events) = unbounded_channel();
@@ -621,7 +629,8 @@ async fn demo_flow(
             | UiCommand::React { .. }
             | UiCommand::CancelReaction { .. }
             | UiCommand::ReactionDetails { .. }
-            | UiCommand::FetchLottie(_) => {}
+            | UiCommand::FetchLottie(_)
+            | UiCommand::LoadAnimoji => {}
         }
     }
     let t = now_ms();
@@ -755,7 +764,11 @@ async fn demo_flow(
                 let _ = ui.send(UiEvent::MessagesDeleted { chat_id, ids });
             }
             UiCommand::SendText {
-                chat_id, text, cid, ..
+                chat_id,
+                text,
+                cid,
+                elements,
+                ..
             } => {
                 let ui = ui.clone();
                 tokio::spawn(async move {
@@ -763,6 +776,9 @@ async fn demo_flow(
                     let mut row = demo_row(cid, true, &text, now_ms(), Delivery::Sent);
                     row.id = cid;
                     row.cid = Some(cid);
+                    if !elements.is_empty() {
+                        row.marks = rich::autolinks(&text, &element_marks(&text, &elements));
+                    }
                     let _ = ui.send(UiEvent::MessageAdded {
                         chat_id,
                         message: row,
@@ -837,6 +853,9 @@ async fn demo_flow(
                     Some(bytes) => UiEvent::Lottie { url, bytes },
                     None => UiEvent::LottieFailed { url },
                 });
+            }
+            UiCommand::LoadAnimoji => {
+                let _ = ui.send(UiEvent::AnimojiCatalog(demo_animoji()));
             }
             UiCommand::DownloadFile { name, .. } => {
                 let _ = ui.send(UiEvent::Notice(format!("Демо: {name} не скачивается")));
@@ -918,6 +937,19 @@ fn demo_sessions(now: i64, only_current: bool) -> Vec<SessionRow> {
         ));
     }
     rows
+}
+
+fn demo_animoji() -> Vec<max_core::assets::AnimojiFace> {
+    ["👋", "🔥", "😂", "❤️"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, emoji)| max_core::assets::AnimojiFace {
+            id: i64::try_from(i).unwrap_or(0) + 1,
+            set_id: Some(1),
+            emoji: emoji.to_string(),
+            lottie_url: "demo://lottie/pulse".into(),
+        })
+        .collect()
 }
 
 fn demo_row(id: i64, out: bool, text: &str, time: i64, delivery: Delivery) -> MessageRow {
@@ -1174,12 +1206,36 @@ fn demo_history(chat_id: i64, now: i64) -> Vec<MessageRow> {
 
 // ---- real ----------------------------------------------------------------------------------
 
+/// Credential target for this client. While the data folder is still under the previous
+/// name, keep that target. After the folder moves, copy the default profile's key and token.
+fn open_secrets(profiles: &std::path::Path) -> Arc<dyn SecretStore> {
+    let legacy = profiles
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        == Some("maxrs");
+    if legacy {
+        return Arc::new(OsSecrets::new("maxrs"));
+    }
+    let current = OsSecrets::new("maxly-gpui");
+    let previous = OsSecrets::new("maxrs");
+    for name in ["default:db-key", "default:auth-token"] {
+        if matches!(current.get(name), Ok(Some(_))) {
+            continue;
+        }
+        if let Ok(Some(bytes)) = previous.get(name) {
+            let _ = current.set(name, &bytes);
+        }
+    }
+    Arc::new(current)
+}
+
 async fn real_flow(
     ui: UnboundedSender<UiEvent>,
     mut commands: UnboundedReceiver<UiCommand>,
 ) -> Result<(), String> {
     let root = default_profiles_dir().ok_or("no local data folder")?;
-    let secrets: Arc<dyn SecretStore> = Arc::new(OsSecrets::new("maxrs"));
+    let secrets = open_secrets(&root);
     let mut config = CoreConfig::default();
     config.transport.trace = crate::trace::transport_trace();
     // Each pass is one logged-in run; logout starts the next pass at the login screens.
@@ -1503,6 +1559,24 @@ async fn run_logged_in(
                             });
                         });
                     }
+                    UiCommand::LoadAnimoji => {
+                        tokio::spawn(async move {
+                            let loaded = match handle.transport() {
+                                Ok(t) => max_core::assets::animoji_faces(&t).await,
+                                Err(e) => Err(e),
+                            };
+                            let _ = ui.send(match loaded {
+                                Ok(faces) => UiEvent::AnimojiCatalog(faces),
+                                Err(e) => {
+                                    crate::trace::note(&format!("animoji catalog failed: {e}"));
+                                    UiEvent::AnimojiFailed(format!(
+                                        "Не удалось загрузить анимированные смайлики: {}",
+                                        message(&e)
+                                    ))
+                                }
+                            });
+                        });
+                    }
                     UiCommand::LinkInfo(link) => {
                         tokio::spawn(async move {
                             let card = match handle.transport() {
@@ -1521,10 +1595,21 @@ async fn run_logged_in(
                             let _ = ui.send(UiEvent::LinkCard { url: link, card });
                         });
                     }
-                    UiCommand::SendText { chat_id, text, cid, reply_to } => {
+                    UiCommand::SendText {
+                        chat_id,
+                        text,
+                        cid,
+                        reply_to,
+                        elements,
+                    } => {
                         tokio::spawn(async move {
                             let result = match handle.transport() {
-                                Ok(t) => messages::send_text(&t, chat_id, &text, cid, reply_to).await,
+                                Ok(t) => {
+                                    messages::send_composed(
+                                        &t, chat_id, &text, cid, reply_to, &elements,
+                                    )
+                                    .await
+                                }
                                 Err(e) => Err(e),
                             };
                             let _ = ui.send(match result {
@@ -2107,20 +2192,33 @@ pub fn marked_text(m: &messages::Message) -> (String, Vec<rich::Mark>) {
     if raw.is_empty() || !text.ends_with(raw) {
         return (text, Vec::new());
     }
-    let elements = m.elements.iter().flatten().map(|e| rich::Element {
-        kind: e.type_.as_str(),
-        from: e.from.map_or(0, i64::from),
-        length: e.length.map_or(0, i64::from),
-        url: e.attributes.as_ref().and_then(|a| {
-            if e.type_ == "ANIMOJI" {
-                a.animoji_lottie_url.as_deref()
-            } else {
-                a.url.as_deref()
-            }
-        }),
-    });
-    let marks = rich::shift(rich::from_elements(raw, elements), text.len() - raw.len());
+    let marks = rich::shift(
+        element_marks(raw, m.elements.as_deref().unwrap_or(&[])),
+        text.len() - raw.len(),
+    );
     (text, marks)
+}
+
+/// Marks for `elements` over `text` itself (no attachment label in front).
+pub fn element_marks(
+    text: &str,
+    elements: &[max_proto::schema::types::MessageElement],
+) -> Vec<rich::Mark> {
+    rich::from_elements(
+        text,
+        elements.iter().map(|e| rich::Element {
+            kind: e.type_.as_str(),
+            from: e.from.map_or(0, i64::from),
+            length: e.length.map_or(0, i64::from),
+            url: e.attributes.as_ref().and_then(|a| {
+                if e.type_ == "ANIMOJI" {
+                    a.animoji_lottie_url.as_deref()
+                } else {
+                    a.url.as_deref()
+                }
+            }),
+        }),
+    )
 }
 
 /// The text shown inside a bubble: photos, files and stickers are drawn, so only the other

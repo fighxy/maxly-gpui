@@ -9,7 +9,7 @@ use max_store::{OsSecrets, SecretStore};
 #[test]
 #[ignore = "writes to the OS credential store"]
 fn os_secrets_roundtrip_and_cleanup() {
-    let store = OsSecrets::new("maxrs-test");
+    let store = OsSecrets::new("maxly-gpui-test");
     let name = format!("probe-{}", std::process::id());
     assert_eq!(store.get(&name).unwrap(), None);
     store.set(&name, &[1, 2, 3, 0, 255]).unwrap();

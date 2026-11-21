@@ -1,6 +1,6 @@
 """Spawn the official MAX client under Frida and record its decoded API frames.
 
-Usage (from C:\\dev\\maxrs):
+Usage (from C:\\dev\\maxly-gpui):
   re\\.venv-frida\\Scripts\\python.exe -I re\\capture\\capture.py --seconds 40 --out re\\out\\cap1
 
 Writes into --out:

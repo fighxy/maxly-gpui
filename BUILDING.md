@@ -1,4 +1,4 @@
-# Building maxrs
+# Building maxly-gpui
 
 ## Windows
 
@@ -13,7 +13,7 @@
 
   New shells see the variable; an already open shell needs it exported by hand.
 - A short path to the target directory. OpenSSL's build tree is deep, and MSVC fails with
-  `C1083: Invalid argument` when paths get too long; `C:\dev\maxrs\target` is fine.
+  `C1083: Invalid argument` when paths get too long; `C:\dev\maxly-gpui\target` is fine.
 - NASM is not needed: OpenSSL is built with `no-asm`.
 
 The first build of `max-store` compiles OpenSSL and SQLCipher and takes about 4 minutes;
@@ -35,15 +35,15 @@ cargo test -p max-store --test os_secrets -- --ignored
 ## Running the client
 
 ```sh
-cargo run -p maxrs -- --demo        # made-up data, no network
-cargo run -p maxrs -- --demo-walk   # steps through every screen on a timer
-cargo run -p maxrs                  # connects to api2.oneme.ru
-cargo run -p maxrs -- --trace       # same, with a local protocol trace (rust/research/live-check.md)
+cargo run -p maxly-gpui -- --demo        # made-up data, no network
+cargo run -p maxly-gpui -- --demo-walk   # steps through every screen on a timer
+cargo run -p maxly-gpui                  # connects to api2.oneme.ru
+cargo run -p maxly-gpui -- --trace       # same, with a local protocol trace (rust/research/live-check.md)
 ```
 
-`tools/window-shot.ps1 -ProcessName maxrs -Out shot.png` captures only the client window;
-`tools/window-click.ps1 -ProcessName maxrs -X 289 -Y 25` posts a click to it without moving the cursor;
-`tools/window-type.ps1 -ProcessName maxrs -Text "Hi" -Enter` posts text the same way.
+`tools/window-shot.ps1 -ProcessName maxly-gpui -Out shot.png` captures only the client window;
+`tools/window-click.ps1 -ProcessName maxly-gpui -X 289 -Y 25` posts a click to it without moving the cursor;
+`tools/window-type.ps1 -ProcessName maxly-gpui -Text "Hi" -Enter` posts text the same way.
 
 ## Reverse engineering tools
 

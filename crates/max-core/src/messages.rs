@@ -73,6 +73,18 @@ pub async fn send_text(
     cid: i64,
     reply_to: Option<i64>,
 ) -> Result<SendResponse> {
+    send_composed(transport, chat_id, text, cid, reply_to, &[]).await
+}
+
+/// [`send_text`] with formatting elements (an animated emoji is an `ANIMOJI` element).
+pub async fn send_composed(
+    transport: &Transport,
+    chat_id: i64,
+    text: &str,
+    cid: i64,
+    reply_to: Option<i64>,
+    elements: &[max_proto::schema::types::MessageElement],
+) -> Result<SendResponse> {
     let params = send::Parameters {
         chat_id: Some(chat_id),
         notify: Some(true),
@@ -84,6 +96,7 @@ pub async fn send_text(
                 message_id,
                 ..OutgoingMessageLink::default()
             }),
+            elements: (!elements.is_empty()).then(|| elements.to_vec()),
             ..OutgoingMessage::default()
         },
         ..send::Parameters::default()

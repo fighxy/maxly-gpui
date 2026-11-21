@@ -20,7 +20,7 @@ pub struct Instance {
     pub wakeups: std::sync::mpsc::Receiver<()>,
 }
 
-/// `\\.\pipe\maxrs-<user>-<hash>`: the user name cut to ASCII letters, digits, `-` and `_`, and
+/// `\\.\pipe\maxly-gpui-<user>-<hash>`: the user name cut to ASCII letters, digits, `-` and `_`, and
 /// an FNV-1a hash of the whole name, so names that differ only in other letters (Cyrillic ones)
 /// stay apart. FNV is fixed, unlike std's hasher, so every build finds the same pipe.
 pub fn pipe_name(user: &str) -> String {
@@ -32,7 +32,7 @@ pub fn pipe_name(user: &str) -> String {
     let hash = user.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     });
-    format!(r"\\.\pipe\maxrs-{short}-{hash:016x}")
+    format!(r"\\.\pipe\maxly-gpui-{short}-{hash:016x}")
 }
 
 /// What a second instance sends.
@@ -52,7 +52,7 @@ fn claim_pipe(name: String) -> Claim {
 
     let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
-        .thread_name("maxrs-instance")
+        .thread_name("maxly-gpui-instance")
         .enable_all()
         .build()
     else {
@@ -127,15 +127,15 @@ mod tests {
     #[test]
     fn pipe_names_are_per_user_and_clean() {
         assert_eq!(pipe_name("ivan"), pipe_name("ivan"), "stable");
-        assert!(pipe_name("ivan").starts_with(r"\\.\pipe\maxrs-ivan-"));
-        assert!(pipe_name(r"Иван\..\x y").starts_with(r"\\.\pipe\maxrs-xy-"));
+        assert!(pipe_name("ivan").starts_with(r"\\.\pipe\maxly-gpui-ivan-"));
+        assert!(pipe_name(r"Иван\..\x y").starts_with(r"\\.\pipe\maxly-gpui-xy-"));
         assert_ne!(
             pipe_name("Иван"),
             pipe_name("Пётр"),
             "non-ASCII names stay apart"
         );
         // FNV-1a of the empty string is its offset basis.
-        assert_eq!(pipe_name(""), r"\\.\pipe\maxrs--cbf29ce484222325");
+        assert_eq!(pipe_name(""), r"\\.\pipe\maxly-gpui--cbf29ce484222325");
     }
 
     /// The real pipe, under a name of its own: the first claim serves it, a second one finds it
@@ -147,7 +147,7 @@ mod tests {
 
         use super::{Claim, claim_pipe};
 
-        let name = format!(r"\\.\pipe\maxrs-test-{}", std::process::id());
+        let name = format!(r"\\.\pipe\maxly-gpui-test-{}", std::process::id());
         let Claim::First(first) = claim_pipe(name.clone()) else {
             panic!("the first claim must own the pipe");
         };

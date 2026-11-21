@@ -9,9 +9,31 @@ use crate::{Database, DbKey, Result, SecretStore, StoreError};
 const DB_FILE: &str = "app.db";
 const IDENTITY_KEY: &str = "identity";
 
-/// Where profiles live by default: `%LOCALAPPDATA%\maxrs\profiles` on Windows.
+const DATA_DIR: &str = "maxly-gpui";
+const LEGACY_DATA_DIR: &str = "maxrs";
+
+/// This client's files: `%LOCALAPPDATA%\maxly-gpui`.
+///
+/// A directory left under the previous name is renamed here when nothing still has it open.
+pub fn local_data_dir() -> Option<PathBuf> {
+    let base = dirs::data_local_dir()?;
+    let next = base.join(DATA_DIR);
+    if next.exists() {
+        return Some(next);
+    }
+    let prev = base.join(LEGACY_DATA_DIR);
+    if prev.is_dir() && std::fs::rename(&prev, &next).is_ok() {
+        return Some(next);
+    }
+    if prev.is_dir() {
+        return Some(prev);
+    }
+    Some(next)
+}
+
+/// Where profiles live by default: `%LOCALAPPDATA%\maxly-gpui\profiles` on Windows.
 pub fn default_profiles_dir() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("maxrs").join("profiles"))
+    local_data_dir().map(|d| d.join("profiles"))
 }
 
 /// One local profile: its folder, its encrypted database and its secrets.

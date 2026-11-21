@@ -51,9 +51,9 @@ pub fn tray_pixels(unread: bool) -> Vec<u8> {
 /// The tray tooltip for `unread` messages.
 pub fn tooltip(unread: i32) -> String {
     if unread > 0 {
-        format!("maxrs — непрочитанных: {unread}")
+        format!("maxly-gpui — непрочитанных: {unread}")
     } else {
-        "maxrs".to_string()
+        "maxly-gpui".to_string()
     }
 }
 
@@ -81,7 +81,7 @@ mod imp {
     impl Desktop {
         /// Put the icon into the tray; without it closing the window quits.
         pub fn new() -> Desktop {
-            let show = MenuItem::new("Открыть maxrs", true, None);
+            let show = MenuItem::new("Открыть maxly-gpui", true, None);
             let quit = MenuItem::new("Выйти", true, None);
             let menu = Menu::new();
             let built = menu
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn tooltips() {
-        assert_eq!(tooltip(0), "maxrs");
-        assert_eq!(tooltip(7), "maxrs — непрочитанных: 7");
+        assert_eq!(tooltip(0), "maxly-gpui");
+        assert_eq!(tooltip(7), "maxly-gpui — непрочитанных: 7");
     }
 }

@@ -12,6 +12,7 @@
 //! `core.dll` (`rust/research/protocol-and-telemetry.md`). No telemetry is sent (ADR-005).
 
 pub mod account;
+pub mod assets;
 mod auth;
 mod config;
 pub mod contacts;

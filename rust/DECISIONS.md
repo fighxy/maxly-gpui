@@ -3,9 +3,9 @@
 ## ADR-001: Project location and reference material
 Status: accepted (2026-11-19)
 Context: The official client is installed in `C:\MAX` (binaries only, 741 MB).
-Decision: The project lives in `C:\dev\maxrs` (git). `C:\MAX` is a read-only reverse
+Decision: The project lives in `C:\dev\maxly-gpui` (git). `C:\MAX` is a read-only reverse
 engineering target; nothing is written into it. Ghidra snapshots and outputs stay in `re/`.
-Consequences: Every RE command reads `C:\MAX` and writes under `C:\dev\maxrs\re`.
+Consequences: Every RE command reads `C:\MAX` and writes under `C:\dev\maxly-gpui\re`.
 
 ## ADR-002: Reverse engineering of the official client is the source of truth
 Status: accepted (2026-11-19)

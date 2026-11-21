@@ -4273,7 +4273,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "maxrs"
+name = "maxly-gpui"
 version = "0.1.0"
 dependencies = [
  "bytes",

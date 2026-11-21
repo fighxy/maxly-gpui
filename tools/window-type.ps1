@@ -1,5 +1,5 @@
 # Post text (WM_CHAR) and optionally Enter to a window, without touching the real keyboard.
-# Usage: powershell -File tools/window-type.ps1 -ProcessName maxrs -Text "Hi" -Enter
+# Usage: powershell -File tools/window-type.ps1 -ProcessName maxly-gpui -Text "Hi" -Enter
 param(
     [Parameter(Mandatory = $true)][string]$ProcessName,
     [Parameter(Mandatory = $true)][string]$Text,

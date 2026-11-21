@@ -1,5 +1,5 @@
 [package]
-name = "maxrs"
+name = "maxly-gpui"
 version = "0.1.0"
 description = "Telemetry-free MAX desktop client (gpui + gpui-kit)"
 edition.workspace = true
@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [[bin]]
-name = "maxrs"
+name = "maxly-gpui"
 path = "src/main.rs"
 
 [dependencies]

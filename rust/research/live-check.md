@@ -6,19 +6,19 @@ against the real server. Use a test account only, never a personal one.
 ## Run
 
 ```powershell
-cd C:\dev\maxrs
-cargo run -p maxrs -- --trace
+cd C:\dev\maxly-gpui
+cargo run -p maxly-gpui -- --trace
 ```
 
-The trace goes to `%LOCALAPPDATA%\maxrs\traces\trace-<time>.log`; the path is printed at start.
+The trace goes to `%LOCALAPPDATA%\maxly-gpui\traces\trace-<time>.log`; the path is printed at start.
 It holds one line per frame: direction, `cmd`, `seq`, opcode and the payload with personal data
 removed (`max_proto::redact`): map keys, numbers, enum names and error texts stay; message
 texts, names and other strings become `<str N>`; phone numbers, tokens and codes become
 `<hidden>`; URLs keep only their host. HTTP results and failures are lines starting with `--`.
 Read the file before passing it on.
 
-The login is stored in the `default` profile (`%LOCALAPPDATA%\maxrs\profiles\default`, key in
-Windows Credential Manager under `maxrs`). Logout is not built yet: to end the test session,
+The login is stored in the `default` profile (`%LOCALAPPDATA%\maxly-gpui\profiles\default`, key in
+Windows Credential Manager under `maxly-gpui`). Logout is not built yet: to end the test session,
 close it in the phone app's list of active sessions and delete the profile folder.
 
 ## Steps
@@ -45,7 +45,8 @@ close it in the phone app's list of active sessions and delete the profile folde
 | 17 | Open a chat with a forwarded message | text and attachments come from `link.message`; `chatName` for channels | — |
 | 18 | Open a chat with bold or italic text, a mention, a plain address and a link whose text is not the address | formatting and the mention are coloured; the plain address is a link; a left click opens it; the hidden address asks first and shows the real url | element offsets are UTF-16 |
 | 19 | Open a chat with a web link that has a preview, and a `max.ru` link (chat, person or post) | the web link shows the card that arrived with the message (`SHARE`); the `max.ru` link sends `LINK_INFO` (89) and shows the answer as a card; a sensitive image stays hidden until «Показать» | `SHARE` field names from `core.dll` |
-| 20 | Open a chat with reactions and an animated emoji; put and remove a reaction; open «кто» | chips match `reactionInfo`; a click sends `MSG_REACTION` / `MSG_CANCEL_REACTION` with `reactionType` `EMOJI`; pushes 155 and 156 move the chips; «кто» sends `MSG_GET_DETAILED_REACTIONS`; an `ANIMOJI` with `animojiLottieUrl` animates | reaction type string |
+| 20 | Open a chat with reactions and an animated emoji; put and remove a reaction; open «кто» | chips match `reactionInfo`; a click sends `MSG_REACTION` / `MSG_CANCEL_REACTION` with `reactionType` `EMOJI`; pushes 155 and 156 move the chips; «кто» sends `MSG_GET_DETAILED_REACTIONS` (a channel answers that the list is unavailable, so the button is hidden there); an `ANIMOJI` with `animojiLottieUrl` animates | reaction type string |
+| 21 | In a dialog or a group, open 😊, pick a plain emoji and an animated one, send | the plain character is inserted; the animated one plays in the plate and in the message; `MSG_SEND` carries an `ANIMOJI` element (`entityId`, `animojiLottieUrl`, `animojiSetId`); a channel has no 😊 | list is `ASSETS_GET` `assetType=ANIMOJI_SET` `sectionId=SYSTEM|POPULAR|RECENT`; ids arrive in `stickerSets` |
 
 For each step note: worked / server error (the `error` and `localizedMessage` in the trace) /
 nothing happened. Any server `cmd=Error` (3) line answers which guess was wrong.

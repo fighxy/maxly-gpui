@@ -1,9 +1,10 @@
-//! Local interface settings (theme, font size), kept in `%LOCALAPPDATA%\maxly-gpui\ui.txt` as
+//! Local interface settings (theme, font size), kept next to the profile as `ui.txt`
+//! (`%LOCALAPPDATA%\maxly-gpui` on Windows, `~/.local/share/maxly-gpui` on Linux) in
 //! `key=value` lines. Nothing here leaves the machine or holds account data.
 
 use std::path::PathBuf;
 
-/// Light, dark, or following Windows.
+/// Light, dark, or following the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeChoice {
     /// Follow the system appearance.
@@ -44,7 +45,7 @@ pub struct UiSettings {
     pub theme: ThemeChoice,
     /// Base font size in px, one of [`FONT_SIZES`].
     pub font_size: u8,
-    /// Windows notifications for new messages.
+    /// System notifications for new messages.
     pub notifications: bool,
     /// Show the message text in notifications (off: only who wrote).
     pub preview: bool,

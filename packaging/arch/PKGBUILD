@@ -1,0 +1,62 @@
+# Maintainer: the maxly-gpui authors
+# Build from a checkout: cd packaging/arch && makepkg -si
+# The source is the public git repository, not uncommitted files in the working tree.
+pkgname=maxly-gpui
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Telemetry-free desktop client for the MAX messenger'
+arch=('x86_64' 'aarch64')
+url='https://github.com/fighxy/maxly-gpui'
+license=('LicenseRef-AllRightsReserved')
+depends=(
+  'dbus'
+  'fontconfig'
+  'gcc-libs'
+  'glibc'
+  'libxcb'
+  'libxkbcommon'
+  'vulkan-icd-loader'
+  'wayland'
+)
+makedepends=('cargo' 'git' 'perl')
+optdepends=(
+  'gnome-keyring: Secret Service for the database key'
+  'kwallet: Secret Service for the database key on KDE'
+  'dunst: desktop notifications'
+  'mako: desktop notifications on Sway'
+)
+options=('!lto')
+source=("git+https://github.com/fighxy/maxly-gpui.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  printf '0.1.0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$pkgname"
+  export OPENSSL_SRC_PERL=/usr/bin/perl
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "$pkgname"
+  export OPENSSL_SRC_PERL=/usr/bin/perl
+  cargo build --frozen --release -p maxly-gpui
+}
+
+check() {
+  cd "$pkgname"
+  export OPENSSL_SRC_PERL=/usr/bin/perl
+  cargo test --frozen --release --workspace
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 packaging/arch/maxly-gpui.desktop \
+    "$pkgdir/usr/share/applications/maxly-gpui.desktop"
+  install -Dm644 packaging/arch/maxly-gpui.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/maxly-gpui.svg"
+}

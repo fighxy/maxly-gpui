@@ -4,7 +4,7 @@
 //! `maxly-gpui --demo-walk` steps through every screen on a timer (for screenshots);
 //! `maxly-gpui --trace` writes a local protocol trace without personal data (`trace.rs`).
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod album;
 mod app_view;
@@ -63,8 +63,9 @@ fn main() {
         .with_assets(AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            // The AppUserModelID Windows shows notifications under (registered for this user on
-            // the first notification, as GPUI does for unpackaged apps).
+            // Windows shows toasts under this AppUserModelID (GPUI registers it on the first
+            // toast). Linux uses the name as the notification app name, and `app_id` below as
+            // the Wayland app id and the X11 window class.
             cx.set_app_identity("maxly-gpui.desktop", "maxly-gpui");
             let title: SharedString = if demo {
                 "maxly-gpui — демо"
@@ -85,6 +86,7 @@ fn main() {
                 inactive_frame_interval: Some(frame),
                 low_power_frame_interval: Some(frame),
                 thermal_frame_interval: Some(frame),
+                app_id: Some("maxly-gpui".into()),
                 ..Default::default()
             };
             let opened = gpui_kit::open_window(options, cx, move |window, cx| {

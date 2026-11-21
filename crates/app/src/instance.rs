@@ -1,6 +1,7 @@
-//! One running client per Windows user (M3). The first instance holds a named pipe; a second
-//! one connects to it, asks it to show its window, and exits. The pipe name carries the user
-//! name so other accounts on the machine have their own; tokio rejects remote clients.
+//! One running client per user (M3). The first instance holds an endpoint; a second one
+//! connects to it, asks it to show its window, and exits. Windows uses a named pipe (tokio
+//! rejects remote clients). Linux uses a socket in `$XDG_RUNTIME_DIR`, which systemd already
+//! keeps private to the user — the usual place on Arch.
 
 /// The outcome of [`claim`].
 pub enum Claim {
@@ -14,10 +15,21 @@ pub enum Claim {
 
 /// Keeps the pipe served for as long as the app runs.
 pub struct Instance {
-    /// Holds the thread that serves the pipe.
+    /// Holds the thread that serves the endpoint.
     _runtime: tokio::runtime::Runtime,
     /// One message per later start of the client.
     pub wakeups: std::sync::mpsc::Receiver<()>,
+    /// Socket file to remove when this instance exits. A crash leaves it; the next start
+    /// removes a socket nobody answers.
+    #[cfg(unix)]
+    socket: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for Instance {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket);
+    }
 }
 
 /// `\\.\pipe\maxly-gpui-<user>-<hash>`: the user name cut to ASCII letters, digits, `-` and `_`, and
@@ -114,8 +126,102 @@ async fn serve(
     }
 }
 
-/// No single-instance check outside Windows yet.
-#[cfg(not(windows))]
+/// `$XDG_RUNTIME_DIR/maxly-gpui.sock`, or a `0700` directory under the temp dir when the
+/// session has no runtime directory (a bare `su`, not a normal Arch login).
+#[cfg(unix)]
+fn runtime_socket() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
+        return std::path::PathBuf::from(dir).join("maxly-gpui.sock");
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+    let short: String = user
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect();
+    let dir = std::env::temp_dir().join(format!("maxly-gpui-{short}"));
+    use std::os::unix::fs::DirBuilderExt as _;
+    let mut builder = std::fs::DirBuilder::new();
+    let _ = builder.mode(0o700).recursive(true).create(&dir);
+    dir.join("maxly-gpui.sock")
+}
+
+/// Become the instance on a Unix socket, or tell the running one to show itself.
+#[cfg(unix)]
+pub fn claim() -> Claim {
+    claim_socket(runtime_socket())
+}
+
+/// [`claim`] on the socket `path`.
+#[cfg(unix)]
+fn claim_socket(path: std::path::PathBuf) -> Claim {
+    use tokio::io::AsyncReadExt as _;
+    use tokio::net::UnixListener;
+
+    if poke(&path) {
+        return Claim::Running;
+    }
+    // A previous crash leaves the file. Nobody answered, so it is ours to replace.
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+        && std::fs::create_dir_all(dir).is_err()
+    {
+        return Claim::Alone;
+    }
+    let Ok(listener) = UnixListener::bind(&path) else {
+        return if poke(&path) {
+            Claim::Running
+        } else {
+            Claim::Alone
+        };
+    };
+    let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("maxly-gpui-instance")
+        .enable_all()
+        .build()
+    else {
+        let _ = std::fs::remove_file(&path);
+        return Claim::Alone;
+    };
+    let (tx, wakeups) = std::sync::mpsc::channel();
+    runtime.spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 16];
+            if let Ok(n) = stream.read(&mut buf).await
+                && buf.get(..n) == Some(SHOW)
+                && tx.send(()).is_err()
+            {
+                return;
+            }
+        }
+    });
+    Claim::First(Instance {
+        _runtime: runtime,
+        wakeups,
+        socket: path,
+    })
+}
+
+/// `true` when a living instance accepted `show`.
+#[cfg(unix)]
+fn poke(path: &std::path::Path) -> bool {
+    use std::io::Write as _;
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(path) else {
+        return false;
+    };
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+    stream.write_all(SHOW).is_ok()
+}
+
+/// No single-instance check on platforms without a pipe or a socket.
+#[cfg(not(any(windows, unix)))]
 pub fn claim() -> Claim {
     Claim::Alone
 }
@@ -153,6 +259,27 @@ mod tests {
         };
         for _ in 0..2 {
             assert!(matches!(claim_pipe(name.clone()), Claim::Running));
+            assert_eq!(first.wakeups.recv_timeout(Duration::from_secs(5)), Ok(()));
+        }
+    }
+
+    /// The real socket, under a name of its own: the first claim serves it, a second one finds it
+    /// and wakes the first, twice in a row.
+    #[cfg(unix)]
+    #[test]
+    fn second_start_wakes_the_first() {
+        use std::time::Duration;
+
+        use super::{Claim, claim_socket};
+
+        let path =
+            std::env::temp_dir().join(format!("maxly-gpui-test-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let Claim::First(first) = claim_socket(path.clone()) else {
+            panic!("the first claim must own the socket");
+        };
+        for _ in 0..2 {
+            assert!(matches!(claim_socket(path.clone()), Claim::Running));
             assert_eq!(first.wakeups.recv_timeout(Duration::from_secs(5)), Ok(()));
         }
     }

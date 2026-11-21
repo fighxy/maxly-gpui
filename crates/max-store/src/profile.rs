@@ -12,7 +12,8 @@ const IDENTITY_KEY: &str = "identity";
 const DATA_DIR: &str = "maxly-gpui";
 const LEGACY_DATA_DIR: &str = "maxrs";
 
-/// This client's files: `%LOCALAPPDATA%\maxly-gpui`.
+/// This client's files: `%LOCALAPPDATA%\maxly-gpui` on Windows,
+/// `$XDG_DATA_HOME/maxly-gpui` (usually `~/.local/share/maxly-gpui`) on Linux.
 ///
 /// A directory left under the previous name is renamed here when nothing still has it open.
 pub fn local_data_dir() -> Option<PathBuf> {
@@ -31,7 +32,7 @@ pub fn local_data_dir() -> Option<PathBuf> {
     Some(next)
 }
 
-/// Where profiles live by default: `%LOCALAPPDATA%\maxly-gpui\profiles` on Windows.
+/// Where profiles live by default, under [`local_data_dir`].
 pub fn default_profiles_dir() -> Option<PathBuf> {
     local_data_dir().map(|d| d.join("profiles"))
 }

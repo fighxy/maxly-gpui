@@ -1,7 +1,9 @@
-//! Desktop integration on Windows: the tray icon with its menu, hiding the window to the tray
-//! and showing it again, and the unread mark on the tray icon. No unsafe code here: the tray
-//! comes from `tray-icon`, the window calls from `winsafe`'s safe wrappers (GPUI has no way to
-//! hide a window on Windows). Other platforms get a desktop without a tray.
+//! The tray icon, and showing or concealing the window.
+//!
+//! Windows hides the HWND through `winsafe` (GPUI cannot hide a window there). Linux minimizes
+//! and raises the GPUI window. The tray on Linux speaks the StatusNotifier protocol (`ksni`),
+//! which KDE, waybar and swaybar provide; GNOME needs the AppIndicator extension. Arch does
+//! not need `libappindicator`. No unsafe code here.
 
 /// What the user asked for through the tray.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,18 +59,14 @@ pub fn tooltip(unread: i32) -> String {
     }
 }
 
-#[cfg(windows)]
-mod imp {
+#[cfg(any(windows, target_os = "linux"))]
+mod tray {
     use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use tray_icon::{
         Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     };
-    use winsafe::{self as w, co};
 
     use super::{DesktopEvent, ICON_SIZE, tooltip, tray_pixels};
-
-    /// GPUI's window class on Windows.
-    const GPUI_WINDOW_CLASS: &str = "Zed::Window";
 
     /// The tray icon, its menu items and the unread mark it shows.
     pub struct Desktop {
@@ -147,49 +145,10 @@ mod imp {
     fn icon(unread: bool) -> Option<Icon> {
         Icon::from_rgba(tray_pixels(unread), ICON_SIZE, ICON_SIZE).ok()
     }
-
-    /// Run `f` on every top-level GPUI window of this process.
-    fn each_window(mut f: impl FnMut(&w::HWND)) {
-        let pid = w::GetCurrentProcessId();
-        let _ = w::EnumWindows(|hwnd: w::HWND| {
-            if hwnd.GetWindowThreadProcessId().1 == pid
-                && hwnd.GetClassName().is_ok_and(|c| c == GPUI_WINDOW_CLASS)
-            {
-                f(&hwnd);
-            }
-            true
-        });
-    }
-
-    /// Hide the window (it stays alive in the tray).
-    pub fn hide_window() {
-        each_window(|hwnd| {
-            hwnd.ShowWindow(co::SW::HIDE);
-        });
-    }
-
-    /// Show, restore and raise the window.
-    pub fn show_window() {
-        each_window(|hwnd| {
-            hwnd.ShowWindow(if hwnd.IsIconic() {
-                co::SW::RESTORE
-            } else {
-                co::SW::SHOW
-            });
-            hwnd.SetForegroundWindow();
-        });
-    }
-
-    /// The window is on screen (not hidden to the tray).
-    pub fn window_visible() -> bool {
-        let mut visible = false;
-        each_window(|hwnd| visible |= hwnd.IsWindowVisible());
-        visible
-    }
 }
 
-#[cfg(not(windows))]
-mod imp {
+#[cfg(not(any(windows, target_os = "linux")))]
+mod tray {
     use super::DesktopEvent;
 
     /// No tray on this platform.
@@ -207,15 +166,135 @@ mod imp {
         }
         pub fn set_unread(&mut self, _count: i32) {}
     }
+}
 
-    pub fn hide_window() {}
-    pub fn show_window() {}
-    pub fn window_visible() -> bool {
-        true
+pub use tray::Desktop;
+
+#[cfg(windows)]
+mod win {
+    use winsafe::{self as w, co};
+
+    /// GPUI's window class on Windows.
+    const GPUI_WINDOW_CLASS: &str = "Zed::Window";
+
+    /// Run `f` on every top-level GPUI window of this process.
+    fn each_window(mut f: impl FnMut(&w::HWND)) {
+        let pid = w::GetCurrentProcessId();
+        let _ = w::EnumWindows(|hwnd: w::HWND| {
+            if hwnd.GetWindowThreadProcessId().1 == pid
+                && hwnd.GetClassName().is_ok_and(|c| c == GPUI_WINDOW_CLASS)
+            {
+                f(&hwnd);
+            }
+            true
+        });
+    }
+
+    /// Hide the window (it stays alive in the tray).
+    pub fn conceal() {
+        each_window(|hwnd| {
+            hwnd.ShowWindow(co::SW::HIDE);
+        });
+    }
+
+    /// Show, restore and raise the window.
+    pub fn reveal() {
+        each_window(|hwnd| {
+            hwnd.ShowWindow(if hwnd.IsIconic() {
+                co::SW::RESTORE
+            } else {
+                co::SW::SHOW
+            });
+            hwnd.SetForegroundWindow();
+        });
+    }
+
+    /// The window is on screen (not hidden to the tray).
+    pub fn visible() -> bool {
+        let mut visible = false;
+        each_window(|hwnd| visible |= hwnd.IsWindowVisible());
+        visible
     }
 }
 
-pub use imp::{Desktop, hide_window, show_window, window_visible};
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Set when the close button minimized the window, cleared when it is shown again.
+    /// Wayland does not always report a minimized window as hidden.
+    static CONCEALED: AtomicBool = AtomicBool::new(false);
+
+    pub fn conceal(window: &mut gpui_kit::Window) {
+        CONCEALED.store(true, Ordering::Relaxed);
+        window.minimize_window();
+    }
+
+    pub fn reveal(window: &mut gpui_kit::Window) {
+        CONCEALED.store(false, Ordering::Relaxed);
+        window.activate_window();
+    }
+
+    pub fn note_shown() {
+        CONCEALED.store(false, Ordering::Relaxed);
+    }
+
+    pub fn visible() -> bool {
+        !CONCEALED.load(Ordering::Relaxed)
+    }
+}
+
+/// Hide the window, or minimize it where the platform cannot unmap it.
+pub fn conceal(window: &mut gpui_kit::Window) {
+    #[cfg(windows)]
+    {
+        let _ = window;
+        win::conceal();
+    }
+    #[cfg(target_os = "linux")]
+    linux::conceal(window);
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = window;
+    }
+}
+
+/// Show and raise the window.
+pub fn reveal(window: &mut gpui_kit::Window) {
+    #[cfg(windows)]
+    {
+        let _ = window;
+        win::reveal();
+    }
+    #[cfg(target_os = "linux")]
+    linux::reveal(window);
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = window;
+    }
+}
+
+/// The user brought the window back themselves (a click on the taskbar).
+pub fn note_shown() {
+    #[cfg(target_os = "linux")]
+    linux::note_shown();
+}
+
+/// The window is on screen, not concealed to the tray.
+pub fn window_visible() -> bool {
+    #[cfg(windows)]
+    {
+        win::visible()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::visible()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        true
+    }
+}
 
 #[cfg(test)]
 mod tests {

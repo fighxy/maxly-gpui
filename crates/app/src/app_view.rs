@@ -107,7 +107,7 @@ enum Section {
 enum SettingsPage {
     /// Who we are, sessions, logout.
     Account,
-    /// Windows notifications and the tray.
+    /// System notifications and the tray.
     Notifications,
     /// Theme and font size.
     Appearance,
@@ -489,7 +489,9 @@ pub struct AppView {
     viewer_focus: FocusHandle,
     /// The tray icon and window hiding.
     desktop: desktop::Desktop,
-    /// The single-instance pipe; later starts of the client show this window.
+    /// This window, so a tray click can raise it on Linux as well as on Windows.
+    window: AnyWindowHandle,
+    /// The single-instance endpoint; later starts of the client show this window.
     instance: Option<Instance>,
     /// The window title without the unread count.
     title: SharedString,
@@ -558,7 +560,7 @@ impl AppView {
                     _ => {}
                 },
             ),
-            // "Как в системе" follows Windows switching between light and dark.
+            // "Как в системе" follows the system switching between light and dark.
             cx.observe_window_appearance(window, |this, window, cx| {
                 if this.ui.theme == ThemeChoice::System {
                     apply_ui(&this.ui, window, cx);
@@ -567,6 +569,9 @@ impl AppView {
             // Notifications are for messages the user is not looking at.
             cx.observe_window_activation(window, |this, window, _| {
                 this.window_active = window.is_window_active();
+                if this.window_active {
+                    desktop::note_shown();
+                }
             }),
         ];
         let ui = UiSettings::load();
@@ -594,14 +599,14 @@ impl AppView {
         .detach();
         // Closing the window hides it to the tray while the tray is there and the user wants it.
         let view = cx.entity().downgrade();
-        window.on_window_should_close(cx, move |_, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
             let to_tray = view
                 .update(cx, |this, _| {
                     this.ui.close_to_tray && this.desktop.has_tray()
                 })
                 .unwrap_or(false);
             if to_tray {
-                desktop::hide_window();
+                desktop::conceal(window);
                 return false;
             }
             cx.quit();
@@ -610,12 +615,12 @@ impl AppView {
         // A click on a notification shows the window and opens its chat.
         let view = cx.entity().downgrade();
         cx.on_system_notification_response(move |response, cx| {
-            desktop::show_window();
             let chat_id = response
                 .tag
                 .strip_prefix(NOTIFY_TAG)
                 .and_then(|id| id.parse::<i64>().ok());
             let _ = view.update(cx, |this, cx| {
+                this.show_main_window(cx);
                 this.section = Section::Chats;
                 if let Some(chat_id) = chat_id {
                     this.open_chat(chat_id, cx);
@@ -625,6 +630,7 @@ impl AppView {
         });
         AppView {
             desktop: desktop::Desktop::new(),
+            window: window.window_handle(),
             instance,
             title,
             window_active: true,
@@ -3115,13 +3121,20 @@ impl AppView {
         }
         for event in events {
             match event {
-                DesktopEvent::Show => desktop::show_window(),
+                DesktopEvent::Show => self.show_main_window(cx),
                 DesktopEvent::Quit => cx.quit(),
             }
         }
     }
 
-    /// A Windows notification for a new incoming message, unless the user is looking at that
+    /// Raise the window after a tray click, a notification click, or a second start.
+    fn show_main_window(&self, cx: &mut Context<Self>) {
+        let _ = self
+            .window
+            .update(cx, |_, window, _| desktop::reveal(window));
+    }
+
+    /// A system notification for a new incoming message, unless the user is looking at that
     /// chat or turned notifications off. One notification per chat: a newer one replaces it.
     fn notify_message(&self, chat_id: i64, message: &MessageRow, cx: &mut Context<Self>) {
         if !self.ui.notifications || message.out || message.delivery != Delivery::Sent {
@@ -4990,7 +5003,7 @@ impl AppView {
                     vec![
                         toggle(
                             "notify-on",
-                            "Уведомления Windows",
+                            "Уведомления системы",
                             "О сообщениях в чатах, которые сейчас не открыты перед вами",
                             ui.notifications,
                             true,
@@ -5015,7 +5028,11 @@ impl AppView {
                         "close-to-tray",
                         "Закрывать в трей",
                         if tray {
-                            "Крестик прячет окно в трей, клиент продолжает получать сообщения"
+                            if cfg!(target_os = "linux") {
+                                "Крестик сворачивает окно и оставляет значок в трее; клиент продолжает получать сообщения"
+                            } else {
+                                "Крестик прячет окно в трей, клиент продолжает получать сообщения"
+                            }
                         } else {
                             "Значок в трее не создался, поэтому крестик закрывает клиент"
                         },
@@ -5130,10 +5147,7 @@ impl AppView {
             div()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child(
-                    "Переписка хранится в базе SQLCipher; её ключ и токен входа лежат в \
-                     защищённом хранилище Windows и без вашей учётной записи не читаются.",
-                )
+                .child(local_store_note())
                 .into_any_element(),
         );
         if let Some(p) = UiSettings::path() {
@@ -5171,7 +5185,7 @@ impl AppView {
                     "maxly-gpui",
                     vec![
                         Self::info_row("Версия", env!("CARGO_PKG_VERSION").to_string(), cx),
-                        line("Клиент мессенджера MAX для Windows без телеметрии."),
+                        line("Клиент мессенджера MAX для Windows и Linux без телеметрии."),
                     ],
                     cx,
                 ),
@@ -5297,6 +5311,17 @@ fn clock(ms: i64) -> String {
 ///
 /// The list moves by `-delta_y` immediately. The returned distance is what we
 /// scroll back, then play out over the following frames. A small notch is `0`.
+/// Where the database key and the login token are kept, in the language of the settings page.
+fn local_store_note() -> &'static str {
+    if cfg!(windows) {
+        "Переписка хранится в базе SQLCipher; её ключ и токен входа лежат в Диспетчере учётных данных Windows и без вашей учётной записи не читаются."
+    } else if cfg!(target_os = "linux") {
+        "Переписка хранится в базе SQLCipher; её ключ и токен входа лежат в связке ключей системы (Secret Service) и без вашей сессии не читаются."
+    } else {
+        "Переписка хранится в базе SQLCipher; её ключ и токен входа лежат в защищённом хранилище системы."
+    }
+}
+
 fn wheel_glide_extra(delta_y: f32, frame_px: f32) -> f32 {
     let applied = -delta_y;
     let keep = applied.signum() * applied.abs().min(frame_px);

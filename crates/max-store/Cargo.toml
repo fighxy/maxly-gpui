@@ -12,7 +12,9 @@ workspace = true
 [dependencies]
 dirs = "7.0.0"
 getrandom = "0.4.3"
-keyring = { version = "3.6.3", features = ["windows-native"] }
+# Windows: Credential Manager. Linux: the Secret Service (gnome-keyring, KWallet).
+# crypto-rust encrypts secrets on the bus without a second OpenSSL.
+keyring = { version = "3.6.3", features = ["windows-native", "sync-secret-service", "crypto-rust"] }
 max-identity = { path = "../max-identity" }
 rusqlite = { version = "0.40.2", features = ["bundled-sqlcipher-vendored-openssl"] }
 serde = "1.0.229"

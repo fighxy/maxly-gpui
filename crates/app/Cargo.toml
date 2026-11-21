@@ -33,8 +33,14 @@ zeroize = "1.9.2"
 [dev-dependencies]
 rmpv = "1.3.1"
 
-# Desktop integration without unsafe code of our own: the tray icon and menu, and safe Win32
-# wrappers to hide and show the GPUI window (GPUI has no hide on Windows).
+# Desktop integration without unsafe code of our own.
+# Windows: tray-icon plus safe Win32 wrappers (GPUI cannot hide a window there).
+# Linux: the same tray crate over the StatusNotifier protocol (ksni). Arch does not need
+# libappindicator; a desktop that speaks StatusNotifier (KDE, swaybar, waybar, GNOME with
+# the AppIndicator extension) shows the icon.
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.26.1"
 winsafe = { version = "0.0.29", features = ["user"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }

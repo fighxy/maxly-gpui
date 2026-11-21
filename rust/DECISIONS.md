@@ -111,6 +111,10 @@ Consequences: Data is unreadable without the Windows user's logon secrets; copyi
 folder to another account or machine does not reveal it. Losing the protected entry loses the
 local cache (the account itself is unaffected: log in again). Other platforms use their own
 keystore behind the same interface later.
+Amendment (2026-11-21): Linux uses the same `OsSecrets` interface over the freedesktop Secret
+Service (`keyring` feature `sync-secret-service`, bus encryption via `crypto-rust`).
+gnome-keyring and KWallet both implement it. The session must have a Secret Service daemon;
+without one, opening a profile fails instead of writing the key next to the database.
 
 ## ADR-010: Pinned UI stack
 Status: accepted (2026-11-19)

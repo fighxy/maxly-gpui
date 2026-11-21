@@ -78,9 +78,26 @@ impl Environment {
                 .unwrap_or_else(|| "Windows 11 Version 25H2".to_string()),
             system_language: system::language(),
             timezone: system::timezone(),
-            computer_name: std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty()),
+            computer_name: computer_name(),
         }
     }
+}
+
+/// The computer's name, used only when the user asks to present it (ADR-008).
+/// Windows stores it in `COMPUTERNAME`. Linux, including Arch, has it in `HOSTNAME`
+/// or `/etc/hostname`; a graphical session often has neither variable.
+fn computer_name() -> Option<String> {
+    let from_env = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|n| !n.is_empty());
+    if from_env.is_some() {
+        return from_env;
+    }
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|n| !n.is_empty())
 }
 
 /// The `userAgent` for this build, machine and settings.

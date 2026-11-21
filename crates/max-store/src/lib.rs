@@ -3,8 +3,8 @@
 //! * [`Database`]: one SQLCipher file, opened with a raw 256-bit key; a key-value table for
 //!   now, more tables as the core needs them (migrations by `PRAGMA user_version`).
 //! * [`SecretStore`]: where the database key and the login token live. [`OsSecrets`] is the
-//!   Windows Credential Manager (entries encrypted with DPAPI for the current user);
-//!   [`MemorySecrets`] is for tests.
+//!   Windows Credential Manager (DPAPI) or, on Linux, the Secret Service (gnome-keyring or
+//!   KWallet). [`MemorySecrets`] is for tests.
 //! * [`Profile`]: ties both together and keeps the [`max_identity::Identity`].
 //!
 //! Building needs `OPENSSL_SRC_PERL` pointing to a full Perl (SQLCipher builds OpenSSL from

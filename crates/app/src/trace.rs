@@ -20,7 +20,7 @@ struct TraceLog {
 
 static LOG: OnceLock<TraceLog> = OnceLock::new();
 
-/// Where traces go: `%LOCALAPPDATA%\maxly-gpui\traces`.
+/// Where traces go: under the local data folder (`traces`).
 fn traces_dir() -> Option<PathBuf> {
     max_store::local_data_dir().map(|d| d.join("traces"))
 }

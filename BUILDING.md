@@ -45,6 +45,42 @@ cargo run -p maxly-gpui -- --trace       # same, with a local protocol trace (ru
 `tools/window-click.ps1 -ProcessName maxly-gpui -X 289 -Y 25` posts a click to it without moving the cursor;
 `tools/window-type.ps1 -ProcessName maxly-gpui -Text "Hi" -Enter` posts text the same way.
 
+## Linux
+
+The same commands. The client still tells the server it is MAX Desktop for Windows (ADR-003).
+Files go to `$XDG_DATA_HOME/maxly-gpui` (usually `~/.local/share/maxly-gpui`). The database key
+and the login token go to the Secret Service. A second start talks to the first through
+`$XDG_RUNTIME_DIR/maxly-gpui.sock`.
+
+OpenSSL inside SQLCipher needs a full Perl (`/usr/bin/perl` is enough; set `OPENSSL_SRC_PERL`
+if `perl` is not on `PATH`). The first build of `max-store` compiles OpenSSL and takes several
+minutes.
+
+Notifications need a daemon that speaks the freedesktop notification spec (`dunst`, `mako`,
+the GNOME or KDE daemon). The tray speaks StatusNotifier, not `libappindicator`: KDE, waybar
+and swaybar show it; GNOME needs the AppIndicator extension.
+
+### Arch
+
+```sh
+sudo pacman -S --needed rust perl pkgconf dbus libxkbcommon wayland vulkan-icd-loader fontconfig libxcb
+# One secret store. gnome-keyring also works outside GNOME if its daemon is running.
+sudo pacman -S --needed gnome-keyring
+# or, on KDE: sudo pacman -S --needed kwallet
+export OPENSSL_SRC_PERL=/usr/bin/perl
+cargo run -p maxly-gpui -- --demo
+```
+
+A package is in `packaging/arch`. From a checkout:
+
+```sh
+cd packaging/arch
+makepkg -si
+```
+
+`makepkg` fetches the public git repository, so it builds what is on the remote, not uncommitted
+work in the working tree. For that, use `cargo` as above.
+
 ## Reverse engineering tools
 
 See `re/README.md` (Ghidra, rea, Frida).

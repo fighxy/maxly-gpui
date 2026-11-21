@@ -13,8 +13,9 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, name: &str) -> Result<()>;
 }
 
-/// The operating system's credential store: on Windows the Credential Manager, whose generic
-/// credentials are encrypted with DPAPI for the current user (ADR-009).
+/// The operating system's credential store (ADR-009). On Windows that is Credential Manager,
+/// encrypted with DPAPI for the current user. On Linux it is the Secret Service, which
+/// gnome-keyring and KWallet both provide.
 #[derive(Debug, Clone)]
 pub struct OsSecrets {
     service: String,

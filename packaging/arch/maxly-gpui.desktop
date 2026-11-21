@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=maxly-gpui
+GenericName=MAX
+Comment=Клиент мессенджера MAX без телеметрии
+Exec=maxly-gpui
+Icon=maxly-gpui
+Terminal=false
+Categories=Network;InstantMessaging;
+StartupWMClass=maxly-gpui

@@ -1,6 +1,6 @@
-//! The real Windows Credential Manager. Ignored by default because it writes to the user's
-//! credential store; run with `cargo test -p max-store -- --ignored`. It deletes what it
-//! writes.
+//! The real OS credential store (Credential Manager on Windows, Secret Service on Linux).
+//! Ignored by default because it writes to the user's store; run with
+//! `cargo test -p max-store --test os_secrets -- --ignored`. It deletes what it writes.
 
 #![allow(clippy::unwrap_used)]
 

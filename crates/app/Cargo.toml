@@ -21,6 +21,7 @@ gpui-kit = "=0.10.0"
 image = { version = "0.25.9", default-features = false }
 jiff = "1.0.1"
 max-core = { path = "../max-core" }
+max-lottie = { path = "../max-lottie" }
 max-identity = { path = "../max-identity" }
 max-proto = { path = "../max-proto" }
 max-store = { path = "../max-store" }

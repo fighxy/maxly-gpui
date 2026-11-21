@@ -8,6 +8,8 @@
 //! | 135 | chat changed or added | `NotificationChatData::Response {chat}` |
 //! | 140 | messages deleted in a time range | `MessagesDeleteRangeData::Response {chat, startTime, endTime}` |
 //! | 142 | messages deleted | `MessagesDeleteData::Response {chat, messageIds}` |
+//! | 155 | reaction counters changed | `ReactionsChangedData::Response {chatId, messageId, totalCount, counters}` |
+//! | 156 | our reaction changed | `YouReactedData::Response {chatId, messageId, reactionInfo}` |
 //!
 //! Typing is also sent from here (`MSG_TYPING` 65, `Typing::Send::Parameters {chatId, type}`);
 //! the type names come from `Core::Typing::Interactor::doSend`: `TEXT` (the default), `AUDIO`,
@@ -16,7 +18,7 @@
 use max_proto::Opcode;
 use max_proto::schema::packets::events::{
     messages_delete_data, messages_delete_range_data, notification_chat_data,
-    notification_mark_data, typing_data,
+    notification_mark_data, reactions_changed_data, typing_data, you_reacted_data,
 };
 use max_proto::schema::packets::typing;
 use max_transport::{Response, Transport};
@@ -84,6 +86,18 @@ pub enum ServerEvent {
     },
     /// A chat changed or was added.
     Chat(Box<Chat>),
+    /// Reaction counters changed. `known_yours` is set by the "you reacted" push, which carries
+    /// our emoji; the counters-only push does not.
+    Reactions {
+        /// Chat id.
+        chat_id: i64,
+        /// Message id.
+        message_id: i64,
+        /// Counters, and our emoji when `known_yours`.
+        info: crate::messages::ReactionInfo,
+        /// `info.your_reaction` is authoritative.
+        known_yours: bool,
+    },
 }
 
 /// Decode a push the client acts on; `None` for everything else.
@@ -137,6 +151,28 @@ pub fn decode(push: &Response) -> Option<ServerEvent> {
                 chat_id: d.chat.id,
                 from: d.start_time,
                 to: d.end_time,
+            }
+        }
+        Opcode::ReactionsChanged => {
+            let d: reactions_changed_data::Response = push.decode().ok()?;
+            ServerEvent::Reactions {
+                chat_id: d.chat_id,
+                message_id: d.message_id,
+                info: crate::messages::ReactionInfo {
+                    counters: d.counters,
+                    total_count: Some(d.total_count),
+                    your_reaction: None,
+                },
+                known_yours: false,
+            }
+        }
+        Opcode::YouReacted => {
+            let d: you_reacted_data::Response = push.decode().ok()?;
+            ServerEvent::Reactions {
+                chat_id: d.chat_id,
+                message_id: d.message_id,
+                info: d.reaction_info.unwrap_or_default(),
+                known_yours: true,
             }
         }
         _ => return None,
@@ -285,6 +321,53 @@ mod tests {
                 from: 10,
                 to: 20
             })
+        ));
+        let changed = push(
+            Opcode::ReactionsChanged,
+            &[
+                ("chatId", 7.into()),
+                ("messageId", 3.into()),
+                ("totalCount", 2.into()),
+                (
+                    "counters",
+                    Value::Array(vec![Value::Map(vec![
+                        ("reaction".into(), "👍".into()),
+                        ("count".into(), 2.into()),
+                    ])]),
+                ),
+            ],
+        );
+        assert!(matches!(
+            decode(&changed),
+            Some(ServerEvent::Reactions {
+                chat_id: 7,
+                message_id: 3,
+                known_yours: false,
+                ref info,
+            }) if info.total_count == Some(2)
+                && info.counters.as_ref().is_some_and(|c| c.first().is_some_and(|c| c.reaction == "👍" && c.count == 2))
+        ));
+        let mine = push(
+            Opcode::YouReacted,
+            &[
+                ("chatId", 7.into()),
+                ("messageId", 3.into()),
+                (
+                    "reactionInfo",
+                    Value::Map(vec![
+                        ("yourReaction".into(), "👍".into()),
+                        ("totalCount".into(), 1.into()),
+                    ]),
+                ),
+            ],
+        );
+        assert!(matches!(
+            decode(&mine),
+            Some(ServerEvent::Reactions {
+                known_yours: true,
+                info,
+                ..
+            }) if info.your_reaction.as_deref() == Some("👍")
         ));
         let other = push(Opcode::NotificationPresence, &[("userId", 9.into())]);
         assert!(decode(&other).is_none());

@@ -20,8 +20,8 @@ use max_core::media::Attachment;
 
 use crate::album;
 use crate::backend::{
-    ChatKind, ChatRow, ContactRow, Delivery, MessageRow, Quote, SessionRow, UiCommand, UiEvent,
-    one_line,
+    ChatKind, ChatRow, ContactRow, Delivery, MessageRow, Quote, ReactionCount, SessionRow,
+    UiCommand, UiEvent, one_line, reaction_counts,
 };
 use crate::desktop::{self, DesktopEvent};
 use crate::instance::Instance;
@@ -30,6 +30,7 @@ use crate::rich;
 use crate::settings::{FONT_SIZES, ThemeChoice, UiSettings};
 use crate::viewer::{Viewer, ViewerPhoto, clamp_pan, fit_scale, rotate_pixels};
 use gpui_kit::assets::IconName as Lucide;
+use max_core::messages;
 
 enum Screen {
     Status(String),
@@ -333,6 +334,21 @@ enum ImageState {
     Failed,
 }
 
+/// A Lottie emoji while it loads and after its frames are known.
+enum LottieState {
+    Loading,
+    Ready(LottieClip),
+    Failed,
+}
+
+/// One animated emoji. Drawn frames stay, so a frame is rasterized only the first time it shows.
+struct LottieClip {
+    frames: u32,
+    index: u32,
+    cache: Vec<Option<Arc<RenderImage>>>,
+    json: Vec<u8>,
+}
+
 /// The image format of downloaded bytes, by their signature.
 fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
     let head = &bytes[..bytes.len().min(256)];
@@ -375,6 +391,16 @@ pub struct AppView {
     link_cards: HashMap<String, Option<Attachment>>,
     /// Preview images the user asked to see.
     shown_sensitive: HashSet<String>,
+    /// Lottie emoji, keyed by the file address.
+    lotties: HashMap<String, LottieState>,
+    /// A timer is advancing the Lottie frames.
+    lottie_clock: bool,
+    /// Emoji a chat offers. Missing means the usual plate.
+    reaction_choices: HashMap<i64, Vec<String>>,
+    /// The message whose reaction plate is open (chat, message).
+    reaction_picker: Option<(i64, i64)>,
+    /// Who reacted to a message, while that list is open.
+    reaction_people: Option<(i64, Vec<(String, String)>)>,
     screen: Screen,
     histories: HashMap<i64, History>,
     phone: Entity<InputState>,
@@ -533,6 +559,11 @@ impl AppView {
             images: HashMap::new(),
             link_cards: HashMap::new(),
             shown_sensitive: HashSet::new(),
+            lotties: HashMap::new(),
+            lottie_clock: false,
+            reaction_choices: HashMap::new(),
+            reaction_picker: None,
+            reaction_people: None,
             commands,
             account: None,
             typing: HashMap::new(),
@@ -574,8 +605,10 @@ impl AppView {
                 }
                 let urls: Vec<String> = h.messages.iter().flat_map(image_urls).collect();
                 let links: Vec<String> = h.messages.iter().flat_map(uncovered_max_links).collect();
+                let lotties: Vec<String> = h.messages.iter().flat_map(lottie_urls).collect();
                 self.request_images(urls);
                 self.request_link_previews(links);
+                self.request_lotties(lotties);
                 // `--demo-walk` sends a history without a click: open that chat.
                 if let Screen::Main {
                     selected, chats, ..
@@ -597,12 +630,14 @@ impl AppView {
             } => {
                 let urls: Vec<String> = messages.iter().flat_map(image_urls).collect();
                 let links: Vec<String> = messages.iter().flat_map(uncovered_max_links).collect();
+                let lotties: Vec<String> = messages.iter().flat_map(lottie_urls).collect();
                 let h = self.histories.entry(chat_id).or_default();
                 h.prepend(messages);
                 h.has_more = has_more;
                 h.loading_older = false;
                 self.request_images(urls);
                 self.request_link_previews(links);
+                self.request_lotties(lotties);
             }
             UiEvent::HistoryFailed { chat_id, error } => {
                 let h = self.histories.entry(chat_id).or_default();
@@ -615,7 +650,9 @@ impl AppView {
                 }
                 self.request_images(image_urls(&message));
                 let links = uncovered_max_links(&message);
+                let lotties = lottie_urls(&message);
                 self.request_link_previews(links);
+                self.request_lotties(lotties);
                 self.notify_message(chat_id, &message, cx);
                 self.message_added(chat_id, message);
                 self.mark_read(chat_id);
@@ -643,6 +680,40 @@ impl AppView {
                 }
                 self.link_cards.insert(url, card);
             }
+            UiEvent::Reactions {
+                chat_id,
+                message_id,
+                info,
+                known_yours,
+            } => self.apply_reactions(chat_id, message_id, &info, known_yours),
+            UiEvent::ReactionChoices { chat_id, emojis } => {
+                self.reaction_choices.insert(chat_id, emojis);
+            }
+            UiEvent::ReactionPeople { message_id, people } => {
+                self.reaction_people = Some((message_id, people));
+            }
+            UiEvent::Lottie { url, bytes } => {
+                let json = bytes.to_vec();
+                let frames = max_lottie::frame_count(&json).unwrap_or(0);
+                if frames == 0 {
+                    self.lotties.insert(url, LottieState::Failed);
+                } else {
+                    self.lotties.insert(
+                        url.clone(),
+                        LottieState::Ready(LottieClip {
+                            frames,
+                            index: 0,
+                            cache: vec![None; frames as usize],
+                            json,
+                        }),
+                    );
+                    self.paint_lottie(&url);
+                    self.ensure_lottie_clock(cx);
+                }
+            }
+            UiEvent::LottieFailed { url } => {
+                self.lotties.insert(url, LottieState::Failed);
+            }
             UiEvent::Sessions(rows) => {
                 if let Some(panel) = &mut self.account {
                     panel.sessions = Some(rows);
@@ -669,11 +740,18 @@ impl AppView {
                 self.images.clear();
                 self.link_cards.clear();
                 self.shown_sensitive.clear();
+                self.lotties.clear();
+                self.lottie_clock = false;
+                self.reaction_choices.clear();
+                self.reaction_picker = None;
+                self.reaction_people = None;
                 self.screen = Screen::Status("Вы вышли из аккаунта".into());
             }
             UiEvent::MessageEdited { chat_id, message } => {
                 let links = uncovered_max_links(&message);
+                let lotties = lottie_urls(&message);
                 self.request_link_previews(links);
+                self.request_lotties(lotties);
                 if let Some(h) = self.histories.get_mut(&chat_id) {
                     h.edit(message);
                 }
@@ -823,6 +901,175 @@ impl AppView {
             self.link_cards.insert(url.clone(), None);
             let _ = self.commands.send(UiCommand::LinkInfo(url));
         }
+    }
+
+    fn request_lotties(&mut self, urls: impl IntoIterator<Item = String>) {
+        let urls: Vec<String> = urls
+            .into_iter()
+            .filter(|url| !self.lotties.contains_key(url))
+            .collect();
+        for url in urls {
+            self.lotties.insert(url.clone(), LottieState::Loading);
+            let _ = self.commands.send(UiCommand::FetchLottie(url));
+        }
+    }
+
+    /// Draw the current frame of a Lottie emoji, once, and keep it.
+    fn paint_lottie(&mut self, url: &str) {
+        let Some(LottieState::Ready(clip)) = self.lotties.get(url) else {
+            return;
+        };
+        let index = clip.index;
+        if clip
+            .cache
+            .get(index as usize)
+            .and_then(|frame| frame.as_ref())
+            .is_some()
+        {
+            return;
+        }
+        let json = clip.json.clone();
+        let Some(rgba) = max_lottie::render_frame(&json, index, 48) else {
+            return;
+        };
+        let Some(buffer) = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(48, 48, rgba)
+        else {
+            return;
+        };
+        let frame = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
+        let Some(LottieState::Ready(clip)) = self.lotties.get_mut(url) else {
+            return;
+        };
+        if clip.cache.len() <= index as usize {
+            clip.cache.resize(index as usize + 1, None);
+        }
+        clip.cache[index as usize] = Some(frame);
+    }
+
+    fn ensure_lottie_clock(&mut self, cx: &mut Context<Self>) {
+        if self.lottie_clock {
+            return;
+        }
+        let playing = self
+            .lotties
+            .values()
+            .any(|state| matches!(state, LottieState::Ready(clip) if clip.frames > 1));
+        if !playing {
+            return;
+        }
+        self.lottie_clock = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let keep = this.update(cx, |view, cx| {
+                    let mut urls = Vec::new();
+                    for (url, state) in &mut view.lotties {
+                        if let LottieState::Ready(clip) = state
+                            && clip.frames > 1
+                        {
+                            clip.index = (clip.index + 1) % clip.frames;
+                            urls.push(url.clone());
+                        }
+                    }
+                    for url in &urls {
+                        view.paint_lottie(url);
+                    }
+                    if !urls.is_empty() {
+                        cx.notify();
+                    }
+                    !urls.is_empty()
+                });
+                if !keep.unwrap_or(false) {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |view, _| view.lottie_clock = false);
+        })
+        .detach();
+    }
+
+    fn apply_reactions(
+        &mut self,
+        chat_id: i64,
+        message_id: i64,
+        info: &messages::ReactionInfo,
+        known_yours: bool,
+    ) {
+        let Some(row) = self
+            .histories
+            .get_mut(&chat_id)
+            .and_then(|h| h.messages.iter_mut().find(|m| m.id == message_id))
+        else {
+            return;
+        };
+        let kept = row
+            .reactions
+            .iter()
+            .find(|r| r.mine)
+            .map(|r| r.emoji.clone());
+        let yours = if known_yours {
+            info.your_reaction.as_deref()
+        } else {
+            kept.as_deref()
+        };
+        row.reactions = reaction_counts(info, yours);
+    }
+
+    /// The plate we show for a chat: the server's list, or the usual emoji.
+    fn reaction_palette(&self, chat_id: i64) -> Vec<String> {
+        self.reaction_choices
+            .get(&chat_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                ["👍", "❤️", "🔥", "😂", "😢", "😮", "🙏"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            })
+    }
+
+    fn toggle_reaction(&mut self, chat_id: i64, message_id: i64, emoji: &str) {
+        let Some(row) = self
+            .histories
+            .get_mut(&chat_id)
+            .and_then(|h| h.messages.iter_mut().find(|m| m.id == message_id))
+        else {
+            return;
+        };
+        let removing = row.reactions.iter().any(|r| r.mine && r.emoji == emoji);
+        if let Some(prev) = row.reactions.iter_mut().find(|r| r.mine) {
+            prev.mine = false;
+            prev.count -= 1;
+        }
+        row.reactions.retain(|r| r.count > 0);
+        if !removing {
+            if let Some(chip) = row.reactions.iter_mut().find(|r| r.emoji == emoji) {
+                chip.count += 1;
+                chip.mine = true;
+            } else {
+                row.reactions.push(ReactionCount {
+                    emoji: emoji.to_string(),
+                    count: 1,
+                    mine: true,
+                });
+            }
+        }
+        let command = if removing {
+            UiCommand::CancelReaction {
+                chat_id,
+                message_id,
+            }
+        } else {
+            UiCommand::React {
+                chat_id,
+                message_id,
+                emoji: emoji.to_string(),
+            }
+        };
+        let _ = self.commands.send(command);
+        self.reaction_picker = None;
     }
 
     fn pick_file(&mut self, cx: &mut Context<Self>) {
@@ -1923,25 +2170,177 @@ impl AppView {
     }
 
     /// A message's text with its formatting, mentions and clickable links.
+    /// Chips under a message, and the plate of emoji to add one.
+    fn reaction_row(
+        &self,
+        chat_id: i64,
+        m: &MessageRow,
+        key: u64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.reaction_picker == Some((chat_id, m.id));
+        let people = self
+            .reaction_people
+            .as_ref()
+            .filter(|(id, _)| *id == m.id)
+            .map(|(_, lines)| lines.clone());
+        let message_id = m.id;
+        v_flex()
+            .gap_1()
+            .when(open, |this| {
+                let palette = self.reaction_palette(chat_id);
+                this.child(
+                    h_flex()
+                        .gap_1()
+                        .children(palette.into_iter().enumerate().map(|(i, emoji)| {
+                            let chosen = emoji.clone();
+                            Button::new(("plate", key.wrapping_add(i as u64)))
+                                .xsmall()
+                                .ghost()
+                                .label(emoji)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_reaction(chat_id, message_id, &chosen);
+                                    cx.notify();
+                                }))
+                        })),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .children(m.reactions.iter().enumerate().map(|(i, chip)| {
+                        let emoji = chip.emoji.clone();
+                        let label = format!("{} {}", chip.emoji, chip.count);
+                        let mine = chip.mine;
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new(("chip", key.wrapping_add(20 + i as u64)))
+                                    .xsmall()
+                                    .when(mine, |this| this.selected(true))
+                                    .ghost()
+                                    .label(label)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_reaction(chat_id, message_id, &emoji);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new(("who", key.wrapping_add(40 + i as u64)))
+                                    .xsmall()
+                                    .ghost()
+                                    .label("кто")
+                                    .on_click(cx.listener(move |this, _, _, _| {
+                                        let _ = this.commands.send(UiCommand::ReactionDetails {
+                                            chat_id,
+                                            message_id,
+                                        });
+                                    })),
+                            )
+                    }))
+                    .child(
+                        Button::new(("add-react", key))
+                            .xsmall()
+                            .ghost()
+                            .label(if open { "×" } else { "+" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.reaction_picker = if open {
+                                    None
+                                } else {
+                                    Some((chat_id, message_id))
+                                };
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when_some(people, |this, lines| {
+                this.child(v_flex().children(lines.into_iter().map(|(who, emoji)| {
+                    div()
+                        .text_xs()
+                        .child(format!("{who} {emoji}"))
+                        .into_any_element()
+                })))
+            })
+            .into_any_element()
+    }
+
     fn rich_text(&self, m: &MessageRow, key: u64, cx: &mut Context<Self>) -> AnyElement {
-        if m.marks.is_empty() {
-            return div().child(m.text.clone()).into_any_element();
+        if m.marks
+            .iter()
+            .any(|mark| matches!(mark.kind, rich::MarkKind::Animoji { .. }))
+        {
+            return self.with_animoji(m, key, cx);
+        }
+        self.styled_text(&m.text, &m.marks, m.out, key, cx)
+    }
+
+    /// The message text with an animated emoji drawn in place of its characters.
+    fn with_animoji(&self, m: &MessageRow, key: u64, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = h_flex().flex_wrap().items_end().gap_1();
+        for (i, part) in rich::pieces(m.text.len(), &m.marks).into_iter().enumerate() {
+            match part {
+                rich::Piece::Text(range) if !m.text[range.clone()].is_empty() => {
+                    let text = m.text[range.clone()].to_string();
+                    let marks = rich::marks_in(&m.marks, range);
+                    row = row.child(self.styled_text(
+                        &text,
+                        &marks,
+                        m.out,
+                        key.wrapping_add(i as u64 + 1),
+                        cx,
+                    ));
+                }
+                rich::Piece::Animoji { range, url } => {
+                    let fallback = m.text[range].to_string();
+                    row = row.child(self.animoji_view(&url, &fallback));
+                }
+                rich::Piece::Text(_) => {}
+            }
+        }
+        row.into_any_element()
+    }
+
+    fn animoji_view(&self, url: &str, fallback: &str) -> AnyElement {
+        let frame = self.lotties.get(url).and_then(|state| match state {
+            LottieState::Ready(clip) => clip.cache.get(clip.index as usize).and_then(|f| f.clone()),
+            _ => None,
+        });
+        match frame {
+            Some(image) => img(image).w(px(28.)).h(px(28.)).into_any_element(),
+            None => div()
+                .text_sm()
+                .child(fallback.to_string())
+                .into_any_element(),
+        }
+    }
+
+    fn styled_text(
+        &self,
+        text: &str,
+        marks: &[rich::Mark],
+        out: bool,
+        key: u64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if marks.is_empty() {
+            return div().child(text.to_string()).into_any_element();
         }
         // On our own (accent-coloured) bubbles links keep the text colour and are underlined.
         // The neutral themes draw links in the text colour; messengers use blue.
-        let link_color = if m.out {
+        let link_color = if out {
             cx.theme().primary_foreground
         } else if cx.theme().is_dark() {
             rgb(0x6c_b4_ff).into()
         } else {
             rgb(0x1a_6f_d6).into()
         };
-        let mono_bg = if m.out {
+        let mono_bg = if out {
             cx.theme().primary_foreground.opacity(0.15)
         } else {
             cx.theme().foreground.opacity(0.08)
         };
-        let runs = rich::runs(m.text.len(), &m.marks);
+        let runs = rich::runs(text.len(), marks);
         let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = runs
             .iter()
             .map(|(range, f)| {
@@ -1972,10 +2371,10 @@ impl AppView {
             .filter(|(_, f)| f.mono)
             .map(|(range, _)| (range.clone(), mono.clone()))
             .collect();
-        let styled = StyledText::new(m.text.clone())
+        let styled = StyledText::new(text.to_string())
             .with_highlights(highlights)
             .with_font_family_overrides(fonts);
-        let links = rich::links(&m.marks);
+        let links = rich::links(marks);
         if links.is_empty() {
             return styled.into_any_element();
         }
@@ -2778,7 +3177,10 @@ impl AppView {
                 "{}{}{state}",
                 if m.edited { "изменено · " } else { "" },
                 clock(m.time)
-            )));
+            )))
+            .when(m.id != 0 && m.delivery == Delivery::Sent, |this| {
+                this.child(self.reaction_row(chat_id, m, message_key, cx))
+            });
         let key =
             u64::from_ne_bytes(if m.id != 0 { m.id } else { m.cid.unwrap_or(0) }.to_ne_bytes());
         // The row under the mouse, and the row whose menu is open, are tinted across the width.
@@ -3963,6 +4365,16 @@ fn image_urls(m: &MessageRow) -> Vec<String> {
 }
 
 /// `max.ru` links in the message that have no `SHARE` card of their own yet.
+fn lottie_urls(m: &MessageRow) -> Vec<String> {
+    m.marks
+        .iter()
+        .filter_map(|mark| match &mark.kind {
+            rich::MarkKind::Animoji { url } => Some(url.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn uncovered_max_links(m: &MessageRow) -> Vec<String> {
     rich::links(&m.marks)
         .into_iter()

@@ -3,7 +3,8 @@
 //!
 //! Element types are the `core.dll` strings (`STRONG`, `EMPHASIZED`, `UNDERLINE`,
 //! `STRIKETHROUGH`, `MONOSPACED`, `CODE`, `HEADING`, `QUOTE`, `USER_MENTION`, `LINK` with
-//! `attributes.url`); `from` and `length` count UTF-16 code units, as PyMax builds them.
+//! `attributes.url`, `ANIMOJI` with `attributes.animojiLottieUrl`); `from` and `length` count
+//! UTF-16 code units, as PyMax builds them.
 
 use std::ops::Range;
 
@@ -24,6 +25,10 @@ pub enum MarkKind {
     Link {
         url: String,
         hidden: bool,
+    },
+    /// An animated emoji. `url` is its Lottie file (`attributes.animojiLottieUrl`).
+    Animoji {
+        url: String,
     },
 }
 
@@ -120,6 +125,14 @@ pub fn from_elements<'a>(text: &str, elements: impl IntoIterator<Item = Element<
             "HEADING" => MarkKind::Heading,
             "QUOTE" => MarkKind::Quote,
             "USER_MENTION" => MarkKind::Mention,
+            "ANIMOJI" => {
+                let Some(url) = e.url.map(str::trim).filter(|u| !u.is_empty()) else {
+                    continue;
+                };
+                MarkKind::Animoji {
+                    url: url.to_string(),
+                }
+            }
             "LINK" => {
                 let label = text[start..end].trim();
                 let Some(url) = e
@@ -270,6 +283,7 @@ pub fn runs(len: usize, marks: &[Mark]) -> Vec<(Range<usize>, Flags)> {
                 MarkKind::Quote => f.quote = true,
                 MarkKind::Mention => f.mention = true,
                 MarkKind::Link { .. } => f.link = true,
+                MarkKind::Animoji { .. } => {}
             }
         }
         if f != Flags::default() {
@@ -277,6 +291,66 @@ pub fn runs(len: usize, marks: &[Mark]) -> Vec<(Range<usize>, Flags)> {
         }
     }
     out
+}
+
+/// A slice of the message: plain (possibly formatted) text, or one animated emoji.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Piece {
+    /// Bytes of the message text.
+    Text(Range<usize>),
+    /// An animated emoji covering those bytes.
+    Animoji { range: Range<usize>, url: String },
+}
+
+/// The message split around its animated emoji, in order. Text with no animoji is one piece.
+pub fn pieces(len: usize, marks: &[Mark]) -> Vec<Piece> {
+    let mut anim: Vec<&Mark> = marks
+        .iter()
+        .filter(|m| matches!(m.kind, MarkKind::Animoji { .. }))
+        .filter(|m| m.range.start < m.range.end && m.range.start < len)
+        .collect();
+    anim.sort_by_key(|m| m.range.start);
+    let mut out = Vec::new();
+    let mut at = 0;
+    for m in anim {
+        let start = m.range.start.max(at).min(len);
+        let end = m.range.end.min(len);
+        if start > at {
+            out.push(Piece::Text(at..start));
+        }
+        if let MarkKind::Animoji { url } = &m.kind
+            && end > start
+        {
+            out.push(Piece::Animoji {
+                range: start..end,
+                url: url.clone(),
+            });
+            at = end;
+        }
+    }
+    if at < len {
+        out.push(Piece::Text(at..len));
+    }
+    out
+}
+
+/// Marks that cover `range`, shifted so `range.start` is byte 0. Animated emoji are left out:
+/// they are drawn as their own piece.
+pub fn marks_in(marks: &[Mark], range: Range<usize>) -> Vec<Mark> {
+    marks
+        .iter()
+        .filter_map(|m| {
+            if matches!(m.kind, MarkKind::Animoji { .. }) {
+                return None;
+            }
+            let start = m.range.start.max(range.start);
+            let end = m.range.end.min(range.end);
+            (start < end).then(|| Mark {
+                range: start - range.start..end - range.start,
+                kind: m.kind.clone(),
+            })
+        })
+        .collect()
 }
 
 /// A link to draw as clickable.
@@ -426,6 +500,26 @@ mod tests {
         );
         assert_eq!(marks[2].kind, MarkKind::Italic);
         assert!(!is_hidden("www.Example.com/", "https://example.com"));
+        let wave = "До завтра! 👋";
+        let start = wave.find('👋').unwrap_or(0);
+        let marks = from_elements(
+            wave,
+            [Element {
+                kind: "ANIMOJI",
+                from: 11,
+                length: 2,
+                url: Some("https://i.example/a.json"),
+            }],
+        );
+        assert!(matches!(
+            &marks[0].kind,
+            MarkKind::Animoji { url }
+                if url == "https://i.example/a.json" && marks[0].range == (start..wave.len())
+        ));
+        assert!(matches!(
+            pieces(wave.len(), &marks).as_slice(),
+            [Piece::Text(_), Piece::Animoji { .. }]
+        ));
     }
 
     #[test]

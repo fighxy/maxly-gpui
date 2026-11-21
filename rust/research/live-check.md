@@ -45,6 +45,7 @@ close it in the phone app's list of active sessions and delete the profile folde
 | 17 | Open a chat with a forwarded message | text and attachments come from `link.message`; `chatName` for channels | — |
 | 18 | Open a chat with bold or italic text, a mention, a plain address and a link whose text is not the address | formatting and the mention are coloured; the plain address is a link; a left click opens it; the hidden address asks first and shows the real url | element offsets are UTF-16 |
 | 19 | Open a chat with a web link that has a preview, and a `max.ru` link (chat, person or post) | the web link shows the card that arrived with the message (`SHARE`); the `max.ru` link sends `LINK_INFO` (89) and shows the answer as a card; a sensitive image stays hidden until «Показать» | `SHARE` field names from `core.dll` |
+| 20 | Open a chat with reactions and an animated emoji; put and remove a reaction; open «кто» | chips match `reactionInfo`; a click sends `MSG_REACTION` / `MSG_CANCEL_REACTION` with `reactionType` `EMOJI`; pushes 155 and 156 move the chips; «кто» sends `MSG_GET_DETAILED_REACTIONS`; an `ANIMOJI` with `animojiLottieUrl` animates | reaction type string |
 
 For each step note: worked / server error (the `error` and `localizedMessage` in the trace) /
 nothing happened. Any server `cmd=Error` (3) line answers which guess was wrong.

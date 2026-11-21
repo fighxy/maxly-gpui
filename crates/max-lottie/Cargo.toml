@@ -1,0 +1,21 @@
+[package]
+name = "max-lottie"
+version = "0.1.0"
+description = "Play a Lottie emoji with ThorVG, the renderer the official client uses"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thorvg = "0.6"
+
+# The workspace forbids unsafe. ThorVG's software canvas takes the pixel buffer by pointer;
+# this crate is the one place that pointer is held, and only until the frame has been copied out.
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

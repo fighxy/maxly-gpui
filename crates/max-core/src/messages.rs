@@ -163,6 +163,109 @@ pub async fn link_info(transport: &Transport, link: &str) -> Result<LinkInfo> {
     Ok(transport.call(Opcode::LinkInfo, &params).await?)
 }
 
+/// `reactionType` of an emoji reaction (`MSG_REACTION`). The `id` is the emoji itself.
+pub const REACTION_EMOJI: &str = "EMOJI";
+
+/// Counters on a message, and which emoji is ours (`MessageReactionInfo`).
+pub type ReactionInfo = max_proto::schema::types::MessageReactionInfo;
+
+/// One person who reacted (`MessageReactionEntry`).
+pub type ReactionEntry = max_proto::schema::types::MessageReactionEntry;
+
+/// Put `emoji` on a message (`MSG_REACTION`). The answer is the message's counters afterwards.
+pub async fn react(
+    transport: &Transport,
+    chat_id: i64,
+    message_id: i64,
+    emoji: &str,
+) -> Result<ReactionInfo> {
+    let params = max_proto::schema::packets::reactions::msg_react::Parameters {
+        chat_id,
+        post_id: None,
+        message_id,
+        reaction: max_proto::schema::types::MessageReaction {
+            reaction_type: REACTION_EMOJI.to_string(),
+            id: emoji.to_string(),
+        },
+    };
+    let response: max_proto::schema::packets::reactions::msg_react::Response =
+        transport.call(Opcode::MsgReact, &params).await?;
+    Ok(response.reaction_info)
+}
+
+/// Take our reaction off a message (`MSG_CANCEL_REACTION`).
+pub async fn cancel_reaction(
+    transport: &Transport,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<ReactionInfo> {
+    let params = max_proto::schema::packets::reactions::cancel_reaction::Parameters {
+        chat_id,
+        post_id: None,
+        message_id,
+    };
+    let response: max_proto::schema::packets::reactions::cancel_reaction::Response =
+        transport.call(Opcode::CancelReaction, &params).await?;
+    Ok(response.reaction_info)
+}
+
+/// Counters for the given messages (`MSG_GET_REACTIONS`), keyed by message id.
+pub async fn reactions(
+    transport: &Transport,
+    chat_id: i64,
+    message_ids: &[i64],
+) -> Result<std::collections::BTreeMap<i64, ReactionInfo>> {
+    let params = max_proto::schema::packets::reactions::get_reactions::Parameters {
+        chat_id,
+        post_id: None,
+        message_ids: message_ids.to_vec(),
+    };
+    let response: max_proto::schema::packets::reactions::get_reactions::Response =
+        transport.call(Opcode::GetReactions, &params).await?;
+    Ok(response.messages_reactions)
+}
+
+/// Who reacted (`MSG_GET_DETAILED_REACTIONS`): the counters and one entry per person.
+pub async fn detailed_reactions(
+    transport: &Transport,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<(ReactionInfo, Vec<ReactionEntry>)> {
+    let params = max_proto::schema::packets::reactions::get_detailed_reactions::Parameters {
+        chat_id,
+        post_id: None,
+        message_id,
+        reaction: None,
+        marker: None,
+        count: Some(100),
+    };
+    let response: max_proto::schema::packets::reactions::get_detailed_reactions::Response =
+        transport
+            .call(Opcode::GetDetailedReactions, &params)
+            .await?;
+    Ok((
+        response.reaction_info.unwrap_or_default(),
+        response.reactions.unwrap_or_default(),
+    ))
+}
+
+/// Emoji the chat allows (`REACTIONS_SETTINGS_GET_BY_CHAT_ID`). Empty when the server names none.
+pub async fn chat_reaction_emoji(transport: &Transport, chat_id: i64) -> Result<Vec<String>> {
+    let params = max_proto::schema::packets::reactions::get_chat_reactions::Parameters {
+        chat_ids: vec![chat_id],
+    };
+    let response: max_proto::schema::packets::reactions::get_chat_reactions::Response =
+        transport.call(Opcode::GetChatReactions, &params).await?;
+    let ids = response
+        .chat_reactions_settings
+        .into_iter()
+        .flatten()
+        .find(|s| s.is_active && s.chat_id.is_none_or(|id| id == chat_id))
+        .and_then(|s| s.reaction_ids)
+        .unwrap_or_default();
+    Ok(ids.into_iter().filter(|s| !s.is_empty()).collect())
+}
+
 /// Mark `chat_id` as read up to `message_id` (`CHAT_MARK`, `type` `READ_MESSAGE`, `mark` = now).
 pub async fn mark_read(
     transport: &Transport,

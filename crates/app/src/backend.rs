@@ -99,6 +99,24 @@ pub enum UiEvent {
         url: String,
         card: Option<Attachment>,
     },
+    /// Reaction counters for one message. `known_yours` means `info.your_reaction` is ours.
+    Reactions {
+        chat_id: i64,
+        message_id: i64,
+        info: messages::ReactionInfo,
+        known_yours: bool,
+    },
+    /// Emoji a chat offers on its reaction plate. Empty is not sent.
+    ReactionChoices { chat_id: i64, emojis: Vec<String> },
+    /// People who reacted, as (name, emoji).
+    ReactionPeople {
+        message_id: i64,
+        people: Vec<(String, String)>,
+    },
+    /// A Lottie file for an animated emoji.
+    Lottie { url: String, bytes: bytes::Bytes },
+    /// A Lottie file did not load.
+    LottieFailed { url: String },
     /// The people we know, for the contacts section.
     Contacts(Vec<ContactRow>),
     /// Something failed; shown with a way to start over.
@@ -171,6 +189,18 @@ pub enum UiCommand {
     Typing { chat_id: i64 },
     /// Ask what a `max.ru` link points at.
     LinkInfo(String),
+    /// Put this emoji on a message, replacing ours if we had another.
+    React {
+        chat_id: i64,
+        message_id: i64,
+        emoji: String,
+    },
+    /// Take our reaction off a message.
+    CancelReaction { chat_id: i64, message_id: i64 },
+    /// Who reacted to a message.
+    ReactionDetails { chat_id: i64, message_id: i64 },
+    /// Load a Lottie emoji.
+    FetchLottie(String),
 }
 
 /// One active session of the account, for the account panel.
@@ -257,6 +287,35 @@ pub struct MessageRow {
     pub forwarded: Option<String>,
     /// Formatting, mentions and links over `text`, as byte ranges.
     pub marks: Vec<rich::Mark>,
+    /// Emoji reactions under the message, ours marked.
+    pub reactions: Vec<ReactionCount>,
+}
+
+/// One emoji on a message: how many people, and whether it is ours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionCount {
+    /// The emoji.
+    pub emoji: String,
+    /// How many people put it.
+    pub count: i32,
+    /// It is the one we put.
+    pub mine: bool,
+}
+
+/// Chips for a message's `reactionInfo`. `yours`, when set, wins over the info's own emoji
+/// (a counters push does not say whether ours is still there).
+pub fn reaction_counts(info: &messages::ReactionInfo, yours: Option<&str>) -> Vec<ReactionCount> {
+    let mine = yours.or(info.your_reaction.as_deref()).unwrap_or("");
+    info.counters
+        .iter()
+        .flatten()
+        .filter(|c| c.count > 0 && !c.reaction.is_empty())
+        .map(|c| ReactionCount {
+            mine: c.reaction == mine,
+            emoji: c.reaction.clone(),
+            count: c.count,
+        })
+        .collect()
 }
 
 impl MessageRow {
@@ -558,7 +617,11 @@ async fn demo_flow(
             UiCommand::FetchImage(_)
             | UiCommand::DownloadFile { .. }
             | UiCommand::SendFile { .. }
-            | UiCommand::LinkInfo(_) => {}
+            | UiCommand::LinkInfo(_)
+            | UiCommand::React { .. }
+            | UiCommand::CancelReaction { .. }
+            | UiCommand::ReactionDetails { .. }
+            | UiCommand::FetchLottie(_) => {}
         }
     }
     let t = now_ms();
@@ -755,6 +818,24 @@ async fn demo_flow(
                         image: Some("demo://avatar/2".into()),
                         sensitive: false,
                     }),
+                });
+            }
+            UiCommand::React { .. } | UiCommand::CancelReaction { .. } => {}
+            UiCommand::ReactionDetails { message_id, .. } => {
+                let _ = ui.send(UiEvent::ReactionPeople {
+                    message_id,
+                    people: vec![
+                        ("Анна Смирнова".into(), "👍".into()),
+                        ("Вы".into(), "👍".into()),
+                    ],
+                });
+            }
+            UiCommand::FetchLottie(url) => {
+                let bytes =
+                    (url == "demo://lottie/pulse").then(|| bytes::Bytes::from(max_lottie::PULSE));
+                let _ = ui.send(match bytes {
+                    Some(bytes) => UiEvent::Lottie { url, bytes },
+                    None => UiEvent::LottieFailed { url },
                 });
             }
             UiCommand::DownloadFile { name, .. } => {
@@ -981,6 +1062,32 @@ fn demo_history(chat_id: i64, now: i64) -> Vec<MessageRow> {
                     sender: "Вы".into(),
                     text: "Привет, да. Во сколько удобно?".into(),
                 });
+            }
+            if i == 1 {
+                row.reactions = vec![
+                    ReactionCount {
+                        emoji: "👍".into(),
+                        count: 2,
+                        mine: true,
+                    },
+                    ReactionCount {
+                        emoji: "❤️".into(),
+                        count: 1,
+                        mine: false,
+                    },
+                ];
+            }
+            if i == 6 {
+                let start = row.text.find('👋').unwrap_or(row.text.len());
+                let end = (start + '👋'.len_utf8()).min(row.text.len());
+                if end > start {
+                    row.marks.push(rich::Mark {
+                        range: start..end,
+                        kind: rich::MarkKind::Animoji {
+                            url: "demo://lottie/pulse".into(),
+                        },
+                    });
+                }
             }
             if i == 5 {
                 row.forwarded = Some("Пригородные поезда".into());
@@ -1221,6 +1328,19 @@ async fn run_logged_in(
                         });
                     }
                     UiCommand::OpenChat(chat_id) => {
+                        let (handle_r, ui_r) = (handle.clone(), ui.clone());
+                        tokio::spawn(async move {
+                            let emojis = async {
+                                let t = handle_r.transport()?;
+                                messages::chat_reaction_emoji(&t, chat_id).await
+                            }
+                            .await;
+                            if let Ok(emojis) = emojis
+                                && !emojis.is_empty()
+                            {
+                                let _ = ui_r.send(UiEvent::ReactionChoices { chat_id, emojis });
+                            }
+                        });
                         tokio::spawn(async move {
                             let result = async {
                                 let t = handle.transport()?;
@@ -1266,6 +1386,121 @@ async fn run_logged_in(
                                     crate::trace::note(&format!("read mark failed: {e}"));
                                 }
                             }
+                        });
+                    }
+                    UiCommand::React {
+                        chat_id,
+                        message_id,
+                        emoji,
+                    } => {
+                        tokio::spawn(async move {
+                            let sent = async {
+                                let t = handle.transport()?;
+                                messages::react(&t, chat_id, message_id, &emoji).await
+                            }
+                            .await;
+                            let _ = ui.send(match sent {
+                                Ok(info) => UiEvent::Reactions {
+                                    chat_id,
+                                    message_id,
+                                    info,
+                                    known_yours: true,
+                                },
+                                Err(e) => {
+                                    crate::trace::note(&format!("react failed: {e}"));
+                                    UiEvent::Notice(format!(
+                                        "Не удалось поставить реакцию: {}",
+                                        message(&e)
+                                    ))
+                                }
+                            });
+                        });
+                    }
+                    UiCommand::CancelReaction {
+                        chat_id,
+                        message_id,
+                    } => {
+                        tokio::spawn(async move {
+                            let sent = async {
+                                let t = handle.transport()?;
+                                messages::cancel_reaction(&t, chat_id, message_id).await
+                            }
+                            .await;
+                            let _ = ui.send(match sent {
+                                Ok(info) => UiEvent::Reactions {
+                                    chat_id,
+                                    message_id,
+                                    info,
+                                    known_yours: true,
+                                },
+                                Err(e) => {
+                                    crate::trace::note(&format!("cancel reaction failed: {e}"));
+                                    UiEvent::Notice(format!(
+                                        "Не удалось убрать реакцию: {}",
+                                        message(&e)
+                                    ))
+                                }
+                            });
+                        });
+                    }
+                    UiCommand::ReactionDetails {
+                        chat_id,
+                        message_id,
+                    } => {
+                        tokio::spawn(async move {
+                            let sent = async {
+                                let t = handle.transport()?;
+                                let (info, entries) =
+                                    messages::detailed_reactions(&t, chat_id, message_id).await?;
+                                let ids: Vec<i64> = entries.iter().filter_map(|e| e.user_id).collect();
+                                resolve_names(&t, &names, ids).await;
+                                Ok::<_, CoreError>((info, entries))
+                            }
+                            .await;
+                            let _ = ui.send(match sent {
+                                Ok((info, entries)) => {
+                                    let names = names.read().unwrap_or_else(PoisonError::into_inner);
+                                    let _ = ui.send(UiEvent::Reactions {
+                                        chat_id,
+                                        message_id,
+                                        info,
+                                        known_yours: true,
+                                    });
+                                    let people = entries
+                                        .into_iter()
+                                        .filter_map(|e| {
+                                            let emoji = e.reaction.filter(|s| !s.is_empty())?;
+                                            let who = e.user_id.map_or_else(
+                                                || "Кто-то".to_string(),
+                                                |id| names.name(Some(id)),
+                                            );
+                                            Some((who, emoji))
+                                        })
+                                        .collect();
+                                    UiEvent::ReactionPeople {
+                                        message_id,
+                                        people,
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::trace::note(&format!("reaction details failed: {e}"));
+                                    UiEvent::Notice(format!(
+                                        "Не удалось показать, кто поставил реакцию: {}",
+                                        message(&e)
+                                    ))
+                                }
+                            });
+                        });
+                    }
+                    UiCommand::FetchLottie(url) => {
+                        tokio::spawn(async move {
+                            let _ = ui.send(match http.download(&url, media::MAX_DOWNLOAD).await {
+                                Ok(bytes) => UiEvent::Lottie { url, bytes },
+                                Err(e) => {
+                                    crate::trace::note(&format!("lottie {url} failed: {e}"));
+                                    UiEvent::LottieFailed { url }
+                                }
+                            });
                         });
                     }
                     UiCommand::LinkInfo(link) => {
@@ -1616,6 +1851,17 @@ impl Names {
             },
             E::Mark { chat_id, mark, .. } => UiEvent::PeerRead { chat_id, mark },
             E::Chat(chat) => UiEvent::ChatChanged(self.chat_row(&chat)),
+            E::Reactions {
+                chat_id,
+                message_id,
+                info,
+                known_yours,
+            } => UiEvent::Reactions {
+                chat_id,
+                message_id,
+                info,
+                known_yours,
+            },
         })
     }
 
@@ -1676,6 +1922,11 @@ impl Names {
                 sender: self.name(l.message.sender),
                 text: one_line(&message_text(&l.message)),
             }),
+            reactions: m
+                .reaction_info
+                .as_ref()
+                .map(|info| reaction_counts(info, None))
+                .unwrap_or_default(),
             forwarded: forward.map(|l| {
                 l.chat_name
                     .clone()
@@ -1860,7 +2111,13 @@ pub fn marked_text(m: &messages::Message) -> (String, Vec<rich::Mark>) {
         kind: e.type_.as_str(),
         from: e.from.map_or(0, i64::from),
         length: e.length.map_or(0, i64::from),
-        url: e.attributes.as_ref().and_then(|a| a.url.as_deref()),
+        url: e.attributes.as_ref().and_then(|a| {
+            if e.type_ == "ANIMOJI" {
+                a.animoji_lottie_url.as_deref()
+            } else {
+                a.url.as_deref()
+            }
+        }),
     });
     let marks = rich::shift(rich::from_elements(raw, elements), text.len() - raw.len());
     (text, marks)
@@ -2613,6 +2870,39 @@ mod tests {
                 if title == "Пост" && description == "длинный пост"
         ));
         assert!(link_card("https://max.ru/x", &LinkInfo::default()).is_none());
+    }
+
+    #[test]
+    fn reaction_chips_mark_ours() {
+        use max_proto::schema::types::{MessageReactionCounter, MessageReactionInfo};
+        let info = MessageReactionInfo {
+            counters: Some(vec![
+                MessageReactionCounter {
+                    reaction: "👍".into(),
+                    count: 2,
+                },
+                MessageReactionCounter {
+                    reaction: "🔥".into(),
+                    count: 0,
+                },
+            ]),
+            your_reaction: Some("👍".into()),
+            total_count: Some(2),
+        };
+        let chips = reaction_counts(&info, None);
+        assert_eq!(chips.len(), 1);
+        assert!(chips[0].mine);
+        let kept = reaction_counts(
+            &MessageReactionInfo {
+                your_reaction: None,
+                ..info
+            },
+            Some("👍"),
+        );
+        assert!(
+            kept[0].mine,
+            "a counters push keeps the emoji we already had"
+        );
     }
 
     #[test]

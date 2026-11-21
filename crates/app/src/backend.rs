@@ -290,8 +290,67 @@ pub struct ChatTitle {
     pub avatar: Option<String>,
 }
 
+/// What kind of chat a row is (`Chat.type`: `DIALOG`, `CHAT`, `CHANNEL` in `core.dll`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatKind {
+    /// A dialog with one person.
+    #[default]
+    Dialog,
+    /// Saved messages: a dialog with ourselves.
+    Saved,
+    /// A group chat.
+    Group,
+    /// A channel.
+    Channel,
+}
+
+/// "1 234 567": thousands split by a narrow no-break space, as Russian text writes them.
+pub fn group_digits(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push('\u{202F}');
+        }
+        out.push(c);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}
+
+/// The Russian noun form for `n`: `one` (1, 21), `few` (2–4, 22–24) or `many` (the rest,
+/// 11–14).
+pub fn plural<'a>(n: i64, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
+    let n = n.unsigned_abs();
+    match (n % 10, n % 100) {
+        (_, 11..=14) => many,
+        (1, _) => one,
+        (2..=4, _) => few,
+        _ => many,
+    }
+}
+
+impl ChatRow {
+    /// The line under the chat title: subscribers of a channel, members of a group.
+    pub fn members_line(&self) -> Option<String> {
+        let n = self.members?;
+        Some(match self.kind {
+            ChatKind::Channel => format!(
+                "{} {}",
+                group_digits(n),
+                plural(n, "подписчик", "подписчика", "подписчиков")
+            ),
+            ChatKind::Group => format!(
+                "{} {}",
+                group_digits(n),
+                plural(n, "участник", "участника", "участников")
+            ),
+            ChatKind::Dialog | ChatKind::Saved => return None,
+        })
+    }
+}
+
 /// One row of the chat list.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChatRow {
     /// Chat id.
     pub id: i64,
@@ -307,6 +366,14 @@ pub struct ChatRow {
     pub peer_mark: i64,
     /// Chat icon, or the other person's photo for a dialog.
     pub avatar: Option<String>,
+    /// Dialog, saved messages, group or channel.
+    pub kind: ChatKind,
+    /// Members of a group, subscribers of a channel (`participantsCount`), when known.
+    pub members: Option<i64>,
+    /// The chat's description (empty if none).
+    pub description: String,
+    /// The chat's public link (empty if none).
+    pub link: String,
 }
 
 /// Handles to a running backend.
@@ -489,6 +556,27 @@ async fn demo_flow(
             peer_mark: t - 3 * 60_000,
             // Drawn locally: the first two chats show a photo, the rest initials.
             avatar: (i < 2).then(|| format!("demo://avatar/{i}")),
+            kind: match i {
+                1 => ChatKind::Group,
+                2 => ChatKind::Saved,
+                3 => ChatKind::Channel,
+                _ => ChatKind::Dialog,
+            },
+            members: match i {
+                1 => Some(5),
+                3 => Some(12_345),
+                _ => None,
+            },
+            description: match i {
+                1 => "Сборки, задачи и созвоны по проекту".into(),
+                3 => "Новости, объявления и отключения в нашем районе".into(),
+                _ => String::new(),
+            },
+            link: if i == 3 {
+                "https://max.ru/demo_rayon".into()
+            } else {
+                String::new()
+            },
         })
         .collect();
     let _ = ui.send(UiEvent::LoggedIn {
@@ -1819,6 +1907,24 @@ fn chat_row_with(
         .as_ref()
         .map(|m| one_line(&message_text(m)))
         .unwrap_or_default();
+    let kind = match chat.type_.as_str() {
+        "CHANNEL" => ChatKind::Channel,
+        "CHAT" => ChatKind::Group,
+        _ if other == me_id => ChatKind::Saved,
+        "DIALOG" => ChatKind::Dialog,
+        // An unknown type: a title means a group, none a dialog.
+        _ if chat.title.as_deref().is_some_and(|t| !t.is_empty()) => ChatKind::Group,
+        _ => ChatKind::Dialog,
+    };
+    let members = match kind {
+        // A channel's `participants` lists only some members: trust the count alone.
+        ChatKind::Channel => chat.participants_count,
+        ChatKind::Group => chat.participants_count.or_else(|| {
+            let n = i64::try_from(chat.participants.len()).unwrap_or(0);
+            (n > 0).then_some(n)
+        }),
+        ChatKind::Dialog | ChatKind::Saved => None,
+    };
     ChatRow {
         id: chat.id,
         title,
@@ -1827,6 +1933,10 @@ fn chat_row_with(
         time: chat.last_event_time,
         peer_mark: peer_mark(chat, me_id),
         avatar,
+        kind,
+        members,
+        description: chat.description.clone().unwrap_or_default(),
+        link: chat.link.clone().unwrap_or_default(),
     }
 }
 
@@ -1901,6 +2011,70 @@ mod tests {
         let titles: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(titles, ["Группа", "Анна", "Избранное"]);
         assert_eq!((rows[1].preview.as_str(), rows[1].unread), ("привет", 3));
+    }
+
+    #[test]
+    fn russian_plurals_and_digit_groups() {
+        let forms = |n| plural(n, "участник", "участника", "участников");
+        let got: Vec<&str> = [1, 2, 4, 5, 11, 12, 14, 21, 22, 25, 101, 111]
+            .into_iter()
+            .map(forms)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "участник",
+                "участника",
+                "участника",
+                "участников",
+                "участников",
+                "участников",
+                "участников",
+                "участник",
+                "участника",
+                "участников",
+                "участник",
+                "участников"
+            ]
+        );
+        assert_eq!(group_digits(7), "7");
+        assert_eq!(group_digits(12_345), "12\u{202F}345");
+        assert_eq!(group_digits(1_234_567), "1\u{202F}234\u{202F}567");
+    }
+
+    #[test]
+    fn chat_kinds_and_member_counts() {
+        let names = Names::from_login(&login_with(vec![]));
+        let row = |type_: &str, title: Option<&str>, count: Option<i64>, members: &[i64]| {
+            names.chat_row(&Chat {
+                id: 1,
+                type_: type_.into(),
+                title: title.map(Into::into),
+                participants_count: count,
+                participants: members.iter().map(|id| (*id, 0)).collect(),
+                ..Chat::default()
+            })
+        };
+        let channel = row("CHANNEL", Some("РБК"), Some(1_200_000), &[1]);
+        assert_eq!(channel.kind, ChatKind::Channel);
+        assert_eq!(
+            channel.members_line().as_deref(),
+            Some("1\u{202F}200\u{202F}000 подписчиков")
+        );
+        let no_count = row("CHANNEL", Some("Канал"), None, &[1, 2]);
+        assert_eq!(
+            no_count.members_line(),
+            None,
+            "a channel's member map is partial"
+        );
+        let group = row("CHAT", Some("Семья"), None, &[1, 2, 3]);
+        assert_eq!(group.members_line().as_deref(), Some("3 участника"));
+        let dialog = row("DIALOG", None, None, &[1, 2]);
+        assert_eq!(
+            (dialog.kind, dialog.members_line()),
+            (ChatKind::Dialog, None)
+        );
+        assert_eq!(row("DIALOG", None, None, &[1]).kind, ChatKind::Saved);
     }
 
     #[test]

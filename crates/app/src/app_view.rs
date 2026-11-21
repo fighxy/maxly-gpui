@@ -14,7 +14,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use max_core::media::Attachment;
 
 use crate::backend::{
-    ChatRow, ContactRow, Delivery, MessageRow, Quote, SessionRow, UiCommand, UiEvent, one_line,
+    ChatKind, ChatRow, ContactRow, Delivery, MessageRow, Quote, SessionRow, UiCommand, UiEvent,
+    one_line,
 };
 use crate::qr;
 use crate::settings::{FONT_SIZES, ThemeChoice, UiSettings};
@@ -353,6 +354,8 @@ pub struct AppView {
     contacts: Vec<ContactRow>,
     /// The contact whose card is shown.
     contact_selected: Option<i64>,
+    /// The profile panel is shown beside the open chat.
+    profile_open: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -420,6 +423,7 @@ impl AppView {
             ui,
             contacts: Vec::new(),
             contact_selected: None,
+            profile_open: false,
             _subscriptions: subscriptions,
         }
     }
@@ -516,6 +520,7 @@ impl AppView {
                 self.settings_page = SettingsPage::Account;
                 self.contacts.clear();
                 self.contact_selected = None;
+                self.profile_open = false;
                 self.compose = None;
                 self.histories.clear();
                 self.images.clear();
@@ -1863,17 +1868,7 @@ impl AppView {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(
-                v_flex()
-                    .px_4()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(div().font_semibold().child(chat.title.clone()))
-                    .when_some(self.typing_label(chat), |this, label| {
-                        this.child(div().text_xs().text_color(cx.theme().primary).child(label))
-                    }),
-            )
+            .child(self.chat_header(chat, cx))
             .child(
                 v_flex()
                     .id("history")
@@ -1953,6 +1948,142 @@ impl AppView {
                                     })),
                             ),
                     ),
+            )
+    }
+
+    /// The bar above the history: photo, title, and typing, subscribers or members under it.
+    /// A click opens or closes the profile panel.
+    fn chat_header(&self, chat: &ChatRow, cx: &mut Context<Self>) -> Stateful<Div> {
+        let (subtitle, highlight) = match self.typing_label(chat) {
+            Some(typing) => (Some(typing), true),
+            None => (chat.members_line(), false),
+        };
+        h_flex()
+            .id("chat-header")
+            .gap_3()
+            .px_4()
+            .py_2()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .cursor_pointer()
+            .hover(|this| this.bg(cx.theme().secondary_hover))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.profile_open = !this.profile_open;
+                cx.notify();
+            }))
+            .child(self.avatar(&chat.title, chat.avatar.as_ref(), 40., cx))
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .child(div().font_semibold().truncate().child(chat.title.clone()))
+                    .when_some(subtitle, |this, line| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(if highlight {
+                                    cx.theme().primary
+                                } else {
+                                    cx.theme().muted_foreground
+                                })
+                                .child(line),
+                        )
+                    }),
+            )
+    }
+
+    /// The chat's profile beside the history: photo, title, members, description, link.
+    fn render_profile(&self, chat: &ChatRow, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let kind = match chat.kind {
+            ChatKind::Dialog => "Личный чат",
+            ChatKind::Saved => "Избранное: заметки для себя",
+            ChatKind::Group => "Группа",
+            ChatKind::Channel => "Канал",
+        };
+        let subtitle = chat.members_line().unwrap_or_else(|| kind.to_string());
+        let link = chat.link.clone();
+        v_flex()
+            .w(px(320.))
+            .h_full()
+            .flex_shrink_0()
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().sidebar)
+            .child(
+                h_flex()
+                    .px_4()
+                    .py_3()
+                    .justify_between()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(div().font_semibold().child("Информация"))
+                    .child(
+                        Button::new("profile-close")
+                            .ghost()
+                            .small()
+                            .label("✕")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.profile_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("profile")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_4()
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.avatar(&chat.title, chat.avatar.as_ref(), 96., cx))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_semibold()
+                                    .text_center()
+                                    .child(chat.title.clone()),
+                            )
+                            .child(div().text_sm().text_color(muted).child(subtitle)),
+                    )
+                    .when(!chat.description.is_empty(), |this| {
+                        this.child(Self::info_row("Описание", chat.description.clone(), cx))
+                    })
+                    .when(!link.is_empty(), |this| {
+                        this.child(
+                            v_flex()
+                                .gap_1()
+                                .child(Self::info_row("Ссылка", link.clone(), cx))
+                                .child(
+                                    h_flex().child(
+                                        Button::new("profile-copy-link")
+                                            .outline()
+                                            .small()
+                                            .label("Копировать ссылку")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    link.clone(),
+                                                ));
+                                                if let Screen::Main { status, .. } =
+                                                    &mut this.screen
+                                                {
+                                                    *status = Some("Ссылка скопирована".into());
+                                                }
+                                                cx.notify();
+                                            })),
+                                    ),
+                                ),
+                        )
+                    })
+                    .when(chat.members.is_some(), |this| {
+                        this.child(Self::info_row("Тип", kind.to_string(), cx))
+                    }),
             )
     }
 
@@ -2080,6 +2211,12 @@ impl AppView {
             .child(list);
         let content = match self.section {
             Section::Chats => match selected.and_then(|id| chats.iter().find(|c| c.id == id)) {
+                Some(chat) if self.profile_open => h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(self.render_chat(chat, cx))
+                    .child(self.render_profile(chat, cx)),
                 Some(chat) => self.render_chat(chat, cx),
                 None => Self::placeholder("Выберите чат", None, cx),
             },
@@ -2866,7 +3003,7 @@ mod chat_list_tests {
             unread: 0,
             time,
             peer_mark: 0,
-            avatar: None,
+            ..ChatRow::default()
         }
     }
 

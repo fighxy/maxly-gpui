@@ -126,7 +126,7 @@ Release (ADR-006): **v1** messaging core, **v2** full chat features,
 | F4 | Invite links: list, create, delete; join by link | O 221-223, 56, 57; Q `SidebarInviteByLinkPage` | v2 | open |
 | F5 | Join requests | Q `JoinRequestsPage`, `PinnedChannelJoinRequest` | v2 | open |
 | F6 | Leave, delete, clear chat | O 52, 58 | v1 | open |
-| F7 | Chat/channel info and settings sidebar | O 48, 55; Q `Sidebar*` | v1 (view), v2 (edit) | open |
+| F7 | Chat/channel info and settings sidebar | O 48, 55; Q `Sidebar*` | v1 (view), v2 (edit) | view started: the chat header shows the photo and, under the title, subscribers of a channel or members of a group (`participantsCount`; a group falls back to its `participants`; types DIALOG, CHAT, CHANNEL from `core.dll`); a click opens a panel with photo, title, count, description and link (copy); members list, admins and editing open |
 | F8 | Reactions settings per chat | O 257, 258; Q `ReactionsSettings*` | v2 | open |
 | F9 | Chat themes | Q `ChatThemeButton`; S `chat_theme` | v3 | open |
 | F10 | Common chats | O 198; Q `CommonChatsPage` | v2 | open |

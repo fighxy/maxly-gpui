@@ -72,12 +72,19 @@ fn main() {
                 "maxly-gpui"
             }
             .into();
+            // GPUI otherwise holds an inactive window and Low Power Mode at about 30 fps,
+            // and a hot machine at about 60. 120 Hz is one frame every 8.3 ms; a slower
+            // display still waits for its own vsync, so this does not draw faster than the screen.
+            let frame = std::time::Duration::from_micros(8_333);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1100.), px(720.)), cx)),
                 titlebar: Some(TitlebarOptions {
                     title: Some(title.clone()),
                     ..Default::default()
                 }),
+                inactive_frame_interval: Some(frame),
+                low_power_frame_interval: Some(frame),
+                thermal_frame_interval: Some(frame),
                 ..Default::default()
             };
             let opened = gpui_kit::open_window(options, cx, move |window, cx| {

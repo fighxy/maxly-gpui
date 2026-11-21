@@ -9,6 +9,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, *};
@@ -59,6 +60,15 @@ enum Screen {
     },
     Error(String),
 }
+
+/// Extra message rows laid out above and below the viewport, so a fast scroll
+/// does not paint empty space while the next rows are measured.
+/// Kept to a few rows: a 120 Hz frame has about 8 ms.
+const HISTORY_OVERDRAW: f32 = 240.;
+
+/// How far one frame of a mouse-wheel glide may move, in pixels.
+/// The list applies a whole notch at once; the rest is spread over later frames.
+const WHEEL_FRAME_PX: f32 = 16.;
 
 /// How long "typing" stays shown after the last typing event.
 const TYPING_SHOWN: std::time::Duration = std::time::Duration::from_secs(6);
@@ -189,6 +199,17 @@ enum Compose {
     Edit { message_id: i64, original: String },
 }
 
+/// What [`History::add`] did with a message. The open transcript uses it to
+/// insert or remeasure one virtual row instead of rebuilding the list.
+enum Stored {
+    /// A new row at the end.
+    Pushed,
+    /// An existing row was replaced.
+    Updated(usize),
+    /// The message was already shown.
+    Skipped,
+}
+
 /// The messages of one chat as far as they are loaded.
 #[derive(Default)]
 struct History {
@@ -205,13 +226,16 @@ struct History {
 
 impl History {
     /// Put an older page in front, skipping messages already shown.
-    fn prepend(&mut self, older: Vec<MessageRow>) {
+    /// Returns how many rows were inserted.
+    fn prepend(&mut self, older: Vec<MessageRow>) -> usize {
         let mut fresh: Vec<MessageRow> = older
             .into_iter()
             .filter(|m| m.id == 0 || !self.messages.iter().any(|k| k.id == m.id))
             .collect();
+        let added = fresh.len();
         fresh.append(&mut self.messages);
         self.messages = fresh;
+        added
     }
 
     /// The newest incoming message, if it is newer than the last read mark. Our own messages
@@ -228,23 +252,24 @@ impl History {
 
     /// Add a message, or replace our pending copy with the same `cid`; skip known ids. A
     /// confirmed reply keeps the pending copy's quote if the server's copy has none.
-    fn add(&mut self, mut message: MessageRow) {
+    fn add(&mut self, mut message: MessageRow) -> Stored {
         if let Some(cid) = message.cid
-            && let Some(pending) = self
+            && let Some(ix) = self
                 .messages
-                .iter_mut()
-                .find(|m| m.out && m.cid == Some(cid))
+                .iter()
+                .position(|m| m.out && m.cid == Some(cid))
         {
             if message.reply.is_none() {
-                message.reply = pending.reply.take();
+                message.reply = self.messages[ix].reply.take();
             }
-            *pending = message;
-            return;
+            self.messages[ix] = message;
+            return Stored::Updated(ix);
         }
         if message.id != 0 && self.messages.iter().any(|m| m.id == message.id) {
-            return;
+            return Stored::Skipped;
         }
         self.messages.push(message);
+        Stored::Pushed
     }
 
     /// Put an edited copy in place of a known message. What the copy leaves out (time, quote,
@@ -420,7 +445,31 @@ pub struct AppView {
     code: Entity<InputState>,
     password: Entity<InputState>,
     composer: Entity<InputState>,
-    scroll: ScrollHandle,
+    /// Virtual transcript of the open chat. Only the rows on screen are built.
+    history_list: ListState,
+    /// Chat the transcript belongs to. `None` until a chat is open.
+    history_for: Option<i64>,
+    /// Pixels of a mouse-wheel notch still waiting to be applied to the transcript.
+    history_glide: f32,
+    /// Same, for the chat list.
+    chats_glide: f32,
+    /// Scroll offset, in pixels, at the start of this frame. A notch is measured from here,
+    /// because the list reapplies the whole wheel from that point on every event.
+    history_origin: f32,
+    /// Written again after the chat list resets its rows during render.
+    chats_origin: Cell<f32>,
+    /// Glide still queued at the start of the frame, before this frame's notches.
+    history_glide_base: f32,
+    chats_glide_base: Cell<f32>,
+    /// A frame callback is already scheduled to spend the glide.
+    glide_on: bool,
+    /// Virtual chat list. Rows differ in height (a pin line, an unread badge).
+    chats_list: ListState,
+    /// What the chat list was last measured for, so a new message does not
+    /// rebuild every row's height.
+    chats_stamp: Cell<u64>,
+    /// Scroll position of the contact list.
+    contacts_scroll: UniformListScrollHandle,
     commands: UnboundedSender<UiCommand>,
     /// Shown instead of a chat while open.
     account: Option<AccountPanel>,
@@ -481,6 +530,24 @@ impl AppView {
                 .placeholder("Пароль")
         });
         let composer = cx.new(|cx| InputState::new(window, cx).placeholder("Сообщение"));
+        let history_list = ListState::new(0, ListAlignment::Top, px(HISTORY_OVERDRAW));
+        history_list.set_follow_mode(FollowMode::Tail);
+        // Loading the previous page has to wait until this scroll borrow ends.
+        let older = cx.entity().downgrade();
+        history_list.set_scroll_handler(move |ev, _, cx| {
+            if ev.visible_range.start != 0 {
+                return;
+            }
+            let older = older.clone();
+            cx.defer(move |cx| {
+                let _ = older.update(cx, |this, cx| {
+                    let Some(chat_id) = this.history_for else {
+                        return;
+                    };
+                    this.load_older(chat_id, cx);
+                });
+            });
+        });
         let subscriptions = vec![
             cx.subscribe_in(
                 &composer,
@@ -568,7 +635,18 @@ impl AppView {
             code,
             password,
             composer,
-            scroll: ScrollHandle::new(),
+            history_list,
+            history_for: None,
+            history_glide: 0.,
+            chats_glide: 0.,
+            history_origin: 0.,
+            chats_origin: Cell::new(0.),
+            history_glide_base: 0.,
+            chats_glide_base: Cell::new(0.),
+            glide_on: false,
+            chats_list: ListState::new(0, ListAlignment::Top, px(400.)),
+            chats_stamp: Cell::new(0),
+            contacts_scroll: UniformListScrollHandle::new(),
             images: HashMap::new(),
             link_cards: HashMap::new(),
             shown_sensitive: HashSet::new(),
@@ -638,7 +716,7 @@ impl AppView {
                         row.unread = 0;
                     }
                 }
-                self.scroll.scroll_to_bottom();
+                self.stick_history(chat_id);
                 self.mark_read(chat_id);
             }
             UiEvent::Older {
@@ -650,9 +728,17 @@ impl AppView {
                 let links: Vec<String> = messages.iter().flat_map(uncovered_max_links).collect();
                 let lotties: Vec<String> = messages.iter().flat_map(lottie_urls).collect();
                 let h = self.histories.entry(chat_id).or_default();
-                h.prepend(messages);
+                let added = h.prepend(messages);
                 h.has_more = has_more;
                 h.loading_older = false;
+                if self.history_for == Some(chat_id) && added > 0 {
+                    // Keep the row the reader was looking at; the old first row
+                    // may lose its day header now that older messages sit above it.
+                    self.history_list.splice(0..0, added);
+                    if added < self.history_list.item_count() {
+                        self.history_list.remeasure_items(added..added + 1);
+                    }
+                }
                 self.request_images(urls);
                 self.request_link_previews(links);
                 self.request_lotties(lotties);
@@ -682,10 +768,12 @@ impl AppView {
                     }
                     None => ImageState::Failed,
                 };
-                self.images.insert(url, state);
+                self.images.insert(url.clone(), state);
+                self.remeasure_open_image(&url);
             }
             UiEvent::ImageFailed { url } => {
-                self.images.insert(url, ImageState::Failed);
+                self.images.insert(url.clone(), ImageState::Failed);
+                self.remeasure_open_image(&url);
             }
             UiEvent::LinkCard { url, card } => {
                 if let Some(Attachment::Share {
@@ -697,6 +785,7 @@ impl AppView {
                     self.request_images(vec![image.clone()]);
                 }
                 self.link_cards.insert(url, card);
+                self.remeasure_open_history();
             }
             UiEvent::Reactions {
                 chat_id,
@@ -764,6 +853,8 @@ impl AppView {
                 self.profile_open = false;
                 self.compose = None;
                 self.histories.clear();
+                self.history_for = None;
+                self.history_list.reset(0);
                 self.images.clear();
                 self.link_cards.clear();
                 self.shown_sensitive.clear();
@@ -781,15 +872,15 @@ impl AppView {
                 let lotties = lottie_urls(&message);
                 self.request_link_previews(links);
                 self.request_lotties(lotties);
+                let message_id = message.id;
                 if let Some(h) = self.histories.get_mut(&chat_id) {
                     h.edit(message);
                 }
+                self.remeasure_id(chat_id, message_id);
                 self.refresh_preview(chat_id);
             }
             UiEvent::MessagesDeleted { chat_id, ids } => {
-                if let Some(h) = self.histories.get_mut(&chat_id) {
-                    h.messages.retain(|m| m.id == 0 || !ids.contains(&m.id));
-                }
+                self.drop_messages(chat_id, |m| m.id == 0 || !ids.contains(&m.id));
                 let gone = |id: i64| ids.contains(&id);
                 if let Some(Compose::Reply { quote }) = &self.compose
                     && gone(quote.id)
@@ -799,10 +890,7 @@ impl AppView {
                 self.refresh_preview(chat_id);
             }
             UiEvent::MessagesDeletedRange { chat_id, from, to } => {
-                if let Some(h) = self.histories.get_mut(&chat_id) {
-                    h.messages
-                        .retain(|m| m.id == 0 || m.time < from || m.time > to);
-                }
+                self.drop_messages(chat_id, |m| m.id == 0 || m.time < from || m.time > to);
                 self.refresh_preview(chat_id);
             }
             UiEvent::Typing { chat_id, who } => {
@@ -909,13 +997,14 @@ impl AppView {
                 cid,
                 error,
             } => {
-                if let Some(m) = self
-                    .histories
-                    .get_mut(&chat_id)
-                    .and_then(|h| h.messages.iter_mut().find(|m| m.cid == Some(cid)))
+                if let Some(h) = self.histories.get_mut(&chat_id)
+                    && let Some(ix) = h.messages.iter().position(|m| m.cid == Some(cid))
                 {
-                    m.delivery = Delivery::Failed;
-                    m.sender = error;
+                    h.messages[ix].delivery = Delivery::Failed;
+                    h.messages[ix].sender = error;
+                    if self.history_for == Some(chat_id) {
+                        self.history_list.remeasure_items(ix..ix + 1);
+                    }
                 }
             }
             other => self.apply_screen(other),
@@ -943,10 +1032,119 @@ impl AppView {
             place_row(chats, row);
         }
         if let Some(h) = self.histories.get_mut(&chat_id) {
-            h.add(message);
+            let own = message.out;
+            let stored = h.add(message);
             if open {
-                self.scroll.scroll_to_bottom();
+                self.note_history_change(chat_id, stored, own);
             }
+        }
+    }
+
+    /// Replace the open transcript and pin it to the newest row.
+    fn stick_history(&mut self, chat_id: i64) {
+        let open = self.history_for == Some(chat_id)
+            || matches!(
+                (&self.section, &self.screen),
+                (Section::Chats, Screen::Main { selected: Some(id), .. }) if *id == chat_id
+            );
+        if !open {
+            return;
+        }
+        let count = self
+            .histories
+            .get(&chat_id)
+            .map(|h| h.messages.len())
+            .unwrap_or(0);
+        self.history_list.reset(count);
+        self.history_list.set_follow_mode(FollowMode::Tail);
+        self.history_for = Some(chat_id);
+    }
+
+    /// Keep the virtual transcript in step with one added or replaced message.
+    /// Our own message, and a chat we are already reading at the bottom, stay at the tail.
+    fn note_history_change(&mut self, chat_id: i64, stored: Stored, own: bool) {
+        if self.history_for != Some(chat_id) {
+            self.stick_history(chat_id);
+            return;
+        }
+        let now = self
+            .histories
+            .get(&chat_id)
+            .map(|h| h.messages.len())
+            .unwrap_or(0);
+        let list_count = self.history_list.item_count();
+        match stored {
+            Stored::Pushed if list_count + 1 == now => {
+                self.history_list.splice(list_count..list_count, 1);
+            }
+            Stored::Updated(ix) if ix < list_count => {
+                self.history_list.remeasure_items(ix..ix + 1);
+            }
+            _ => self.history_list.reset(now),
+        }
+        if own || self.history_list.is_following_tail() {
+            self.history_list.set_follow_mode(FollowMode::Tail);
+        }
+    }
+
+    /// Drop rows `keep` rejects, and the same indexes from the open transcript.
+    fn drop_messages(&mut self, chat_id: i64, keep: impl Fn(&MessageRow) -> bool) {
+        let Some(h) = self.histories.get_mut(&chat_id) else {
+            return;
+        };
+        let removed: Vec<usize> = h
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, m)| (!keep(m)).then_some(ix))
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        h.messages.retain(|m| keep(m));
+        if self.history_for == Some(chat_id) {
+            for ix in removed.into_iter().rev() {
+                self.history_list.splice(ix..ix + 1, 0);
+            }
+        }
+    }
+
+    fn remeasure_id(&self, chat_id: i64, message_id: i64) {
+        if self.history_for != Some(chat_id) {
+            return;
+        }
+        let Some(ix) = self
+            .histories
+            .get(&chat_id)
+            .and_then(|h| h.messages.iter().position(|m| m.id == message_id))
+        else {
+            return;
+        };
+        self.history_list.remeasure_items(ix..ix + 1);
+    }
+
+    /// A loaded photo changes the height of the bubble that shows it.
+    fn remeasure_open_image(&self, url: &str) {
+        let Some(chat_id) = self.history_for else {
+            return;
+        };
+        let Some(history) = self.histories.get(&chat_id) else {
+            return;
+        };
+        for (ix, message) in history.messages.iter().enumerate() {
+            let hit = image_urls(message).iter().any(|u| u == url)
+                || message.attachments.iter().any(
+                    |a| matches!(a, Attachment::Share { image: Some(image), .. } if image == url),
+                );
+            if hit {
+                self.history_list.remeasure_items(ix..ix + 1);
+            }
+        }
+    }
+
+    fn remeasure_open_history(&self) {
+        if self.history_for.is_some() {
+            self.history_list.remeasure();
         }
     }
 
@@ -1035,7 +1233,9 @@ impl AppView {
                             playing = true;
                         }
                     }
-                    if playing {
+                    // A frame that is not on screen does not need a new draw.
+                    // Scrolling stays on the list's own path instead of rebuilding the window.
+                    if playing && view.lottie_visible() {
                         cx.notify();
                     }
                     playing
@@ -1049,6 +1249,157 @@ impl AppView {
         .detach();
     }
 
+    /// Whether a playing emoji is actually on screen. The clock still advances hidden
+    /// frames, but it does not ask the window to draw them.
+    fn lottie_visible(&self) -> bool {
+        if !self.window_active || self.viewer.is_some() {
+            return false;
+        }
+        if self.emoji_open
+            && self.animoji.as_ref().is_some_and(|faces| {
+                faces
+                    .iter()
+                    .any(|face| self.lottie_playing(&face.lottie_url))
+            })
+        {
+            return true;
+        }
+        let Some(chat_id) = self.history_for else {
+            return false;
+        };
+        let Some(history) = self.histories.get(&chat_id) else {
+            return false;
+        };
+        let count = history.messages.len();
+        if count == 0 {
+            return false;
+        }
+        let top = self.history_list.logical_scroll_top().item_ix;
+        let start = if top >= count {
+            count.saturating_sub(16)
+        } else {
+            top.saturating_sub(2)
+        };
+        let end = (start + 24).min(count);
+        history.messages[start..end]
+            .iter()
+            .any(|m| lottie_urls(m).iter().any(|url| self.lottie_playing(url)))
+    }
+
+    fn lottie_playing(&self, url: &str) -> bool {
+        matches!(
+            self.lotties.get(url),
+            Some(LottieState::Ready(clip)) if clip.frames > 1
+        )
+    }
+
+    /// The list already jumped by the whole notch. Keep one frame of it and
+    /// play the rest on the following frames, one slice per refresh.
+    fn glide_history(&mut self, ev: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.glide_wheel(ev, true, window, cx);
+    }
+
+    fn glide_chats(&mut self, ev: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.glide_wheel(ev, false, window, cx);
+    }
+
+    fn glide_wheel(
+        &mut self,
+        ev: &ScrollEvent,
+        history: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A trackpad already sends a small delta on each frame.
+        if ev.delta.precise() {
+            return;
+        }
+        let list = if history {
+            self.history_list.clone()
+        } else {
+            self.chats_list.clone()
+        };
+        if list.item_count() == 0 {
+            return;
+        }
+        let origin = if history {
+            self.history_origin
+        } else {
+            self.chats_origin.get()
+        };
+        let base = if history {
+            self.history_glide_base
+        } else {
+            self.chats_glide_base.get()
+        };
+        // The list already moved. Measure that, and keep only one frame of it.
+        // A second notch in the same frame is measured from the same origin.
+        let moved = list_scroll_px(&list) - origin;
+        let extra = wheel_glide_extra(-moved, WHEEL_FRAME_PX);
+        if history {
+            self.history_glide = base + extra;
+        } else {
+            self.chats_glide = base + extra;
+        }
+        if extra == 0. {
+            return;
+        }
+        list.scroll_by(px(-extra));
+        self.kick_glide(window, cx);
+    }
+
+    fn step_glide(&mut self, history: bool) -> bool {
+        let remaining = if history {
+            self.history_glide
+        } else {
+            self.chats_glide
+        };
+        let step = glide_step(remaining);
+        if step == 0. {
+            if history {
+                self.history_glide = 0.;
+            } else {
+                self.chats_glide = 0.;
+            }
+            return false;
+        }
+        let list = if history {
+            self.history_list.clone()
+        } else {
+            self.chats_list.clone()
+        };
+        list.scroll_by(px(step));
+        let left = remaining - step;
+        let left = if left.abs() < 0.5 { 0. } else { left };
+        if history {
+            self.history_glide = left;
+        } else {
+            self.chats_glide = left;
+        }
+        true
+    }
+
+    fn kick_glide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.glide_on {
+            return;
+        }
+        self.glide_on = true;
+        cx.on_next_frame(window, |this, window, cx| this.pump_glide(window, cx));
+    }
+
+    /// Spend a slice of the queued wheel distance. One call is one displayed frame.
+    fn pump_glide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let moved = self.step_glide(true) || self.step_glide(false);
+        if self.history_glide != 0. || self.chats_glide != 0. {
+            cx.on_next_frame(window, |this, window, cx| this.pump_glide(window, cx));
+        } else {
+            self.glide_on = false;
+        }
+        if moved {
+            cx.notify();
+        }
+    }
+
     fn apply_reactions(
         &mut self,
         chat_id: i64,
@@ -1056,24 +1407,30 @@ impl AppView {
         info: &messages::ReactionInfo,
         known_yours: bool,
     ) {
-        let Some(row) = self
-            .histories
-            .get_mut(&chat_id)
-            .and_then(|h| h.messages.iter_mut().find(|m| m.id == message_id))
-        else {
-            return;
+        let found = {
+            let Some(row) = self
+                .histories
+                .get_mut(&chat_id)
+                .and_then(|h| h.messages.iter_mut().find(|m| m.id == message_id))
+            else {
+                return;
+            };
+            let kept = row
+                .reactions
+                .iter()
+                .find(|r| r.mine)
+                .map(|r| r.emoji.clone());
+            let yours = if known_yours {
+                info.your_reaction.as_deref()
+            } else {
+                kept.as_deref()
+            };
+            row.reactions = reaction_counts(info, yours);
+            true
         };
-        let kept = row
-            .reactions
-            .iter()
-            .find(|r| r.mine)
-            .map(|r| r.emoji.clone());
-        let yours = if known_yours {
-            info.your_reaction.as_deref()
-        } else {
-            kept.as_deref()
-        };
-        row.reactions = reaction_counts(info, yours);
+        if found {
+            self.remeasure_id(chat_id, message_id);
+        }
     }
 
     /// The plate we show for a chat: the server's list, or the usual emoji.
@@ -1129,6 +1486,7 @@ impl AppView {
         };
         let _ = self.commands.send(command);
         self.reaction_picker = None;
+        self.remeasure_id(chat_id, message_id);
     }
 
     fn pick_file(&mut self, cx: &mut Context<Self>) {
@@ -1274,7 +1632,16 @@ impl AppView {
             h.error = None;
             let _ = self.commands.send(UiCommand::OpenChat(chat_id));
         }
-        self.scroll.scroll_to_bottom();
+        let count = self
+            .histories
+            .get(&chat_id)
+            .map(|h| h.messages.len())
+            .unwrap_or(0);
+        if self.history_for != Some(chat_id) {
+            self.history_list.reset(count);
+            self.history_for = Some(chat_id);
+        }
+        self.history_list.set_follow_mode(FollowMode::Tail);
         self.mark_read(chat_id);
         cx.notify();
     }
@@ -1358,6 +1725,8 @@ impl AppView {
     fn set_ui(&mut self, ui: UiSettings, window: &mut Window, cx: &mut Context<Self>) {
         self.ui = ui;
         apply_ui(&self.ui, window, cx);
+        self.history_list.remeasure();
+        self.chats_list.remeasure();
         if let Err(e) = self.ui.save()
             && let Screen::Main { status, .. } = &mut self.screen
         {
@@ -3594,45 +3963,65 @@ impl AppView {
         });
     }
 
+    /// One transcript row. A day header rides on the first message of that day,
+    /// so the virtual list stays one row per message.
+    fn history_item(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(chat_id) = self.history_for else {
+            return div().into_any_element();
+        };
+        let Screen::Main { chats, .. } = &self.screen else {
+            return div().into_any_element();
+        };
+        let Some(chat) = chats.iter().find(|c| c.id == chat_id) else {
+            return div().into_any_element();
+        };
+        let Some(history) = self.histories.get(&chat_id) else {
+            return div().into_any_element();
+        };
+        let Some(message) = history.messages.get(ix) else {
+            return div().into_any_element();
+        };
+        let day = day_label(message.time);
+        let new_day = ix == 0
+            || history
+                .messages
+                .get(ix - 1)
+                .is_none_or(|prev| day_label(prev.time) != day);
+        let bubble = self.bubble(
+            chat.id,
+            message,
+            &chat.title,
+            chat.peer_mark,
+            chat.kind != ChatKind::Channel,
+            cx,
+        );
+        if !new_day {
+            return bubble;
+        }
+        v_flex()
+            .w_full()
+            .child(
+                h_flex().w_full().justify_center().py_2().child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(day),
+                ),
+            )
+            .child(bubble)
+            .into_any_element()
+    }
+
     fn render_chat(&self, chat: &ChatRow, cx: &mut Context<Self>) -> Div {
         let history = self.histories.get(&chat.id);
-        let mut items: Vec<AnyElement> = Vec::new();
-        let mut last_day = String::new();
-        for m in history.map(|h| h.messages.as_slice()).unwrap_or_default() {
-            let day = day_label(m.time);
-            if day != last_day {
-                items.push(
-                    h_flex()
-                        .w_full()
-                        .justify_center()
-                        .py_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(day.clone()),
-                        )
-                        .into_any_element(),
-                );
-                last_day = day;
-            }
-            items.push(
-                self.bubble(
-                    chat.id,
-                    m,
-                    &chat.title,
-                    chat.peer_mark,
-                    chat.kind != ChatKind::Channel,
-                    cx,
-                )
-                .into_any_element(),
-            );
-        }
+        let count = history.map(|h| h.messages.len()).unwrap_or(0);
         let chat_id = chat.id;
         // None: no older page; Some(loading) otherwise.
         let older_state = history
             .filter(|h| h.has_more && !h.messages.is_empty())
             .map(|h| h.loading_older);
+        // The button sits above the transcript only while the first row is in view.
+        let at_top = self.history_list.logical_scroll_top().item_ix == 0;
         let notice = match history {
             Some(h) if h.loading => Some("Загрузка…".to_string()),
             Some(History { error: Some(e), .. }) => {
@@ -3641,28 +4030,45 @@ impl AppView {
             Some(h) if h.messages.is_empty() => Some("Сообщений пока нет".to_string()),
             _ => None,
         };
+        // The list builds only the rows in view (plus a margin), so a long chat
+        // does not lay out every bubble on each scroll step.
+        let transcript = list(
+            self.history_list.clone(),
+            cx.processor(|this, ix: usize, _, cx| this.history_item(ix, cx)),
+        )
+        .size_full();
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
             .child(self.chat_header(chat, cx))
+            .when(older_state.is_some() && at_top, |this| {
+                let loading = older_state == Some(true);
+                this.child(
+                    h_flex().w_full().justify_center().py_1().child(
+                        Button::new("older")
+                            .ghost()
+                            .small()
+                            .label(if loading {
+                                "Загрузка…"
+                            } else {
+                                "Показать более ранние"
+                            })
+                            .disabled(loading)
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.load_older(chat_id, cx)),
+                            ),
+                    ),
+                )
+            })
             .child(
-                v_flex()
+                div()
                     .id("history")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .on_scroll(cx.listener(move |this, ev: &ScrollEvent, _, cx| {
-                        // Scrolling up at the top loads the previous page.
-                        let up = ev.delta.pixel_delta(px(20.)).y > px(0.);
-                        if up && this.scroll.offset().y >= px(-4.) {
-                            this.load_older(chat_id, cx);
-                        }
-                    }))
-                    // Rows span the full width so a highlighted row reads as one line.
-                    .py_3()
-                    .gap_0p5()
+                    .w_full()
+                    .relative()
+                    .overflow_hidden()
                     // A left click anywhere closes a right-click menu; drop its row's highlight.
                     .on_mouse_down(
                         MouseButton::Left,
@@ -3672,36 +4078,24 @@ impl AppView {
                             }
                         }),
                     )
-                    .when(older_state.is_some(), |this| {
-                        let loading = older_state == Some(true);
-                        this.child(
-                            h_flex().w_full().justify_center().child(
-                                Button::new("older")
-                                    .ghost()
-                                    .small()
-                                    .label(if loading {
-                                        "Загрузка…"
-                                    } else {
-                                        "Показать более ранние"
-                                    })
-                                    .disabled(loading)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.load_older(chat_id, cx)
-                                    })),
-                            ),
-                        )
-                    })
-                    .when_some(notice, |this, n| {
+                    // Runs after the list has already jumped by the whole notch.
+                    .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
+                        this.glide_history(ev, window, cx);
+                    }))
+                    .when(count == 0, |this| {
                         this.child(
                             h_flex()
-                                .w_full()
+                                .size_full()
                                 .justify_center()
-                                .py_4()
+                                .items_center()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(n),
+                                .child(notice.clone().unwrap_or_default()),
                         )
                     })
-                    .children(items),
+                    .when(count > 0, |this| {
+                        this.child(transcript)
+                            .vertical_scrollbar(&self.history_list)
+                    }),
             )
             .child(
                 v_flex()
@@ -4074,23 +4468,7 @@ impl AppView {
     ) -> Div {
         let unread: i32 = chats.iter().map(|c| c.unread.max(0)).sum();
         let (title, list): (&str, AnyElement) = match self.section {
-            Section::Chats => (
-                "Чаты",
-                v_flex()
-                    .id("chat-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .p_2()
-                    .gap_1()
-                    .children(chats.iter().map(|row| {
-                        let typing = self.typing_label(row);
-                        let avatar = self.avatar(&row.title, row.avatar.as_ref(), 40., cx);
-                        let menu = self.chat_menu(row, cx);
-                        Self::chat_row(row, selected == Some(row.id), typing, avatar, cx)
-                            .context_menu(menu)
-                    }))
-                    .into_any_element(),
-            ),
+            Section::Chats => ("Чаты", self.chat_list(cx)),
             Section::Contacts => ("Контакты", self.contact_list(cx).into_any_element()),
             Section::Calls => (
                 "Звонки",
@@ -4128,7 +4506,7 @@ impl AppView {
                         this.child(div().text_xs().text_color(cx.theme().warning).child(s))
                     }),
             )
-            .child(list);
+            .child(div().flex_1().min_h_0().overflow_hidden().child(list));
         let content = match self.section {
             Section::Chats => match selected.and_then(|id| chats.iter().find(|c| c.id == id)) {
                 Some(chat) if self.profile_open => h_flex()
@@ -4383,43 +4761,112 @@ impl AppView {
             }))
     }
 
-    fn contact_list(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let muted = cx.theme().muted_foreground;
-        v_flex()
-            .id("contact-list")
-            .flex_1()
-            .overflow_y_scroll()
-            .p_2()
-            .gap_1()
-            .when(self.contacts.is_empty(), |this| {
-                this.child(
-                    div()
-                        .p_2()
-                        .text_sm()
-                        .text_color(muted)
-                        .child("Контактов пока нет"),
+    /// Chat rows built only for what is on screen. A pin line and an unread
+    /// badge change a row's height, so each row is measured on its own.
+    fn chat_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Screen::Main { chats, .. } = &self.screen {
+            let stamp = chat_rows_stamp(chats);
+            if self.chats_list.item_count() != chats.len() {
+                self.chats_list.reset(chats.len());
+            } else if self.chats_stamp.get() != stamp {
+                self.chats_list.remeasure();
+            }
+            self.chats_stamp.set(stamp);
+        }
+        // Reset and remeasure happen above, and they change the pixel offset.
+        // The wheel measures its jump from whatever the list will paint.
+        self.chats_origin.set(list_scroll_px(&self.chats_list));
+        self.chats_glide_base.set(self.chats_glide);
+        div()
+            .id("chat-scroll")
+            .size_full()
+            .relative()
+            .on_scroll(cx.listener(|this, ev: &ScrollEvent, window, cx| {
+                this.glide_chats(ev, window, cx);
+            }))
+            .child(
+                list(
+                    self.chats_list.clone(),
+                    cx.processor(|this, ix: usize, _, cx| this.chat_list_row(ix, cx)),
                 )
-            })
-            .children(self.contacts.iter().map(|c| {
+                .size_full(),
+            )
+            .vertical_scrollbar(&self.chats_list)
+            .into_any_element()
+    }
+
+    fn chat_list_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Screen::Main {
+            chats, selected, ..
+        } = &self.screen
+        else {
+            return div().into_any_element();
+        };
+        let Some(row) = chats.get(ix) else {
+            return div().into_any_element();
+        };
+        let typing = self.typing_label(row);
+        let avatar = self.avatar(&row.title, row.avatar.as_ref(), 40., cx);
+        let menu = self.chat_menu(row, cx);
+        Self::chat_row(row, *selected == Some(row.id), typing, avatar, cx)
+            .mx_2()
+            .context_menu(menu)
+            .into_any_element()
+    }
+
+    fn contact_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.contacts.is_empty() {
+            return div()
+                .p_4()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Контактов пока нет")
+                .into_any_element();
+        }
+        let count = self.contacts.len();
+        uniform_list(
+            "contact-list",
+            count,
+            cx.processor(|this, range: std::ops::Range<usize>, _, cx| this.contact_rows(range, cx)),
+        )
+        .track_scroll(&self.contacts_scroll)
+        .size_full()
+        .px_2()
+        .py_1()
+        .into_any_element()
+    }
+
+    fn contact_rows(
+        &self,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        range
+            .filter_map(|ix| {
+                let c = self.contacts.get(ix)?;
                 let id = c.id;
                 let selected = self.contact_selected == Some(id);
-                h_flex()
-                    .id(("contact", u64::from_ne_bytes(id.to_ne_bytes())))
-                    .gap_3()
-                    .px_3()
-                    .py_2()
-                    .items_center()
-                    .rounded(cx.theme().radius)
-                    .cursor_pointer()
-                    .when(selected, |this| this.bg(cx.theme().accent))
-                    .hover(|this| this.bg(cx.theme().secondary_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.contact_selected = Some(id);
-                        cx.notify();
-                    }))
-                    .child(self.avatar(&c.name, c.avatar.as_ref(), 36., cx))
-                    .child(div().truncate().child(c.name.clone()))
-            }))
+                Some(
+                    h_flex()
+                        .id(("contact", u64::from_ne_bytes(id.to_ne_bytes())))
+                        .gap_3()
+                        .px_3()
+                        .py_2()
+                        .items_center()
+                        .rounded(cx.theme().radius)
+                        .cursor_pointer()
+                        .when(selected, |this| this.bg(cx.theme().accent))
+                        .hover(|this| this.bg(cx.theme().secondary_hover))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.contact_selected = Some(id);
+                            cx.notify();
+                        }))
+                        .child(self.avatar(&c.name, c.avatar.as_ref(), 36., cx))
+                        .child(div().truncate().child(c.name.clone()))
+                        .into_any_element(),
+                )
+            })
+            .collect()
     }
 
     /// A round avatar: the photo at `url` once it is loaded, the first letter of `name` until
@@ -4840,6 +5287,50 @@ fn clock(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// The part of a wheel notch the list applied beyond one frame.
+///
+/// The list moves by `-delta_y` immediately. The returned distance is what we
+/// scroll back, then play out over the following frames. A small notch is `0`.
+fn wheel_glide_extra(delta_y: f32, frame_px: f32) -> f32 {
+    let applied = -delta_y;
+    let keep = applied.signum() * applied.abs().min(frame_px);
+    let extra = applied - keep;
+    if extra.abs() < 0.5 { 0. } else { extra }
+}
+
+/// How far to move on this frame. A fraction of what is left, never less than
+/// [`WHEEL_FRAME_PX`] until the tail, so 120 Hz does not turn into a crawl.
+fn glide_step(remaining: f32) -> f32 {
+    let mag = remaining.abs();
+    if mag < 0.5 {
+        return 0.;
+    }
+    let step = (mag * 0.35).max(WHEEL_FRAME_PX).min(mag);
+    remaining.signum() * step
+}
+
+/// Positive pixels down the list. The scrollbar helper reports the same distance negated.
+fn list_scroll_px(list: &ListState) -> f32 {
+    -f32::from(list.scroll_px_offset_for_scrollbar().y)
+}
+
+/// Order, pin, mute and whether a badge is shown. Preview text is left out:
+/// it does not change the row's height.
+fn chat_rows_stamp(chats: &[ChatRow]) -> u64 {
+    let mut stamp = chats.len() as u64;
+    for chat in chats {
+        stamp = stamp.wrapping_mul(67).wrapping_add(chat.id as u64);
+        stamp = stamp
+            .wrapping_mul(67)
+            .wrapping_add(u64::from(chat.pin_index > 0));
+        stamp = stamp.wrapping_mul(67).wrapping_add(u64::from(chat.muted));
+        stamp = stamp
+            .wrapping_mul(67)
+            .wrapping_add(u64::from(chat.unread > 0));
+    }
+    stamp
+}
+
 /// "Сегодня", "Вчера" or "19.11.2026" for the day of `ms`.
 fn day_label(ms: i64) -> String {
     day_label_in(ms, jiff::Timestamp::now(), &jiff::tz::TimeZone::system())
@@ -4861,6 +5352,10 @@ fn day_label_in(ms: i64, now: jiff::Timestamp, tz: &jiff::tz::TimeZone) -> Strin
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.history_origin = list_scroll_px(&self.history_list);
+        self.chats_origin.set(list_scroll_px(&self.chats_list));
+        self.history_glide_base = self.history_glide;
+        self.chats_glide_base.set(self.chats_glide);
         self.sync_unread(window);
         match &self.screen {
             Screen::Status(s) => Self::centered(
@@ -4932,7 +5427,24 @@ impl Render for AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::{Delivery, History, MessageRow, day_label_in, normalize_phone, short_time_in};
+    use super::{
+        Delivery, History, MessageRow, WHEEL_FRAME_PX, day_label_in, glide_step, normalize_phone,
+        short_time_in, wheel_glide_extra,
+    };
+
+    #[test]
+    fn a_wheel_notch_keeps_one_frame_and_glides_the_rest() {
+        // Three lines of 20px, toward older messages. The list jumps 60px;
+        // one frame stays, 44px is given back to the glide.
+        assert_eq!(wheel_glide_extra(60., WHEEL_FRAME_PX), -44.);
+        assert_eq!(wheel_glide_extra(-60., WHEEL_FRAME_PX), 44.);
+        assert_eq!(wheel_glide_extra(10., WHEEL_FRAME_PX), 0.);
+        assert_eq!(wheel_glide_extra(0., WHEEL_FRAME_PX), 0.);
+        // A short tail is applied whole. clamp would panic here: the floor is above the tail.
+        assert_eq!(glide_step(-44.), -16.);
+        assert_eq!(glide_step(-12.), -12.);
+        assert_eq!(glide_step(0.2), 0.);
+    }
 
     #[test]
     fn local_time_today_and_date_otherwise() {

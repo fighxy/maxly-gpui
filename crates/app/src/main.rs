@@ -12,6 +12,7 @@ mod backend;
 mod desktop;
 mod instance;
 mod qr;
+mod rich;
 mod settings;
 mod trace;
 mod viewer;

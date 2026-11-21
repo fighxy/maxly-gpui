@@ -66,6 +66,22 @@ pub enum Attachment {
         /// Image address.
         url: String,
     },
+    /// A link preview (`SHARE`: `url`, `title`, `description`, `host`, `image`, `isSensitive`).
+    /// The server attaches it to a message; the image stays hidden while `sensitive`.
+    Share {
+        /// Where a click goes.
+        url: String,
+        /// Page or chat title. Empty when the server sent none.
+        title: String,
+        /// Short text under the title.
+        description: String,
+        /// Site shown under the text. Empty when the server sent none.
+        host: String,
+        /// Preview image, when there is one.
+        image: Option<String>,
+        /// The image is not shown until the user asks.
+        sensitive: bool,
+    },
     /// Anything else, by its `_type`.
     Other {
         /// The `_type` value.
@@ -86,6 +102,38 @@ fn text(v: &Value, key: &str) -> Option<String> {
 
 fn int(v: &Value, key: &str) -> Option<i64> {
     field(v, key).and_then(Value::as_i64)
+}
+
+fn flag(v: &Value, key: &str) -> bool {
+    match field(v, key) {
+        Some(Value::Boolean(on)) => *on,
+        Some(v) => v.as_i64() == Some(1),
+        None => false,
+    }
+}
+
+/// A `SHARE` attachment: the link card the server stored with the message.
+fn share(v: &Value) -> Attachment {
+    let url = text(v, "url").unwrap_or_default();
+    let image = field(v, "image").and_then(|image| {
+        text(image, "baseUrl")
+            .or_else(|| text(image, "url"))
+            .or_else(|| text(image, "previewUrl"))
+            .or_else(|| image.as_str().map(str::to_string))
+    });
+    if url.is_empty() && image.is_none() && text(v, "title").is_none() {
+        return Attachment::Other {
+            kind: "SHARE".into(),
+        };
+    }
+    Attachment::Share {
+        url,
+        title: text(v, "title").unwrap_or_default(),
+        description: text(v, "description").unwrap_or_default(),
+        host: text(v, "host").unwrap_or_default(),
+        image: image.filter(|u| !u.is_empty()),
+        sensitive: flag(v, "isSensitive"),
+    }
 }
 
 /// The attachments of a message.
@@ -129,6 +177,7 @@ pub fn attachments(m: &Message) -> Vec<Attachment> {
                     Some(url) => Attachment::Sticker { url },
                     None => Attachment::Other { kind },
                 },
+                "SHARE" => share(v),
                 _ => Attachment::Other { kind },
             }
         })
@@ -434,6 +483,42 @@ mod tests {
                 },
                 Attachment::Other {
                     kind: "POLL".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_a_link_preview() {
+        let image = map(&[("baseUrl", "https://i.example/p".into())]);
+        let m = Message {
+            attaches: Some(vec![
+                Any(map(&[
+                    ("_type", "SHARE".into()),
+                    ("url", "https://example.com/a".into()),
+                    ("title", "Заголовок".into()),
+                    ("description", "Текст".into()),
+                    ("host", "example.com".into()),
+                    ("isSensitive", true.into()),
+                    ("image", image),
+                ])),
+                Any(map(&[("_type", "SHARE".into())])),
+            ]),
+            ..Message::default()
+        };
+        assert_eq!(
+            attachments(&m),
+            [
+                Attachment::Share {
+                    url: "https://example.com/a".into(),
+                    title: "Заголовок".into(),
+                    description: "Текст".into(),
+                    host: "example.com".into(),
+                    image: Some("https://i.example/p".into()),
+                    sensitive: true,
+                },
+                Attachment::Other {
+                    kind: "SHARE".into()
                 },
             ]
         );

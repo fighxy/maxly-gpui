@@ -8,6 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use max_core::media::{self, Attachment, Http, OutgoingAttachment};
 use max_core::messages;
+
+use crate::rich;
 use max_core::{
     AuthStep, CodeRequest, CoreConfig, CoreError, CoreEvent, LoginResponse, QrLogin, QrPoll,
     Session, Supervisor, TlsConnector,
@@ -92,6 +94,11 @@ pub enum UiEvent {
     PeerRead { chat_id: i64, mark: i64 },
     /// A chat changed or was added.
     ChatChanged(ChatRow),
+    /// What a `max.ru` link points at. `None` when the server has no card for it.
+    LinkCard {
+        url: String,
+        card: Option<Attachment>,
+    },
     /// The people we know, for the contacts section.
     Contacts(Vec<ContactRow>),
     /// Something failed; shown with a way to start over.
@@ -162,6 +169,8 @@ pub enum UiCommand {
     Logout,
     /// We are typing in a chat.
     Typing { chat_id: i64 },
+    /// Ask what a `max.ru` link points at.
+    LinkInfo(String),
 }
 
 /// One active session of the account, for the account panel.
@@ -246,6 +255,8 @@ pub struct MessageRow {
     pub reply: Option<Quote>,
     /// Forwarded: the original author or channel; text and attachments are the original's.
     pub forwarded: Option<String>,
+    /// Formatting, mentions and links over `text`, as byte ranges.
+    pub marks: Vec<rich::Mark>,
 }
 
 impl MessageRow {
@@ -269,6 +280,15 @@ impl MessageRow {
                 Attachment::Video { .. } => "Видео".to_string(),
                 Attachment::File { name, .. } => format!("Файл: {name}"),
                 Attachment::Sticker { .. } => "Стикер".to_string(),
+                Attachment::Share { title, host, .. } => {
+                    if !title.is_empty() {
+                        title.clone()
+                    } else if !host.is_empty() {
+                        host.clone()
+                    } else {
+                        "Ссылка".to_string()
+                    }
+                }
                 Attachment::Other { kind } => attachment_label(kind).to_string(),
             })
             .unwrap_or_default()
@@ -537,7 +557,8 @@ async fn demo_flow(
             UiCommand::Typing { .. } => {}
             UiCommand::FetchImage(_)
             | UiCommand::DownloadFile { .. }
-            | UiCommand::SendFile { .. } => {}
+            | UiCommand::SendFile { .. }
+            | UiCommand::LinkInfo(_) => {}
         }
     }
     let t = now_ms();
@@ -723,6 +744,19 @@ async fn demo_flow(
                     None => UiEvent::ImageFailed { url },
                 });
             }
+            UiCommand::LinkInfo(link) => {
+                let _ = ui.send(UiEvent::LinkCard {
+                    url: link.clone(),
+                    card: Some(Attachment::Share {
+                        url: link,
+                        title: "Соседи".into(),
+                        description: "12 участников".into(),
+                        host: "max.ru".into(),
+                        image: Some("demo://avatar/2".into()),
+                        sensitive: false,
+                    }),
+                });
+            }
             UiCommand::DownloadFile { name, .. } => {
                 let _ = ui.send(UiEvent::Notice(format!("Демо: {name} не скачивается")));
             }
@@ -818,6 +852,8 @@ fn demo_row(id: i64, out: bool, text: &str, time: i64, delivery: Delivery) -> Me
         text: text.into(),
         time,
         delivery,
+        // Addresses in demo texts are links, as in real messages.
+        marks: rich::autolinks(text, &[]),
         ..MessageRow::default()
     }
 }
@@ -918,8 +954,12 @@ fn demo_history(chat_id: i64, now: i64) -> Vec<MessageRow> {
         (false, "Привет! Завтра всё в силе?", 95),
         (true, "Привет, да. Во сколько удобно?", 90),
         (false, "Давай с утра, часов в 10", 60),
-        (true, "Договорились", 58),
-        (false, "Вот место, где встретимся", 20),
+        (true, "Договорились: https://max.ru/join/demo", 58),
+        (
+            false,
+            "Вот место, где встретимся: https://example.com/place",
+            20,
+        ),
         (false, "Электрички в субботу: 9:12, 9:47, 10:20", 12),
         (false, "До завтра! 👋", 5),
     ];
@@ -944,6 +984,41 @@ fn demo_history(chat_id: i64, now: i64) -> Vec<MessageRow> {
             }
             if i == 5 {
                 row.forwarded = Some("Пригородные поезда".into());
+                // "Электрички в субботу: 9:12, 9:47, 10:20": a hidden link and bold times.
+                let el = |kind, from, length, url| rich::Element {
+                    kind,
+                    from,
+                    length,
+                    url,
+                };
+                row.marks = rich::from_elements(
+                    &row.text,
+                    [
+                        el("LINK", 0, 10, Some("https://example.org/rasp")),
+                        el("STRONG", 22, 17, None),
+                        el("EMPHASIZED", 11, 9, None),
+                    ],
+                );
+            }
+            if i == 0 {
+                // "Привет! Завтра всё в силе?": code and strikethrough.
+                row.marks = rich::from_elements(
+                    &row.text,
+                    [
+                        rich::Element {
+                            kind: "MONOSPACED",
+                            from: 8,
+                            length: 6,
+                            url: None,
+                        },
+                        rich::Element {
+                            kind: "STRIKETHROUGH",
+                            from: 15,
+                            length: 10,
+                            url: None,
+                        },
+                    ],
+                );
             }
             let photo = |w: i32, h: i32| Attachment::Photo {
                 photo_id: None,
@@ -952,8 +1027,17 @@ fn demo_history(chat_id: i64, now: i64) -> Vec<MessageRow> {
                 height: h,
             };
             if i == 4 {
+                // The address in the text, as a card the server would attach (`SHARE`).
+                row.attachments.push(Attachment::Share {
+                    url: "https://example.com/place".into(),
+                    title: "Место встречи".into(),
+                    description: "Схема прохода от метро до входа".into(),
+                    host: "example.com".into(),
+                    image: Some("demo://photo/640x360".into()),
+                    sensitive: false,
+                });
                 // An album: wide, tall and square photos and a video.
-                row.attachments = vec![
+                row.attachments.extend([
                     photo(640, 420),
                     photo(420, 640),
                     photo(600, 600),
@@ -964,7 +1048,7 @@ fn demo_history(chat_id: i64, now: i64) -> Vec<MessageRow> {
                         height: 720,
                         duration: 42_000,
                     },
-                ];
+                ]);
             }
             if i == 1 {
                 row.attachments = vec![photo(420, 640), photo(640, 420), photo(640, 420)];
@@ -1182,6 +1266,24 @@ async fn run_logged_in(
                                     crate::trace::note(&format!("read mark failed: {e}"));
                                 }
                             }
+                        });
+                    }
+                    UiCommand::LinkInfo(link) => {
+                        tokio::spawn(async move {
+                            let card = match handle.transport() {
+                                Ok(t) => match messages::link_info(&t, &link).await {
+                                    Ok(info) => link_card(&link, &info),
+                                    Err(e) => {
+                                        crate::trace::note(&format!("link info failed: {e}"));
+                                        None
+                                    }
+                                },
+                                Err(e) => {
+                                    crate::trace::note(&format!("link info failed: {e}"));
+                                    None
+                                }
+                            };
+                            let _ = ui.send(UiEvent::LinkCard { url: link, card });
                         });
                     }
                     UiCommand::SendText { chat_id, text, cid, reply_to } => {
@@ -1535,20 +1637,30 @@ impl Names {
         let link = m.link.as_deref();
         let forward = link.filter(|l| l.type_ == messages::LINK_FORWARD);
         let reply = link.filter(|l| l.type_ == messages::LINK_REPLY);
-        let (text, attachments) = match forward {
+        let (text, mut marks, attachments) = match forward {
             Some(l) => {
-                let texts = [bubble_text(m), bubble_text(&l.message)];
-                let text = texts
-                    .into_iter()
-                    .filter(|t| !t.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
+                let (outer, outer_marks) = marked_text(m);
+                let (inner, inner_marks) = marked_text(&l.message);
+                let (text, marks) = match (outer.is_empty(), inner.is_empty()) {
+                    (true, _) => (inner, inner_marks),
+                    (false, true) => (outer, outer_marks),
+                    (false, false) => {
+                        let mut marks = outer_marks;
+                        marks.extend(rich::shift(inner_marks, outer.len() + 2));
+                        (format!("{outer}\n\n{inner}"), marks)
+                    }
+                };
                 let mut attachments = media::attachments(m);
                 attachments.extend(media::attachments(&l.message));
-                (text, attachments)
+                (text, marks, attachments)
             }
-            None => (bubble_text(m), media::attachments(m)),
+            None => {
+                let (text, marks) = marked_text(m);
+                (text, marks, media::attachments(m))
+            }
         };
+        let found = rich::autolinks(&text, &marks);
+        marks.extend(found);
         MessageRow {
             id: m.id,
             cid: m.cid,
@@ -1570,6 +1682,7 @@ impl Names {
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| self.name(l.message.sender))
             }),
+            marks,
         }
     }
 
@@ -1591,6 +1704,133 @@ pub fn sender_ids(m: &messages::Message) -> impl Iterator<Item = i64> + '_ {
         .chain(m.link.as_ref().and_then(|l| l.message.sender))
 }
 
+/// A card for a `max.ru` link, from [`messages::link_info`]. `None` when the answer names nothing.
+fn link_card(link: &str, info: &messages::LinkInfo) -> Option<Attachment> {
+    if let Some(chat) = &info.chat {
+        let title = chat
+            .title
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Чат".into());
+        let description = chat
+            .description
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                chat.participants_count.map(|n| {
+                    let word = if chat.type_ == "CHANNEL" {
+                        plural(n, "подписчик", "подписчика", "подписчиков")
+                    } else {
+                        plural(n, "участник", "участника", "участников")
+                    };
+                    format!("{} {word}", group_digits(n))
+                })
+            })
+            .unwrap_or_default();
+        return Some(share_card(
+            chat.link.clone().filter(|s| !s.is_empty()),
+            link,
+            title,
+            description,
+            chat.base_icon_url.clone(),
+        ));
+    }
+    if let Some(user) = &info.user {
+        return Some(share_card(
+            user.contact.link.clone().filter(|s| !s.is_empty()),
+            link,
+            contact_name(&user.contact),
+            user.summary
+                .clone()
+                .or(user.contact.description.clone())
+                .unwrap_or_default(),
+            user.contact.base_url.clone(),
+        ));
+    }
+    let post = info.post.as_ref().or(info.message.as_ref());
+    if let Some(message) = post {
+        let text = one_line(message.text.as_deref().unwrap_or(""));
+        if !text.is_empty() {
+            return Some(share_card(
+                None,
+                link,
+                if info.post.is_some() {
+                    "Пост".into()
+                } else {
+                    "Сообщение".into()
+                },
+                brief(&text),
+                None,
+            ));
+        }
+    }
+    if let Some(set) = &info.sticker_set
+        && !set.name.is_empty()
+    {
+        return Some(share_card(
+            Some(set.link.clone()).filter(|s| !s.is_empty()),
+            link,
+            set.name.clone(),
+            "Набор стикеров".into(),
+            Some(set.icon_url.clone()).filter(|s| !s.is_empty()),
+        ));
+    }
+    if let Some(call) = &info.video_conference {
+        let title = call
+            .call_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Звонок".into());
+        let description = call
+            .participants_count
+            .map(|n| {
+                let n = i64::from(n);
+                format!(
+                    "{} {}",
+                    group_digits(n),
+                    plural(n, "участник", "участника", "участников")
+                )
+            })
+            .unwrap_or_default();
+        return Some(share_card(
+            Some(call.join_link.clone()).filter(|s| !s.is_empty()),
+            link,
+            title,
+            description,
+            None,
+        ));
+    }
+    None
+}
+
+fn share_card(
+    own_link: Option<String>,
+    asked: &str,
+    title: String,
+    description: String,
+    image: Option<String>,
+) -> Attachment {
+    Attachment::Share {
+        url: own_link.unwrap_or_else(|| asked.to_string()),
+        title,
+        description,
+        host: "max.ru".into(),
+        image: image.filter(|u| !u.is_empty()),
+        sensitive: false,
+    }
+}
+
+/// One line, cut so a card stays a card.
+fn brief(text: &str) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(180).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 /// What an attachment kind is called in the chat list and history.
 pub fn attachment_label(kind: &str) -> &'static str {
     match kind {
@@ -1602,9 +1842,28 @@ pub fn attachment_label(kind: &str) -> &'static str {
         "CONTACT" => "Контакт",
         "LOCATION" => "Геопозиция",
         "POLL" => "Опрос",
+        "SHARE" => "Ссылка",
         "CONTROL" => "Служебное сообщение",
         _ => "Вложение",
     }
+}
+
+/// [`bubble_text`] with the message's formatting elements as marks over it (moved past the
+/// attachment labels put in front of the text).
+pub fn marked_text(m: &messages::Message) -> (String, Vec<rich::Mark>) {
+    let text = bubble_text(m);
+    let raw = m.text.as_deref().unwrap_or("");
+    if raw.is_empty() || !text.ends_with(raw) {
+        return (text, Vec::new());
+    }
+    let elements = m.elements.iter().flatten().map(|e| rich::Element {
+        kind: e.type_.as_str(),
+        from: e.from.map_or(0, i64::from),
+        length: e.length.map_or(0, i64::from),
+        url: e.attributes.as_ref().and_then(|a| a.url.as_deref()),
+    });
+    let marks = rich::shift(rich::from_elements(raw, elements), text.len() - raw.len());
+    (text, marks)
 }
 
 /// The text shown inside a bubble: photos, files and stickers are drawn, so only the other
@@ -1640,13 +1899,17 @@ pub fn message_text(m: &messages::Message) -> String {
         .attaches
         .iter()
         .flatten()
-        .map(|a| {
+        .filter_map(|a| {
             let kind =
                 a.0.as_map()
                     .and_then(|map| map.iter().find(|(k, _)| k.as_str() == Some("_type")))
                     .and_then(|(_, v)| v.as_str())
                     .unwrap_or("");
-            attachment_label(kind)
+            // A link card is drawn on its own; the message text stays as it was written.
+            if kind.is_empty() || (kind == "SHARE" && !text.is_empty()) {
+                return None;
+            }
+            Some(attachment_label(kind))
         })
         .collect();
     match (text.is_empty(), attaches.is_empty()) {
@@ -2223,6 +2486,133 @@ mod tests {
             chats,
             ..LoginResponse::default()
         }
+    }
+
+    #[test]
+    fn formatting_follows_labels_and_forwards() {
+        use max_proto::schema::types::message_element::AttributesMap;
+        use max_proto::schema::types::{MessageElement, MessageLink};
+
+        let names = Names::from_login(&login_with(vec![]));
+        let element = |kind: &str, from: i16, length: i16, url: Option<&str>| MessageElement {
+            type_: kind.into(),
+            from: Some(from),
+            length: Some(length),
+            attributes: url.map(|u| AttributesMap {
+                url: Some(u.into()),
+                ..AttributesMap::default()
+            }),
+            ..MessageElement::default()
+        };
+        // A poll gets "[Опрос] " in front of the text: marks move with it.
+        let poll = max_proto::schema::Any(rmpv::Value::Map(vec![("_type".into(), "POLL".into())]));
+        let m = Message {
+            id: 1,
+            text: Some("жирно и тут".into()),
+            elements: Some(vec![
+                element("STRONG", 0, 5, None),
+                element("LINK", 8, 3, Some("https://example.com")),
+            ]),
+            attaches: Some(vec![poll]),
+            ..Message::default()
+        };
+        let row = names.row(&m);
+        assert!(row.text.starts_with("[Опрос] "));
+        let shown: Vec<&str> = row
+            .marks
+            .iter()
+            .map(|k| &row.text[k.range.clone()])
+            .collect();
+        assert_eq!(shown, ["жирно", "тут"]);
+        // A forward with its own comment: the original's marks follow "comment\n\n".
+        let fwd = Message {
+            id: 2,
+            sender: Some(1),
+            text: Some("см.".into()),
+            link: Some(Box::new(MessageLink {
+                type_: "FORWARD".into(),
+                message: Box::new(Message {
+                    text: Some("важно https://max.ru".into()),
+                    elements: Some(vec![element("STRONG", 0, 5, None)]),
+                    ..Message::default()
+                }),
+                ..MessageLink::default()
+            })),
+            ..Message::default()
+        };
+        let row = names.row(&fwd);
+        let shown: Vec<&str> = row
+            .marks
+            .iter()
+            .map(|k| &row.text[k.range.clone()])
+            .collect();
+        assert_eq!(
+            shown,
+            ["важно", "https://max.ru"],
+            "bold moved, address found"
+        );
+    }
+
+    #[test]
+    fn a_max_link_becomes_a_card() {
+        use max_proto::schema::types::{Chat, ContactResult, Message as ProtoMessage};
+        use messages::LinkInfo;
+        let chat = link_card(
+            "https://max.ru/join/abc",
+            &LinkInfo {
+                chat: Some(Chat {
+                    title: Some("Соседи".into()),
+                    participants_count: Some(1200),
+                    base_icon_url: Some("https://i.example/icon".into()),
+                    type_: "CHAT".into(),
+                    ..Chat::default()
+                }),
+                ..LinkInfo::default()
+            },
+        );
+        assert_eq!(
+            chat,
+            Some(Attachment::Share {
+                url: "https://max.ru/join/abc".into(),
+                title: "Соседи".into(),
+                description: "1\u{202F}200 участников".to_string(),
+                host: "max.ru".into(),
+                image: Some("https://i.example/icon".into()),
+                sensitive: false,
+            })
+        );
+        let user = link_card(
+            "https://max.ru/u/7",
+            &LinkInfo {
+                user: Some(ContactResult {
+                    contact: contact(7, "Анна"),
+                    summary: Some("в сети".into()),
+                    ..ContactResult::default()
+                }),
+                ..LinkInfo::default()
+            },
+        );
+        assert!(matches!(
+            user,
+            Some(Attachment::Share { title, description, .. })
+                if title == "Анна" && description == "в сети"
+        ));
+        let post = link_card(
+            "https://max.ru/post/1",
+            &LinkInfo {
+                post: Some(ProtoMessage {
+                    text: Some("  длинный\nпост  ".into()),
+                    ..ProtoMessage::default()
+                }),
+                ..LinkInfo::default()
+            },
+        );
+        assert!(matches!(
+            post,
+            Some(Attachment::Share { title, description, .. })
+                if title == "Пост" && description == "длинный пост"
+        ));
+        assert!(link_card("https://max.ru/x", &LinkInfo::default()).is_none());
     }
 
     #[test]

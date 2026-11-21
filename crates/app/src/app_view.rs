@@ -1,6 +1,8 @@
 //! The window content: login screens and the main view, driven by backend events.
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -24,6 +26,7 @@ use crate::backend::{
 use crate::desktop::{self, DesktopEvent};
 use crate::instance::Instance;
 use crate::qr;
+use crate::rich;
 use crate::settings::{FONT_SIZES, ThemeChoice, UiSettings};
 use crate::viewer::{Viewer, ViewerPhoto, clamp_pan, fit_scale, rotate_pixels};
 use gpui_kit::assets::IconName as Lucide;
@@ -132,6 +135,9 @@ impl SettingsPage {
         }
     }
 }
+
+/// Corner radius of photo and video thumbnails in bubbles, px.
+const CELL_RADIUS: f32 = 10.;
 
 /// Prefix of a notification's tag; the chat id follows, so a click opens that chat.
 const NOTIFY_TAG: &str = "chat:";
@@ -365,6 +371,10 @@ fn human_size(bytes: i64) -> String {
 /// Root view of the main window.
 pub struct AppView {
     images: HashMap<String, ImageState>,
+    /// A `max.ru` link we already asked about: nothing to show, or the card.
+    link_cards: HashMap<String, Option<Attachment>>,
+    /// Preview images the user asked to see.
+    shown_sensitive: HashSet<String>,
     screen: Screen,
     histories: HashMap<i64, History>,
     phone: Entity<InputState>,
@@ -521,6 +531,8 @@ impl AppView {
             composer,
             scroll: ScrollHandle::new(),
             images: HashMap::new(),
+            link_cards: HashMap::new(),
+            shown_sensitive: HashSet::new(),
             commands,
             account: None,
             typing: HashMap::new(),
@@ -561,7 +573,9 @@ impl AppView {
                     h.add(m);
                 }
                 let urls: Vec<String> = h.messages.iter().flat_map(image_urls).collect();
+                let links: Vec<String> = h.messages.iter().flat_map(uncovered_max_links).collect();
                 self.request_images(urls);
+                self.request_link_previews(links);
                 // `--demo-walk` sends a history without a click: open that chat.
                 if let Screen::Main {
                     selected, chats, ..
@@ -582,11 +596,13 @@ impl AppView {
                 has_more,
             } => {
                 let urls: Vec<String> = messages.iter().flat_map(image_urls).collect();
+                let links: Vec<String> = messages.iter().flat_map(uncovered_max_links).collect();
                 let h = self.histories.entry(chat_id).or_default();
                 h.prepend(messages);
                 h.has_more = has_more;
                 h.loading_older = false;
                 self.request_images(urls);
+                self.request_link_previews(links);
             }
             UiEvent::HistoryFailed { chat_id, error } => {
                 let h = self.histories.entry(chat_id).or_default();
@@ -598,6 +614,8 @@ impl AppView {
                     self.typing.remove(&chat_id);
                 }
                 self.request_images(image_urls(&message));
+                let links = uncovered_max_links(&message);
+                self.request_link_previews(links);
                 self.notify_message(chat_id, &message, cx);
                 self.message_added(chat_id, message);
                 self.mark_read(chat_id);
@@ -613,6 +631,17 @@ impl AppView {
             }
             UiEvent::ImageFailed { url } => {
                 self.images.insert(url, ImageState::Failed);
+            }
+            UiEvent::LinkCard { url, card } => {
+                if let Some(Attachment::Share {
+                    image: Some(image),
+                    sensitive: false,
+                    ..
+                }) = &card
+                {
+                    self.request_images(vec![image.clone()]);
+                }
+                self.link_cards.insert(url, card);
             }
             UiEvent::Sessions(rows) => {
                 if let Some(panel) = &mut self.account {
@@ -638,9 +667,13 @@ impl AppView {
                 self.compose = None;
                 self.histories.clear();
                 self.images.clear();
+                self.link_cards.clear();
+                self.shown_sensitive.clear();
                 self.screen = Screen::Status("Вы вышли из аккаунта".into());
             }
             UiEvent::MessageEdited { chat_id, message } => {
+                let links = uncovered_max_links(&message);
+                self.request_link_previews(links);
                 if let Some(h) = self.histories.get_mut(&chat_id) {
                     h.edit(message);
                 }
@@ -778,6 +811,17 @@ impl AppView {
                 self.images.insert(url.clone(), ImageState::Loading);
                 let _ = self.commands.send(UiCommand::FetchImage(url));
             }
+        }
+    }
+
+    /// Ask about `max.ru` links we have not asked about yet. A failure stays empty and is not retried.
+    fn request_link_previews(&mut self, urls: impl IntoIterator<Item = String>) {
+        for url in urls {
+            if self.link_cards.contains_key(&url) {
+                continue;
+            }
+            self.link_cards.insert(url.clone(), None);
+            let _ = self.commands.send(UiCommand::LinkInfo(url));
         }
     }
 
@@ -1266,6 +1310,7 @@ impl AppView {
             time: cid,
             delivery: Delivery::Pending,
             reply: quote.clone(),
+            marks: rich::autolinks(&text, &[]),
             ..MessageRow::default()
         };
         if self
@@ -1617,6 +1662,162 @@ impl AppView {
             )
     }
 
+    /// Link cards under the text: `SHARE` attachments, then a cached `LINK_INFO` card for a
+    /// `max.ru` link that has none.
+    fn share_cards(&self, m: &MessageRow) -> Vec<Attachment> {
+        let mut cards: Vec<Attachment> = m
+            .attachments
+            .iter()
+            .filter(|a| matches!(a, Attachment::Share { .. }))
+            .cloned()
+            .collect();
+        for url in uncovered_max_links(m) {
+            if let Some(Some(card)) = self.link_cards.get(&url) {
+                cards.push(card.clone());
+            }
+        }
+        cards
+    }
+
+    /// One link card. A left click opens the address the way a link in the text does.
+    fn share_card(
+        &self,
+        message_key: u64,
+        index: usize,
+        card: &Attachment,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Attachment::Share {
+            url,
+            title,
+            description,
+            host,
+            image,
+            sensitive,
+        } = card
+        else {
+            return div().into_any_element();
+        };
+        let shown_host = if host.is_empty() {
+            rich::host_of(url)
+        } else {
+            host.clone()
+        };
+        let heading = if title.is_empty() {
+            shown_host.clone()
+        } else {
+            title.clone()
+        };
+        let revealed = image
+            .as_ref()
+            .is_some_and(|u| self.shown_sensitive.contains(u));
+        let show_image = image.as_ref().is_some_and(|_| !*sensitive || revealed);
+        let link = rich::Link {
+            range: 0..0,
+            url: url.clone(),
+            hidden: !rich::same_host(&shown_host, url),
+        };
+        let muted = cx.theme().foreground.opacity(0.65);
+        let id = message_key.wrapping_add(index as u64);
+        let open = link.clone();
+        v_flex()
+            .w_full()
+            .max_w(px(320.))
+            .gap_1()
+            .rounded(px(8.))
+            .overflow_hidden()
+            .bg(cx.theme().foreground.opacity(0.08))
+            .when(show_image, |this| {
+                let url = image.clone().unwrap_or_default();
+                let link = link.clone();
+                this.child(
+                    div()
+                        .id(("share-img", id))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_link(&link, window, cx);
+                        }))
+                        .child(self.share_image(&url, cx)),
+                )
+            })
+            .when(*sensitive && !revealed && image.is_some(), |this| {
+                let url = image.clone().unwrap_or_default();
+                this.child(
+                    v_flex()
+                        .px_2()
+                        .pt_2()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child("Изображение скрыто"),
+                        )
+                        .child(
+                            Button::new(("share-show", id))
+                                .xsmall()
+                                .ghost()
+                                .label("Показать")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.shown_sensitive.insert(url.clone());
+                                    this.request_images(vec![url.clone()]);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(
+                v_flex()
+                    .id(("share", id))
+                    .px_2()
+                    .py_2()
+                    .gap_1()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_link(&open, window, cx);
+                    }))
+                    .child(div().text_sm().font_medium().truncate().child(heading))
+                    .when(!description.is_empty(), |this| {
+                        this.child(div().text_xs().truncate().child(description.clone()))
+                    })
+                    .when(!shown_host.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .truncate()
+                                .child(shown_host),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The picture on a link card, or a placeholder while it loads.
+    fn share_image(&self, url: &str, cx: &mut Context<Self>) -> AnyElement {
+        match self.images.get(url) {
+            Some(ImageState::Ready(image)) => img(image.clone())
+                .w_full()
+                .h(px(140.))
+                .object_fit(ObjectFit::Cover)
+                .into_any_element(),
+            state => div()
+                .w_full()
+                .h(px(140.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(cx.theme().foreground.opacity(0.06))
+                .text_xs()
+                .text_color(cx.theme().foreground.opacity(0.65))
+                .child(match state {
+                    Some(ImageState::Failed) => "Изображение не загрузилось",
+                    _ => "Загрузка…",
+                })
+                .into_any_element(),
+        }
+    }
+
     fn attachment_view(
         &self,
         chat_id: i64,
@@ -1719,6 +1920,174 @@ impl AppView {
         };
         window.set_window_title(&title);
         self.desktop.set_unread(total);
+    }
+
+    /// A message's text with its formatting, mentions and clickable links.
+    fn rich_text(&self, m: &MessageRow, key: u64, cx: &mut Context<Self>) -> AnyElement {
+        if m.marks.is_empty() {
+            return div().child(m.text.clone()).into_any_element();
+        }
+        // On our own (accent-coloured) bubbles links keep the text colour and are underlined.
+        // The neutral themes draw links in the text colour; messengers use blue.
+        let link_color = if m.out {
+            cx.theme().primary_foreground
+        } else if cx.theme().is_dark() {
+            rgb(0x6c_b4_ff).into()
+        } else {
+            rgb(0x1a_6f_d6).into()
+        };
+        let mono_bg = if m.out {
+            cx.theme().primary_foreground.opacity(0.15)
+        } else {
+            cx.theme().foreground.opacity(0.08)
+        };
+        let runs = rich::runs(m.text.len(), &m.marks);
+        let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = runs
+            .iter()
+            .map(|(range, f)| {
+                let underline = f.underline || f.link;
+                (
+                    range.clone(),
+                    HighlightStyle {
+                        font_weight: f.bold.then_some(FontWeight::BOLD),
+                        font_style: (f.italic || f.quote).then_some(FontStyle::Italic),
+                        underline: underline.then_some(UnderlineStyle {
+                            thickness: px(1.),
+                            ..UnderlineStyle::default()
+                        }),
+                        strikethrough: f.strike.then_some(StrikethroughStyle {
+                            thickness: px(1.),
+                            ..StrikethroughStyle::default()
+                        }),
+                        color: (f.link || f.mention).then_some(link_color),
+                        background_color: f.mono.then_some(mono_bg),
+                        fade_out: f.quote.then_some(0.2),
+                    },
+                )
+            })
+            .collect();
+        let mono = cx.theme().mono_font_family.clone();
+        let fonts: Vec<(std::ops::Range<usize>, SharedString)> = runs
+            .iter()
+            .filter(|(_, f)| f.mono)
+            .map(|(range, _)| (range.clone(), mono.clone()))
+            .collect();
+        let styled = StyledText::new(m.text.clone())
+            .with_highlights(highlights)
+            .with_font_family_overrides(fonts);
+        let links = rich::links(&m.marks);
+        if links.is_empty() {
+            return styled.into_any_element();
+        }
+        let ranges = links.iter().map(|l| l.range.clone()).collect();
+        let view = cx.entity().downgrade();
+        // InteractiveText treats any mouse button as a click. A right click is the message
+        // menu, so it must not open the link. Capture runs before the text records the press.
+        let right_click = Rc::new(Cell::new(false));
+        let pressed_right = right_click.clone();
+        let hover_links = links.clone();
+        let text = InteractiveText::new(("text", key), styled)
+            .on_click(ranges, move |ix, window, cx| {
+                if right_click.get() {
+                    return;
+                }
+                if let Some(link) = links.get(ix) {
+                    let _ = view.update(cx, |this, cx| this.open_link(link, window, cx));
+                }
+            })
+            .tooltip(move |ix, window, cx| {
+                let link = hover_links.iter().find(|l| l.range.contains(&ix))?;
+                if rich::opens_directly(&link.url, link.hidden) {
+                    return None;
+                }
+                Some(Tooltip::new(link.url.clone()).build(window, cx))
+            });
+        div()
+            .id(("links", key))
+            .capture_any_mouse_down(move |event, _, _| {
+                pressed_right.set(event.button != MouseButton::Left);
+            })
+            .child(text)
+            .into_any_element()
+    }
+
+    /// Open a link in the browser. A link whose text hides where it leads, one with a login in
+    /// front of the host, or one the client does not hand to the system, is shown in a dialog
+    /// first.
+    fn open_link(&mut self, link: &rich::Link, window: &mut Window, cx: &mut Context<Self>) {
+        let url = link.url.trim().to_string();
+        let web = rich::opens_externally(&url);
+        let userinfo = rich::has_userinfo(&url);
+        if rich::opens_directly(&url, link.hidden) {
+            cx.open_url(&url);
+            return;
+        }
+        let notice = if !web {
+            "Клиент открывает только веб-страницы и почту. Адрес можно скопировать:"
+        } else if userinfo {
+            "В адресе указан логин перед сайтом. Проверьте, куда она ведёт:"
+        } else {
+            "Текст ссылки не совпадает с адресом. Проверьте, куда она ведёт:"
+        };
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let (open, copy) = (url.clone(), url.clone());
+            dialog
+                .w(px(480.))
+                .title(if web {
+                    "Открыть ссылку?"
+                } else {
+                    "Эта ссылка не открывается"
+                })
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(notice),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .text_sm()
+                                .font_family(cx.theme().mono_font_family.clone())
+                                .child(url.clone()),
+                        ),
+                )
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("link-cancel")
+                                .ghost()
+                                .label("Отмена")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("link-copy")
+                                .outline()
+                                .label("Копировать")
+                                .on_click(move |_, window, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .when(web, |this| {
+                            this.child(
+                                Button::new("link-open")
+                                    .primary()
+                                    .label("Открыть")
+                                    .on_click(move |_, window, cx| {
+                                        cx.open_url(&open);
+                                        window.close_dialog(cx);
+                                    }),
+                            )
+                        }),
+                )
+        });
     }
 
     /// Act on tray clicks and on later starts of the client.
@@ -2205,8 +2574,10 @@ impl AppView {
                     _ => (None, None),
                 };
                 let content = match url.and_then(|u| self.images.get(u)) {
+                    // GPUI crops a cover-fitted image to the element and rounds what is visible.
                     Some(ImageState::Ready(image)) => img(image.clone())
                         .size_full()
+                        .rounded(px(CELL_RADIUS))
                         .object_fit(ObjectFit::Cover)
                         .into_any_element(),
                     state => div()
@@ -2230,7 +2601,7 @@ impl AppView {
                     .top(px(c.y))
                     .w(px(c.w))
                     .h(px(c.h))
-                    .rounded(px(6.))
+                    .rounded(px(CELL_RADIUS))
                     .overflow_hidden()
                     .bg(muted_bg)
                     .when_some(photo_url, |this, url| {
@@ -2318,6 +2689,7 @@ impl AppView {
                         Attachment::Other { .. }
                             | Attachment::Photo { .. }
                             | Attachment::Video { .. }
+                            | Attachment::Share { .. }
                     )
                 })
                 .map(|(i, a)| self.attachment_view(chat_id, m, a, i, cx)),
@@ -2394,8 +2766,14 @@ impl AppView {
             })
             .children(attachments)
             .when(!m.text.is_empty(), |this| {
-                this.child(div().child(m.text.clone()))
+                this.child(self.rich_text(m, message_key, cx))
             })
+            .children(
+                self.share_cards(m)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, card)| self.share_card(message_key, i, &card, cx)),
+            )
             .child(div().text_xs().text_color(muted).child(format!(
                 "{}{}{state}",
                 if m.edited { "изменено · " } else { "" },
@@ -3575,8 +3953,26 @@ fn image_urls(m: &MessageRow) -> Vec<String> {
         .filter_map(|a| match a {
             Attachment::Photo { url, .. } | Attachment::Sticker { url } => Some(url.clone()),
             Attachment::Video { thumbnail, .. } => thumbnail.clone(),
+            // A sensitive preview stays unloaded until the user asks for it.
+            Attachment::Share {
+                image, sensitive, ..
+            } if !sensitive => image.clone(),
             _ => None,
         })
+        .collect()
+}
+
+/// `max.ru` links in the message that have no `SHARE` card of their own yet.
+fn uncovered_max_links(m: &MessageRow) -> Vec<String> {
+    rich::links(&m.marks)
+        .into_iter()
+        .filter(|link| rich::is_max_link(&link.url))
+        .filter(|link| {
+            !m.attachments.iter().any(
+                |a| matches!(a, Attachment::Share { url, .. } if !rich::is_hidden(url, &link.url)),
+            )
+        })
+        .map(|link| link.url)
         .collect()
 }
 

@@ -151,6 +151,18 @@ pub const READ_MESSAGE: &str = "READ_MESSAGE";
 /// The server's answer to [`mark_read`]: the new read mark and unread count.
 pub type MarkResponse = max_proto::schema::packets::chat::chat_mark::Response;
 
+/// What a `max.ru` link points at (`LINK_INFO`): a chat, a person, a message, a sticker set or a call.
+pub type LinkInfo = max_proto::schema::packets::link_info::Response;
+
+/// Ask what `link` opens (`LINK_INFO`). A web page is not this: its preview arrives as a `SHARE`
+/// attachment on the message.
+pub async fn link_info(transport: &Transport, link: &str) -> Result<LinkInfo> {
+    let params = max_proto::schema::packets::link_info::Parameters {
+        link: link.to_string(),
+    };
+    Ok(transport.call(Opcode::LinkInfo, &params).await?)
+}
+
 /// Mark `chat_id` as read up to `message_id` (`CHAT_MARK`, `type` `READ_MESSAGE`, `mark` = now).
 pub async fn mark_read(
     transport: &Transport,
